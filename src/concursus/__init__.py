@@ -57,6 +57,7 @@ from .assemble import OrchestrationAssembler, ProvisioningPlan
 from .build import BuildPlanEntry, RuntimeBuilderFactory
 from .dag import AgentDAG, DAGError
 from .manifest import AgentManifest, ManifestError
+from .provision import Clients, ProvisionError, provision_plan
 from .resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
 from .supervisor import SchemaError, Supervisor
 
@@ -75,5 +76,8 @@ __all__ = [
     "ProvisioningPlan",
     "Supervisor",
     "SchemaError",
+    "provision_plan",
+    "Clients",
+    "ProvisionError",
     "__version__",
 ]

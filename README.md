@@ -104,13 +104,15 @@ plan.order           # ['ingest', 'summarize', 'critique']  <- dispatch order
 plan.to_dict()       # JSON-serializable preview (what `concursus plan` prints)
 ```
 
-`deploy` dry-runs what *would* be created (no boto3 imported); `--execute` provisions each
-agent with `CreateAgentRuntime` on the control plane. `run` dry-runs the topological dispatch;
-`--execute` invokes the live runtimes, threading each output into its dependents:
+`deploy` dry-runs what *would* be created (nothing imported); `--execute` provisions each agent
+end-to-end — ensure its IAM execution role, build + push its image to ECR (when the plan carries a
+placeholder URI), then `CreateAgentRuntime` — reusing an existing image or runtime ARN as-is. `run`
+dry-runs the topological dispatch; `--execute` invokes the live runtimes, threading each output
+into its dependents:
 
 ```bash
-concursus deploy *.agent.yaml                          # dry-run: what would be provisioned
-concursus deploy *.agent.yaml --execute                # + boto3: CreateAgentRuntime on AWS
+concursus deploy *.agent.yaml                          # dry-run: the role/image/create steps
+concursus deploy *.agent.yaml --execute --source-dir . # + boto3 + docker: role → ECR image → create
 concursus run    *.agent.yaml --inputs '{"uri": "s3://doc"}'            # dry-run the dispatch
 concursus run    *.agent.yaml --inputs @inputs.json --execute          # live InvokeAgentRuntime
 ```

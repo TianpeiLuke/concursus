@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`provision`** — the deploy-time actuator behind `deploy --execute`: for each agent (in
+  topological order) it ensures the IAM execution role (`create_role` + attach policy,
+  idempotent), builds and pushes the container image to ECR when the plan carries a placeholder
+  URI (`docker login`/`build`/`push` over a non-destructive temp build context), substitutes the
+  real `roleArn` + `containerUri` into the request, and calls `CreateAgentRuntime`; an already
+  built image or an existing runtime ARN is reused as-is. Every AWS client (`Clients`) and the
+  shell runner are injectable, so the orchestration is unit-tested with fakes — no AWS, no Docker.
+  Exposed as `provision_plan` / `Clients` / `ProvisionError`.
+- **CLI** — `deploy --execute` now runs that full role→image→`CreateAgentRuntime` flow (previously
+  it only called `CreateAgentRuntime` with placeholder role/image); new `--source-dir DIR|NODE=DIR`
+  (build context, default `.`) and `--tag` (image tag, default `latest`). The dry-run now lists
+  the role/image/create steps per agent. boto3 + the `docker` CLI are used only under `--execute`.
+
 ## [0.2.0] - 2026-07-07
 
 The offline compiler — `AgentDAG` + manifests now compile into a provisioning plan and a

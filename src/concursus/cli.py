@@ -146,59 +146,100 @@ def _cmd_plan(args: argparse.Namespace) -> int:
 
 # -- deploy -----------------------------------------------------------------
 def _print_deploy_dryrun(plan: "object") -> None:
-    """Explain what ``deploy --execute`` WOULD provision, without importing boto3."""
-    print(f"DRY RUN (no --execute): would provision {len(plan.order)} agent runtime(s) via")
-    print("AWS Bedrock AgentCore (bedrock-agentcore-control):\n")
+    """Explain what ``deploy --execute`` WOULD do per agent, without importing boto3/docker."""
+    print(f"DRY RUN (no --execute): would provision {len(plan.order)} agent runtime(s) on")
+    print("AWS Bedrock AgentCore. For each agent, in topological order:\n")
     for i, node in enumerate(plan.order, 1):
         entry = plan.entries[node]
         req = entry.create_agent_runtime
         if "agentRuntimeArn" in req:
             print(f"  [{i}] {node}: REUSE existing runtime {req['agentRuntimeArn']}")
             continue
+        steps = []
+        if entry.execution_role is not None:
+            steps.append("create IAM execution role")
+        ccfg = req.get("agentRuntimeArtifact", {}).get("containerConfiguration", {})
+        if entry.build_mode == "container" and ccfg.get("containerUri") == "<image-uri>":
+            steps.append("build + push image to ECR")
         proto = req.get("protocolConfiguration", {}).get("serverProtocol", "?")
-        role = req.get("roleArn", "?")
-        print(
-            f"  [{i}] {node}: CreateAgentRuntime name={req.get('agentRuntimeName')!r} "
-            f"protocol={proto} build_mode={entry.build_mode} role={role}"
-        )
-    print("\nPass --execute to call AWS (requires boto3: pip install concursus[agentcore]).")
-
-
-def _execute_deploy(plan: "object", region: Optional[str]) -> int:
-    """Provision the plan for real: ``CreateAgentRuntime`` per node on the control plane."""
-    try:
-        import boto3  # lazy: only --execute talks to AWS (the optional [agentcore] extra)
-    except ImportError:
-        print(
-            "FAIL  deploy --execute requires boto3 — install the 'agentcore' extra "
-            "(pip install concursus[agentcore])",
-            file=sys.stderr,
-        )
-        return 1
-    client = boto3.client(
-        "bedrock-agentcore-control", **({"region_name": region} if region else {})
+        steps.append(f"CreateAgentRuntime (protocol={proto})")
+        print(f"  [{i}] {node}: " + " -> ".join(steps))
+    print(
+        "\nPass --execute to run these steps (requires boto3 + the docker CLI: "
+        "pip install concursus[agentcore])."
     )
-    for node in plan.order:
-        entry = plan.entries[node]
-        req = entry.create_agent_runtime
-        if "agentRuntimeArn" in req:
-            print(f"REUSE   {node}  -> {req['agentRuntimeArn']}")
-            continue
-        resp = client.create_agent_runtime(**req)
-        print(f"CREATED {node}  -> {resp.get('agentRuntimeArn')}")
+
+
+def _parse_source_dirs(specs: Optional[List[str]]) -> Tuple[str, Dict[str, str]]:
+    """Parse ``--source-dir`` specs into ``(default_dir, {node: dir})``.
+
+    A bare ``DIR`` sets the default build context for every agent; ``NODE=DIR`` overrides one
+    agent's context. The build context holds the agent's code + ``requirements.txt`` (the plan's
+    generated ``app.py`` + ``Dockerfile`` are dropped into a copy of it at build time).
+    """
+    default_dir = "."
+    per_node: Dict[str, str] = {}
+    for spec in specs or []:
+        if "=" in spec:
+            node, _, path = spec.partition("=")
+            node, path = node.strip(), path.strip()
+            if not node or not path:
+                raise ValueError(f"invalid --source-dir {spec!r} (expected DIR or NODE=DIR)")
+            per_node[node] = path
+        else:
+            default_dir = spec.strip() or "."
+    return default_dir, per_node
+
+
+def _execute_deploy(
+    plan: "object",
+    region: Optional[str],
+    default_source_dir: str,
+    source_dirs: Dict[str, str],
+    tag: str,
+) -> int:
+    """Provision the plan for real: ensure IAM roles, build+push images, ``CreateAgentRuntime``."""
+    from .provision import provision_plan
+
+    try:
+        results = provision_plan(
+            plan,
+            region=region,
+            source_dirs=source_dirs,
+            default_source_dir=default_source_dir,
+            tag=tag,
+        )
+    except Exception as exc:  # surface boto3/Docker/provision failures as a clean CLI error
+        print(f"FAIL  {exc}", file=sys.stderr)
+        return 1
+    for r in results:
+        verb = "REUSE  " if r.get("action") == "reused" else "CREATED"
+        extra = ""
+        if r.get("image_uri"):
+            extra += f"  image={r['image_uri']}"
+        if r.get("role_arn"):
+            extra += f"  role={r['role_arn']}"
+        print(f"{verb} {r['node']}  -> {r.get('arn')}{extra}")
     return 0
 
 
 def _cmd_deploy(args: argparse.Namespace) -> int:
     try:
         _manifests, plan = _assemble(args)
+        default_source_dir, source_dirs = _parse_source_dirs(getattr(args, "source_dir", None))
     except (ValueError, OSError) as exc:
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
     if not args.execute:
         _print_deploy_dryrun(plan)
         return 0
-    return _execute_deploy(plan, getattr(args, "region", None))
+    return _execute_deploy(
+        plan,
+        getattr(args, "region", None),
+        default_source_dir,
+        source_dirs,
+        getattr(args, "tag", None) or "latest",
+    )
 
 
 # -- run --------------------------------------------------------------------
@@ -285,8 +326,16 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument(
         "--execute",
         action="store_true",
-        help="Actually provision on AWS via boto3 (otherwise a dry-run; no boto3 imported).",
+        help="Actually provision on AWS (boto3 + docker; otherwise a dry-run, nothing imported).",
     )
+    dp.add_argument(
+        "--source-dir",
+        action="append",
+        metavar="DIR|NODE=DIR",
+        help="Build-context dir holding agent code + requirements.txt (default '.'); repeatable, "
+        "NODE=DIR overrides one agent.",
+    )
+    dp.add_argument("--tag", help="Container image tag to build/push (default 'latest').")
     dp.set_defaults(func=_cmd_deploy)
 
     rn = sub.add_parser(

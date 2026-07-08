@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "concursus"
+dynamic = ["version"]
+description = "Compile a declarative DAG of subagents into an orchestrated team on AWS Bedrock AgentCore."
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Tianpei Xie", email = "unidoctor@gmail.com"}
+]
+maintainers = [
+    {name = "Tianpei Xie", email = "unidoctor@gmail.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+keywords = [
+    "agentcore",
+    "bedrock",
+    "aws",
+    "multi-agent",
+    "agent-orchestration",
+    "llm-agents",
+    "dag",
+    "orchestration",
+    "supervisor",
+    "mcp",
+    "a2a",
+]
+requires-python = ">=3.10"
+
+# Core is pure-Python: the declarative AgentDAG + .agent.yaml manifest model.
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# The AWS Bedrock AgentCore runtime binding (provisioning + invocation). Kept optional so
+# the declarative core installs without the AWS stack.
+agentcore = [
+    "boto3>=1.34.0",
+    "bedrock-agentcore",
+]
+dev = [
+    "pytest>=7.0.0",
+    "build>=1.0.0",
+    "twine>=5.0.0",
+    "black>=23.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+concursus = "concursus.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/TianpeiLuke/concursus"
+Repository = "https://github.com/TianpeiLuke/concursus"
+Issues = "https://github.com/TianpeiLuke/concursus/issues"
+Changelog = "https://github.com/TianpeiLuke/concursus/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["concursus*"]
+
+[tool.setuptools.package-data]
+"concursus" = ["py.typed"]
+
+[tool.black]
+line-length = 95
+target-version = ["py310", "py311", "py312"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = ["tests"]

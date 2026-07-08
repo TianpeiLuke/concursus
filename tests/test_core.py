@@ -47,10 +47,14 @@ def test_manifest_validates():
     m = AgentManifest.from_dict(
         {
             "name": "summarize",
-            "registry": {"container_uri": "acct.dkr.ecr.us-east-1.amazonaws.com/x:latest",
-                         "protocol": "HTTP"},
-            "contract": {"inputs": {"document": {"type": "string"}},
-                         "outputs": {"summary": {"type": "string"}}},
+            "registry": {
+                "container_uri": "acct.dkr.ecr.us-east-1.amazonaws.com/x:latest",
+                "protocol": "HTTP",
+            },
+            "contract": {
+                "inputs": {"document": {"type": "string"}},
+                "outputs": {"summary": {"type": "string"}},
+            },
         }
     ).validate()
     assert m.protocol == "HTTP"

@@ -9,8 +9,12 @@ Memory. It is the coordinator AgentCore deliberately does not ship.
 
 Status: early. This release provides the declarative core — the backend-agnostic
 :class:`~concursus.dag.AgentDAG` and the :class:`~concursus.manifest.AgentManifest`
-(``.agent.yaml``) model. The AgentCore provisioning plan + supervisor (the
-``OrchestrationAssembler``) are the roadmap.
+(``.agent.yaml``) model — plus the offline compiler: the dependency resolver
+(:mod:`~concursus.resolve`), the runtime builder (:mod:`~concursus.build`), the
+:class:`~concursus.assemble.OrchestrationAssembler` (DAG + manifests → a
+:class:`~concursus.assemble.ProvisioningPlan`), and the topological
+:class:`~concursus.supervisor.Supervisor`. Provisioning + invocation over AWS stay behind
+the optional ``[agentcore]`` extra (boto3 is imported lazily).
 
 Basic usage:
     >>> from concursus import AgentDAG
@@ -49,13 +53,27 @@ def _resolve_version() -> str:
 
 __version__ = _resolve_version()
 
+from .assemble import OrchestrationAssembler, ProvisioningPlan
+from .build import BuildPlanEntry, RuntimeBuilderFactory
 from .dag import AgentDAG, DAGError
 from .manifest import AgentManifest, ManifestError
+from .resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
+from .supervisor import SchemaError, Supervisor
 
 __all__ = [
     "AgentDAG",
     "DAGError",
     "AgentManifest",
     "ManifestError",
+    "AgentRef",
+    "AlignmentError",
+    "resolve_edges",
+    "check_alignment",
+    "RuntimeBuilderFactory",
+    "BuildPlanEntry",
+    "OrchestrationAssembler",
+    "ProvisioningPlan",
+    "Supervisor",
+    "SchemaError",
     "__version__",
 ]

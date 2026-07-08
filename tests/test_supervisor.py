@@ -1,0 +1,249 @@
+"""Tests for the Supervisor — the eager AgentRef run loop over a provisioning plan.
+
+A fake :data:`~concursus.supervisor.InvokeFn` (keyed by agentRuntimeArn) drives a 3-node
+chain offline; no boto3 is imported. It records every call so the tests can assert the
+forward threading of outputs, the stable session id, and output-schema validation.
+"""
+
+import json
+import types
+
+import pytest
+
+from concursus import AgentDAG, AgentManifest
+from concursus.resolve import resolve_edges
+from concursus.supervisor import SchemaError, Supervisor, validate_output
+
+
+# -- fixtures ---------------------------------------------------------------
+def _chain():
+    """A well-formed 3-node chain: ingest -> summarize -> critique.
+
+    ``ingest`` uses a flat output schema (with a per-property ``required`` flag); ``summarize``
+    uses the nested ``{"properties": {...}}`` shape plus a top-level ``required`` list — both
+    accepted forms are exercised. ``summarize`` also pins a non-default ``qualifier``.
+    """
+    dag = AgentDAG()
+    for n in ["ingest", "summarize", "critique"]:
+        dag.add_node(n)
+    dag.add_edge("ingest", "summarize")
+    dag.add_edge("summarize", "critique")
+
+    manifests = {
+        "ingest": AgentManifest.from_dict(
+            {
+                "name": "ingest",
+                "registry": {"container_uri": "x", "protocol": "HTTP"},
+                "contract": {
+                    "inputs": {"uri": {"type": "string"}},
+                    "outputs": {"document": {"type": "string", "required": True}},
+                },
+            }
+        ),
+        "summarize": AgentManifest.from_dict(
+            {
+                "name": "summarize",
+                "registry": {"container_uri": "x", "protocol": "HTTP", "qualifier": "PROD"},
+                "contract": {
+                    "inputs": {"document": {"type": "string"}},
+                    "outputs": {
+                        "properties": {"summary": {"type": "string"}},
+                        "required": ["summary"],
+                    },
+                },
+                "spec": {"depends_on": [{"from": "ingest.document", "to": "document"}]},
+            }
+        ),
+        "critique": AgentManifest.from_dict(
+            {
+                "name": "critique",
+                "registry": {"container_uri": "x", "protocol": "HTTP"},
+                "contract": {
+                    "inputs": {"summary": {"type": "string"}},
+                    "outputs": {"critique": {"type": "string", "required": True}},
+                },
+                "spec": {"depends_on": [{"from": "summarize.summary", "to": "summary"}]},
+            }
+        ),
+    }
+    return dag, manifests
+
+
+def _plan(dag, manifests):
+    """A ProvisioningPlan-like stand-in exposing the duck-typed ``.order`` + ``.wiring``."""
+    return types.SimpleNamespace(
+        order=dag.topological_sort(),
+        wiring=resolve_edges(dag, manifests),
+    )
+
+
+class FakeInvoker:
+    """A fake :data:`InvokeFn` returning a canned dict per arn and recording every call."""
+
+    def __init__(self, outputs_by_arn):
+        self.outputs_by_arn = outputs_by_arn
+        self.calls = []  # (arn, qualifier, session_id, payload_dict)
+
+    def __call__(self, arn, qualifier, session_id, payload_bytes):
+        payload = json.loads(payload_bytes)
+        assert isinstance(payload_bytes, (bytes, bytearray))
+        self.calls.append((arn, qualifier, session_id, payload))
+        return dict(self.outputs_by_arn[arn])
+
+    def payload_for(self, arn):
+        for got_arn, _q, _s, payload in self.calls:
+            if got_arn == arn:
+                return payload
+        raise AssertionError(f"no call for arn {arn!r}")
+
+
+_ARNS = {
+    "ingest": "arn:ingest",
+    "summarize": "arn:summarize",
+    "critique": "arn:critique",
+}
+
+
+def _fake_outputs():
+    return {
+        "arn:ingest": {"document": "DOC", "extra": 1},
+        "arn:summarize": {"summary": "SUM"},
+        "arn:critique": {"critique": "OK"},
+    }
+
+
+# -- run loop: forward threading via AgentRef -------------------------------
+def test_run_threads_upstream_output_into_downstream_payload():
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+
+    sup.run({"uri": "s3://doc"})
+
+    # (a) each downstream payload received the upstream field via its AgentRef wiring.
+    assert fake.payload_for("arn:ingest") == {"uri": "s3://doc"}  # source: top-level inputs
+    assert fake.payload_for("arn:summarize")["document"] == "DOC"
+    assert fake.payload_for("arn:critique")["summary"] == "SUM"
+
+
+def test_run_returns_every_node_output():
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+
+    outputs = sup.run({"uri": "s3://doc"})
+
+    # (b) final outputs contain every node.
+    assert set(outputs) == {"ingest", "summarize", "critique"}
+    assert outputs["ingest"] == {"document": "DOC", "extra": 1}
+    assert outputs["summarize"] == {"summary": "SUM"}
+    assert outputs["critique"] == {"critique": "OK"}
+
+
+def test_run_accepts_per_node_external_inputs():
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+
+    sup.run({"ingest": {"uri": "s3://explicit"}})
+
+    assert fake.payload_for("arn:ingest") == {"uri": "s3://explicit"}
+
+
+def test_run_passes_manifest_qualifier():
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+
+    sup.run({"uri": "s3://doc"})
+
+    by_arn = {arn: qualifier for arn, qualifier, _s, _p in fake.calls}
+    assert by_arn["arn:summarize"] == "PROD"  # registry.qualifier honored
+    assert by_arn["arn:ingest"] == "DEFAULT"  # default qualifier
+
+
+# -- session id: stable + >= 33 chars ---------------------------------------
+def test_session_id_is_stable_and_long_across_invokes():
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+
+    sup.run({"uri": "s3://doc"})
+
+    session_ids = {session_id for _a, _q, session_id, _p in fake.calls}
+    # (d) one stable session id propagated to every invoke, and it is >= 33 chars.
+    assert len(fake.calls) == 3
+    assert session_ids == {sup.session_id}
+    assert len(sup.session_id) >= 33
+
+
+def test_generated_session_id_defaults_long():
+    dag, manifests = _chain()
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=FakeInvoker({}))
+    assert len(sup.session_id) >= 33
+
+
+def test_supplied_session_id_is_used():
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    fixed = "S" * 40
+    sup = Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS, session_id=fixed
+    )
+    sup.run({"uri": "s3://doc"})
+    assert {s for _a, _q, s, _p in fake.calls} == {fixed}
+
+
+# -- output validation ------------------------------------------------------
+def test_validate_output_flat_required_flag():
+    validate_output({"summary": "hi"}, {"summary": {"type": "string", "required": True}})
+    with pytest.raises(SchemaError, match="missing required field"):
+        validate_output({"other": 1}, {"summary": {"type": "string", "required": True}})
+
+
+def test_validate_output_nested_required_list():
+    schema = {"properties": {"summary": {"type": "string"}}, "required": ["summary"]}
+    validate_output({"summary": "hi"}, schema)
+    with pytest.raises(SchemaError):
+        validate_output({}, schema)
+
+
+def test_validate_output_rejects_non_dict():
+    with pytest.raises(SchemaError, match="must be a JSON object"):
+        validate_output("not-a-dict", {"o": {"required": True}})
+
+
+def test_validate_output_no_required_fields_passes():
+    validate_output({}, {"summary": {"type": "string"}})
+
+
+def test_run_raises_schema_error_when_required_output_missing():
+    dag, manifests = _chain()
+    broken = _fake_outputs()
+    broken["arn:summarize"] = {"not_summary": "oops"}  # violates required ["summary"]
+    fake = FakeInvoker(broken)
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+
+    with pytest.raises(SchemaError, match="summary"):
+        sup.run({"uri": "s3://doc"})
+
+
+# -- arn fallback -----------------------------------------------------------
+def test_arn_falls_back_to_manifest_registry():
+    dag, manifests = _chain()
+    manifests["ingest"].registry["agent_runtime_arn"] = "arn:from-manifest"
+    outputs = {
+        "arn:from-manifest": {"document": "DOC"},
+        "arn:summarize": {"summary": "S"},
+        "arn:critique": {"critique": "OK"},
+    }
+    fake = FakeInvoker(outputs)
+    # Supply arns only for the two downstream nodes; ingest falls back to its manifest arn.
+    sup = Supervisor(
+        _plan(dag, manifests),
+        manifests,
+        invoke_fn=fake,
+        arns={"summarize": "arn:summarize", "critique": "arn:critique"},
+    )
+    sup.run({"uri": "s3://doc"})
+    assert fake.payload_for("arn:from-manifest") == {"uri": "s3://doc"}

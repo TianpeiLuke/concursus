@@ -9,7 +9,7 @@ Concursus (Latin *"a running-together / convergence"*) is [cursus](https://githu
 
 It is the **coordinator AgentCore deliberately doesn't ship**: AgentCore gives you transport (A2A), tool discovery (Gateway), microVM isolation, identity, memory, and hosting — but no scheduler, dependency graph, or supervisor. You declare a DAG of agents; Concursus provisions them and runs them.
 
-> **Status: alpha.** This release ships the **declarative core** — the backend-agnostic `AgentDAG` and the `AgentManifest` (`.agent.yaml`) model, with validation. The AgentCore provisioning plan + supervisor (the `OrchestrationAssembler`) are on the [roadmap](#roadmap).
+> **Status: alpha.** This release ships the **declarative core** (`AgentDAG` + `AgentManifest`) **and the offline compiler**: the dependency resolver, the runtime builder, the `OrchestrationAssembler` (DAG + manifests → a `ProvisioningPlan`), and the topological `Supervisor` — plus the `plan` / `deploy` / `run` CLI verbs. The compiler is pure-Python; boto3 stays behind the `[agentcore]` extra and is imported lazily only when `deploy --execute` / `run --execute` actually calls AWS.
 
 ---
 
@@ -79,6 +79,46 @@ concursus validate *.agent.yaml       # validate manifests
 concursus --version
 ```
 
+## Compile a plan (`plan` → `deploy` → `run`)
+
+Point the compiler at your manifests. Edges are inferred from each manifest's `depends_on`
+(or pass `--dag ingest->summarize` to set them explicitly). `plan` prints a JSON
+`ProvisioningPlan` — a topological `order`, one `create_agent_runtime` entry per agent, and
+the resolved producer→consumer `wiring` — without touching AWS:
+
+```bash
+concursus plan *.agent.yaml
+```
+
+```python
+from concursus import AgentDAG, AgentManifest, OrchestrationAssembler, Supervisor
+
+manifests = {m.name: m for m in map(AgentManifest.from_yaml, paths)}
+dag = AgentDAG()
+for name in manifests:
+    dag.add_node(name)
+dag.add_edge("ingest", "summarize").add_edge("summarize", "critique")
+
+plan = OrchestrationAssembler(account="111122223333", region="us-east-1").assemble(dag, manifests)
+plan.order           # ['ingest', 'summarize', 'critique']  <- dispatch order
+plan.to_dict()       # JSON-serializable preview (what `concursus plan` prints)
+```
+
+`deploy` dry-runs what *would* be created (no boto3 imported); `--execute` provisions each
+agent with `CreateAgentRuntime` on the control plane. `run` dry-runs the topological dispatch;
+`--execute` invokes the live runtimes, threading each output into its dependents:
+
+```bash
+concursus deploy *.agent.yaml                          # dry-run: what would be provisioned
+concursus deploy *.agent.yaml --execute                # + boto3: CreateAgentRuntime on AWS
+concursus run    *.agent.yaml --inputs '{"uri": "s3://doc"}'            # dry-run the dispatch
+concursus run    *.agent.yaml --inputs @inputs.json --execute          # live InvokeAgentRuntime
+```
+
+```python
+outputs = Supervisor(plan, manifests).run({"uri": "s3://doc"})   # {node_id: output_dict}
+```
+
 ## How it works (the compile target)
 
 Concursus compiles `AgentDAG + manifests` through `validate → resolve → provision → assemble`, mapping cursus concepts onto AgentCore primitives:
@@ -98,9 +138,11 @@ The supervisor dispatches agents in topological order, invokes each with `Invoke
 ## Roadmap
 
 - [x] Declarative core: `AgentDAG` + `AgentManifest` (`.agent.yaml`) + validation + CLI
-- [ ] Advisory dependency resolver over declared output JSON Schemas
-- [ ] `OrchestrationAssembler`: emit an AgentCore provisioning plan (`CreateAgentRuntime` per agent + IAM roles + endpoints)
-- [ ] The supervisor: topological dispatch over `InvokeAgentRuntime` with `AgentRef` wiring + Memory-backed state
+- [x] Dependency resolver over declared output JSON Schemas (`AgentRef` wiring + type-gating)
+- [x] `OrchestrationAssembler`: emit an AgentCore provisioning plan (`CreateAgentRuntime` per agent + synthesized IAM roles + endpoints)
+- [x] The supervisor: topological dispatch over `InvokeAgentRuntime` with `AgentRef` wiring + one stable `runtimeSessionId`
+- [x] `plan` / `deploy` / `run` CLI verbs (deploy/run `--execute` bind boto3 lazily)
+- [ ] Memory-backed shared run state (persist outputs across the ephemeral microVMs)
 - [ ] Gateway/A2A node types; a data-driven catalog + recommender of team topologies
 
 ## License

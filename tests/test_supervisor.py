@@ -12,6 +12,7 @@ import pytest
 
 from concursus import AgentDAG, AgentManifest
 from concursus.resolve import resolve_edges
+from concursus.statestore import InProcessStateStore
 from concursus.supervisor import SchemaError, Supervisor, validate_output
 
 
@@ -247,3 +248,106 @@ def test_arn_falls_back_to_manifest_registry():
     )
     sup.run({"uri": "s3://doc"})
     assert fake.payload_for("arn:from-manifest") == {"uri": "s3://doc"}
+
+
+# -- state store seam: diamond DAG + graph-aware context + resume -----------
+def _diamond():
+    """A diamond DAG a -> b, a -> c, b -> d, c -> d (d fans in from both b and c)."""
+    dag = AgentDAG()
+    for n in ["a", "b", "c", "d"]:
+        dag.add_node(n)
+    dag.add_edge("a", "b")
+    dag.add_edge("a", "c")
+    dag.add_edge("b", "d")
+    dag.add_edge("c", "d")
+
+    def _m(name, inputs, outputs, deps=None):
+        spec = {"depends_on": deps} if deps else {}
+        return AgentManifest.from_dict(
+            {
+                "name": name,
+                "registry": {"container_uri": "x", "protocol": "HTTP"},
+                "contract": {"inputs": inputs, "outputs": outputs},
+                "spec": spec,
+            }
+        )
+
+    manifests = {
+        "a": _m(
+            "a", {"seed": {"type": "string"}}, {"doc": {"type": "string", "required": True}}
+        ),
+        "b": _m(
+            "b",
+            {"doc": {"type": "string"}},
+            {"sb": {"type": "string", "required": True}},
+            [{"from": "a.doc", "to": "doc"}],
+        ),
+        "c": _m(
+            "c",
+            {"doc": {"type": "string"}},
+            {"sc": {"type": "string", "required": True}},
+            [{"from": "a.doc", "to": "doc"}],
+        ),
+        "d": _m(
+            "d",
+            {"sb": {"type": "string"}, "sc": {"type": "string"}},
+            {"sd": {"type": "string", "required": True}},
+            [{"from": "b.sb", "to": "sb"}, {"from": "c.sc", "to": "sc"}],
+        ),
+    }
+    return dag, manifests
+
+
+_DIAMOND_ARNS = {"a": "arn:a", "b": "arn:b", "c": "arn:c", "d": "arn:d"}
+
+
+def _diamond_outputs():
+    return {
+        "arn:a": {"doc": "DOC"},
+        "arn:b": {"sb": "SB"},
+        "arn:c": {"sc": "SC"},
+        "arn:d": {"sd": "SD"},
+    }
+
+
+def test_run_diamond_threads_through_state_store_and_context():
+    dag, manifests = _diamond()
+    fake = FakeInvoker(_diamond_outputs())
+    store = InProcessStateStore()
+    sup = Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=fake, arns=_DIAMOND_ARNS, state_store=store
+    )
+
+    outputs = sup.run({"seed": "s3://doc"})
+
+    # final outputs cover every node, fanning both b and c into d.
+    assert set(outputs) == {"a", "b", "c", "d"}
+    assert outputs["a"] == {"doc": "DOC"}
+    assert outputs["d"] == {"sd": "SD"}
+    assert fake.payload_for("arn:d") == {"sb": "SB", "sc": "SC"}
+
+    # graph-aware context of the sink is its transitive upstream outputs (a, b, c).
+    ctx = sup.context("d")
+    assert set(ctx) == {"a", "b", "c"}
+    assert ctx["a"] == {"doc": "DOC"}
+    assert ctx["b"] == {"sb": "SB"}
+    assert ctx["c"] == {"sc": "SC"}
+
+
+def test_run_resumes_and_skips_already_completed_node():
+    dag, manifests = _diamond()
+    fake = FakeInvoker(_diamond_outputs())
+    store = InProcessStateStore()
+    store.put("a", {"doc": "PRESET"})  # 'a' already recorded -> completed()
+
+    sup = Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=fake, arns=_DIAMOND_ARNS, state_store=store
+    )
+    outputs = sup.run({"seed": "s3://doc"})
+
+    # 'a' was skipped (never invoked); its preset output threaded into b and c.
+    invoked = {arn for arn, _q, _s, _p in fake.calls}
+    assert "arn:a" not in invoked
+    assert invoked == {"arn:b", "arn:c", "arn:d"}
+    assert outputs["a"] == {"doc": "PRESET"}
+    assert fake.payload_for("arn:b") == {"doc": "PRESET"}

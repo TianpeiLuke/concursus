@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`statestore`** — a `StateStore` seam for durable, addressable run state (the slipbox's
+  single-source-of-truth log + derived-projection discipline). Two backends share one Protocol:
+  `InProcessStateStore` (the zero-dependency, offline default — an append-only `Record` log plus a
+  `{node: latest validated output}` projection, with per-node attempt auto-increment and
+  `content_hash` no-op dedup) and `MemoryStateStore` (opt-in, AgentCore Memory-backed — one Blob
+  event per validated output plus typed metadata; **replay-resume** rebuilds the projection from
+  the event log via paginated `list_events`, so a run survives micro-VM teardown). boto3 is
+  imported lazily only in the Memory backend; every test injects a fake client (no AWS). Exposes
+  `StateStore` / `InProcessStateStore` / `MemoryStateStore` / `Record` / `content_hash`.
+- **`rungraph`** — the AgentRef link graph: each `Record` persists its resolved `consumes` edges
+  (`"producer:$.path"`), so the log projects into a queryable `RunGraph` (`from_records` /
+  `from_edges`) with transitive `upstream`/`downstream`, a structural `validate` (raises
+  `RunGraphError` on a cycle or a dangling AgentRef), and a bounded nearest-first `context_order`.
+  Pure Python — no networkx.
+- **`runindex`** — a dual index over the run log, exposing BOTH ways to read state: a **metadata
+  query** surface (inverted postings over `node`/`status`/`record_type`/`schema`/`producer` —
+  `query(status="failed")` is a lookup, not a payload scan, the local analogue of `list_events`
+  filters) and a **Folgezettel-tree traversal** over each `Record`'s new materialized-path
+  `address` (default the node name; a retry/fan-out/branch appends a `/` segment). The parent is
+  prefix-derivable, so `ancestors`/`descendants`/`children`/`siblings`/`traverse` reconstruct the
+  execution tree — the run-state analogue of `slipbox-traverse-folgezettel`. A sub-address maps to
+  an AgentCore `branch{name, rootEventId}` in `MemoryStateStore`, so retries/fan-outs land as
+  branches in the Memory log. `Supervisor.index()` returns it. Pure Python.
+- **`Supervisor`** — now threads outputs through the `StateStore` seam (new `state_store=` keyword,
+  defaulting to `InProcessStateStore`): a node already in `completed()` is skipped (resume), and
+  each validated output is `put` with its `producer` / `consumes` / `schema` metadata. New
+  `Supervisor.context(node)` returns the transitive upstream outputs (`{producer: output}`) via the
+  run graph — shared upstream state as a query, not point-to-point wiring.
+- **CLI** — `run --memory-id ID [--actor-id ID]` backs a `run --execute` with a durable, resumable
+  `MemoryStateStore` sharing the supervisor's `runtimeSessionId` (default actor `run`); boto3 is
+  used only under `--execute`, and the dry-run path still imports nothing.
+- **Public API** — `StateStore`, `InProcessStateStore`, `MemoryStateStore`, `Record`,
+  `content_hash`, `RunGraph`, `RunGraphError`, `RunIndex` are now exported from `concursus`.
+
 ## [0.3.0] - 2026-07-07
 
 ### Added

@@ -137,6 +137,31 @@ Concursus compiles `AgentDAG + manifests` through `validate → resolve → prov
 
 The supervisor dispatches agents in topological order, invokes each with `InvokeAgentRuntime` under one `runtimeSessionId` (session affinity → warm microVMs), extracts each producer's output by JSONPath and injects it into its consumers, and persists outputs to Memory so state survives the ephemeral microVMs.
 
+## Durable run state (the `StateStore` seam)
+
+The supervisor threads every output through a **`StateStore`** — an append-only log of validated
+outputs plus a derived `{node: output}` projection (the slipbox's single-source-of-truth /
+derived-DB discipline). Two backends share one Protocol:
+
+- **`InProcessStateStore`** — the zero-dependency, offline default. Nothing new to install.
+- **`MemoryStateStore`** — opt-in, AgentCore **Memory**-backed. Each validated output is one Blob
+  event; a run **resumes by replaying** its event log, so it survives micro-VM teardown / mid-run
+  crashes — the supervisor skips any node already `completed()`. boto3 is imported lazily (the
+  `[agentcore]` extra); pass `run --memory-id <id> [--actor-id <id>] --execute`.
+
+Each record also persists its resolved `AgentRef` edges (`consumes`), turning the log into a
+**queryable run graph** (`RunGraph`: `upstream`/`downstream`, a structural `validate`, bounded
+`context_order`). `Supervisor.context(node)` returns a node's transitive upstream outputs — shared
+context as a query, not point-to-point wiring:
+
+```python
+from concursus import Supervisor, InProcessStateStore
+
+sup = Supervisor(plan, manifests, state_store=InProcessStateStore())
+outputs = sup.run({"uri": "s3://doc"})   # {node_id: output_dict}
+sup.context("critique")                  # {producer: output} for its transitive upstream
+```
+
 ## Roadmap
 
 - [x] Declarative core: `AgentDAG` + `AgentManifest` (`.agent.yaml`) + validation + CLI
@@ -144,7 +169,7 @@ The supervisor dispatches agents in topological order, invokes each with `Invoke
 - [x] `OrchestrationAssembler`: emit an AgentCore provisioning plan (`CreateAgentRuntime` per agent + synthesized IAM roles + endpoints)
 - [x] The supervisor: topological dispatch over `InvokeAgentRuntime` with `AgentRef` wiring + one stable `runtimeSessionId`
 - [x] `plan` / `deploy` / `run` CLI verbs (deploy/run `--execute` bind boto3 lazily)
-- [ ] Memory-backed shared run state (persist outputs across the ephemeral microVMs)
+- [x] Memory-backed shared run state (the `StateStore` seam: in-process default / AgentCore Memory opt-in, replay-resume, the AgentRef link graph + `context(node)`)
 - [ ] Gateway/A2A node types; a data-driven catalog + recommender of team topologies
 
 ## License

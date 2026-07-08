@@ -3,10 +3,14 @@
 Runtime half of Concursus: walk ``plan.order``, build each agent's invoke payload from the
 external run inputs overlaid with its resolved upstream outputs (the :class:`AgentRef`
 wiring), call its AgentCore endpoint, shape-check the result against the manifest's output
-schema, and thread every output forward into its dependents. The invoke transport is
-injectable (:data:`InvokeFn`); the default lazily binds boto3's ``bedrock-agentcore``
-data-plane client, so importing this module needs no AWS SDK. One stable ``runtimeSessionId``
-spans every invoke in a run (session affinity + AgentCore Memory).
+schema, and thread every output forward into its dependents. Outputs thread through a
+:class:`~concursus.statestore.StateStore` seam (the offline :class:`InProcessStateStore` by
+default, an AgentCore ``MemoryStateStore`` opt-in) so a run can *resume* — a node whose
+validated output is already recorded is skipped — and every recorded ``consumes`` edge feeds
+:meth:`Supervisor.context`, graph-aware upstream context. The invoke transport is injectable
+(:data:`InvokeFn`); the default lazily binds boto3's ``bedrock-agentcore`` data-plane client,
+so importing this module needs no AWS SDK. One stable ``runtimeSessionId`` spans every invoke
+in a run (session affinity + AgentCore Memory).
 """
 
 from __future__ import annotations
@@ -16,6 +20,9 @@ import uuid
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 from .resolve import extract
+from .rungraph import RunGraph
+from .runindex import RunIndex
+from .statestore import InProcessStateStore, StateStore
 
 if TYPE_CHECKING:  # pragma: no cover - hints only; keeps the runtime import graph AWS-free
     from .assemble import ProvisioningPlan
@@ -111,11 +118,13 @@ class Supervisor:
         invoke_fn: Optional[InvokeFn] = None,
         session_id: Optional[str] = None,
         arns: Optional[Dict[str, str]] = None,
+        state_store: Optional[StateStore] = None,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
         self._invoke_fn: InvokeFn = invoke_fn or _default_invoke_fn
         self._session_id = session_id or _new_session_id()
+        self._store: StateStore = state_store or InProcessStateStore()
 
         supplied = dict(arns or {})
         self._arns: Dict[str, str] = {}
@@ -149,19 +158,22 @@ class Supervisor:
     def run(self, inputs: Dict[str, Any]) -> Dict[str, Dict]:
         """Invoke every agent in topological order; return ``{node_id: output_dict}``.
 
-        For each node the payload starts from :meth:`_external_inputs`, then each wiring
-        :class:`AgentRef` overlays ``payload[ref.input_name] = extract(outputs[ref.producer],
-        ref.path)`` — the upstream field the resolver promised. The invoke result is
-        :func:`validate_output`-checked against the manifest's output schema before it is
-        stored and made available to downstream nodes.
+        For each node, a node already in ``self._store.completed()`` is skipped (resume — its
+        validated output was recorded on a prior run). Otherwise the payload starts from
+        :meth:`_external_inputs`, then each wiring :class:`AgentRef` overlays
+        ``payload[ref.input_name] = extract(self._store.get(ref.producer), ref.path)`` — the
+        upstream field the resolver promised. The invoke result is :func:`validate_output`-checked
+        against the manifest's output schema, then ``put`` into the store (with its ``producer`` /
+        ``consumes`` edges / ``schema`` tag) and so made available to downstream nodes.
         """
-        outputs: Dict[str, Dict] = {}
         for node in self._plan.order:
+            if node in self._store.completed():
+                continue  # resume: this node already has a recorded validated output
             manifest = self._manifests.get(node)
             wiring: List["AgentRef"] = list(self._plan.wiring.get(node, []))
             payload = self._external_inputs(node, inputs, wiring)
             for ref in wiring:
-                payload[ref.input_name] = extract(outputs[ref.producer], ref.path)
+                payload[ref.input_name] = extract(self._store.get(ref.producer), ref.path)
 
             arn = self._arns.get(node, _ARN_PLACEHOLDER)
             qualifier = (
@@ -173,5 +185,31 @@ class Supervisor:
                 arn, qualifier, self._session_id, json.dumps(payload).encode()
             )
             validate_output(result, manifest.output_schema if manifest else {})
-            outputs[node] = result
-        return outputs
+            self._store.put(
+                node,
+                result,
+                meta={
+                    "producer": node,
+                    "consumes": [f"{r.producer}:{r.path}" for r in wiring],
+                    "schema": manifest.name if manifest else None,
+                },
+            )
+        return {node: self._store.get(node) for node in self._plan.order}
+
+    # -- graph-aware context (v2) -------------------------------------------
+    def context(self, node: str) -> Dict[str, dict]:
+        """Transitive upstream context for ``node``: ``{producer: latest output}``.
+
+        Rebuilds the run graph from the store's recorded ``consumes`` edges and returns the
+        latest validated output of every node in :meth:`~concursus.rungraph.RunGraph.context_order`
+        (its producers, nearest-first, bounded) — shared upstream state as a query rather than
+        point-to-point wiring.
+        """
+        graph = RunGraph.from_records(self._store.records())
+        return {n: self._store.get(n) for n in graph.context_order(node)}
+
+    def index(self) -> RunIndex:
+        """A :class:`~concursus.runindex.RunIndex` over the run's log — Folgezettel-tree
+        traversal (retries / fan-out / branches) plus metadata queries (``status`` / ``schema`` /
+        ``record_type`` / ``producer``) without scanning payloads."""
+        return RunIndex.from_store(self._store)

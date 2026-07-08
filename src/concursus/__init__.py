@@ -59,6 +59,15 @@ from .dag import AgentDAG, DAGError
 from .manifest import AgentManifest, ManifestError
 from .provision import Clients, ProvisionError, provision_plan
 from .resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
+from .rungraph import RunGraph, RunGraphError
+from .runindex import RunIndex
+from .statestore import (
+    InProcessStateStore,
+    MemoryStateStore,
+    Record,
+    StateStore,
+    content_hash,
+)
 from .supervisor import SchemaError, Supervisor
 
 __all__ = [
@@ -76,6 +85,14 @@ __all__ = [
     "ProvisioningPlan",
     "Supervisor",
     "SchemaError",
+    "StateStore",
+    "InProcessStateStore",
+    "MemoryStateStore",
+    "Record",
+    "content_hash",
+    "RunGraph",
+    "RunGraphError",
+    "RunIndex",
     "provision_plan",
     "Clients",
     "ProvisionError",

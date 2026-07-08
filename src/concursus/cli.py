@@ -264,9 +264,34 @@ def _print_run_dryrun(plan: "object", manifests: Dict[str, "object"], inputs: di
     print("\nPass --execute to invoke the live runtimes (requires boto3 + deployed ARNs).")
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
+def _make_run_supervisor(
+    args: argparse.Namespace, plan: "object", manifests: Dict[str, "object"]
+) -> "object":
+    """A Supervisor for ``run --execute``, optionally backed by a durable MemoryStateStore.
+
+    With ``--memory-id`` the run threads through an AgentCore ``MemoryStateStore`` (opt-in,
+    resumable) sharing the supervisor's ``runtimeSessionId``; ``--actor-id`` scopes the event
+    stream (default ``"run"``). Without it the supervisor keeps its offline in-process default.
+    boto3 is imported lazily (only the Memory backend needs it, and only on the first put).
+    """
     from .supervisor import Supervisor
 
+    memory_id = getattr(args, "memory_id", None)
+    if not memory_id:
+        return Supervisor(plan, manifests)
+
+    from .statestore import MemoryStateStore
+
+    supervisor = Supervisor(plan, manifests)  # mint the stable per-run session id
+    store = MemoryStateStore(
+        memory_id=memory_id,
+        session_id=supervisor.session_id,
+        actor_id=getattr(args, "actor_id", None) or "run",
+    )
+    return Supervisor(plan, manifests, session_id=supervisor.session_id, state_store=store)
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
     try:
         manifests, plan = _assemble(args)
         inputs = _load_inputs(args.inputs)
@@ -277,7 +302,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _print_run_dryrun(plan, manifests, inputs)
         return 0
     try:
-        outputs = Supervisor(plan, manifests).run(inputs)
+        outputs = _make_run_supervisor(args, plan, manifests).run(inputs)
     except Exception as exc:  # surface AWS/runtime/schema failures as a clean CLI error
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
@@ -350,6 +375,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="Actually invoke the live runtimes via boto3 (otherwise a dry-run).",
+    )
+    rn.add_argument(
+        "--memory-id",
+        help="Back the run with an AgentCore Memory StateStore (durable, resumable); "
+        "requires --execute + boto3. Omit for the offline in-process store.",
+    )
+    rn.add_argument(
+        "--actor-id",
+        help="Actor id scoping the Memory event stream (default 'run'); used with --memory-id.",
     )
     rn.set_defaults(func=_cmd_run)
 

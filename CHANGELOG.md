@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Reasoning-substrate tier (Phase 5, opt-in, LLM/LangGraph-free by default)** — the plan is
+  FORMED by bounded deliberation strictly BEFORE `assemble`, then LOWERED to a frozen `AgentDAG`;
+  `Supervisor.run` is untouched. Every model/agent seam is injected with deterministic-stub
+  defaults, so `import concursus` and the full test suite run with **neither langgraph nor any LLM**
+  installed (a new optional `reasoning` extra pins langgraph for the accelerated backend).
+  - **`trailstore.HypothesisTrail`** (AI-23/26) — the durable `.3` hypothesis-branch API:
+    `fanout_root_hypotheses` / `fanout_hypotheses` / `open_frontier(depth_cap, confidence_floor)` /
+    `write_verdict` (append VERDICT + flip RESOLVED atomically) / `hypotheses`, plus a Dung
+    grounded-semantics layer (`attack`, `compute_grounded_extension` -> IN/OUT/UNDEC, `arg_label`)
+    and a `require_resolved` / `ThreadNotResolved` convergence guard.
+  - **`dks_engine.DKSEngine`** (AI-24/27/32) — a BOUNDED cyclic deliberation state machine
+    (observe -> … -> re-observe) carrying MDP-ish state `s_t=(n,r,c,f)`; LangGraph backend when
+    available, else a pure-Python fallback driver running the same nodes/routing. `route_by_confidence`
+    + CCS scoring (>=0.85 auto / 0.50–0.85 argue / <0.50 escalate) with injected `policy=` (RL seam)
+    and `counter_argument_fn=` (MOOG seam). Bounded by `max_rounds`/`depth_cap`/`confidence_floor`.
+  - **`inner_graph`** (AI-25/29) — `partition_frontier` / `compile_inner_graph` / `dispatch_frontier`
+    run one investigator per open hypothesis (a fresh disposable per-round projection, clamped to a
+    concurrency ceiling, merged order-insensitively; a worker failure is `InvestigationResult(ok=False)`,
+    never an exception) with `InnerGraphDigest` write-back to the `.2` worker-log lane (idempotent
+    on a dedup key) — never writing `.3` verdicts.
+  - **`deliberate`** (AI-28/30/31) — `seed(goal, retriever=)` (goal-triggered episode, precedent
+    priming), `lower_to_dag(root, require_resolved=)` (a pure deterministic fold of the IN-labelled
+    hypotheses into an immutable `AgentDAG` the existing assembler freezes; raises on an open
+    frontier), and `form_plan(...)` — the bounded SEED -> READ -> DISPATCH -> DIGEST -> VERDICT ->
+    RE-READ driver that terminates in a frozen plan and hands it to the compiler.
 - **Adaptive-compiler tier (opt-in, identity-preserving)** — the plan-generation feedback edge is
   now expressible AROUND the compiler without ever entering `Supervisor.run`:
   - **AI-22 `planner.plan_from_goal(goal, *, precedents=, operator_directives=, plan_model_fn=)`** —

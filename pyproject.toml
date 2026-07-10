@@ -55,6 +55,13 @@ agentcore = [
     "boto3>=1.34.0",
     "bedrock-agentcore",
 ]
+# The Phase-5 reasoning-substrate seams (hypothesis-branch deliberation + Dung grounded labels).
+# The trailstore itself is PURE stdlib; this extra only pulls the OPTIONAL, INJECTED plan/agent
+# drivers a caller may wire (a LangGraph deliberation graph). concursus imports and its full suite
+# passes with NEITHER langgraph NOR any LLM installed — this is never a hard dependency.
+reasoning = [
+    "langgraph>=0.2.0",
+]
 dev = [
     "pytest>=7.0.0",
     "build>=1.0.0",

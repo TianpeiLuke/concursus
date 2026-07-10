@@ -229,6 +229,175 @@ def test_run_raises_schema_error_when_required_output_missing():
         sup.run({"uri": "s3://doc"})
 
 
+# -- failure tolerance: on_error / max_attempts / blocked-skip --------------
+class FlakyInvoker(FakeInvoker):
+    """A FakeInvoker that raises for the first ``fail_times`` calls to a given arn."""
+
+    def __init__(self, outputs_by_arn, *, flaky_arn, fail_times, exc=None):
+        super().__init__(outputs_by_arn)
+        self._flaky_arn = flaky_arn
+        self._fail_times = fail_times
+        self._seen = 0
+        self._exc = exc or RuntimeError("transport boom")
+
+    def __call__(self, arn, qualifier, session_id, payload_bytes):
+        if arn == self._flaky_arn:
+            self._seen += 1
+            if self._seen <= self._fail_times:
+                raise self._exc
+        return super().__call__(arn, qualifier, session_id, payload_bytes)
+
+
+def test_run_default_still_raises_on_schema_error_regression():
+    # Regression guard for the fail-fast contract: the DEFAULT path must raise unchanged.
+    dag, manifests = _chain()
+    broken = _fake_outputs()
+    broken["arn:summarize"] = {"not_summary": "oops"}
+    fake = FakeInvoker(broken)
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+    with pytest.raises(SchemaError, match="summary"):
+        sup.run({"uri": "s3://doc"})
+
+
+def test_on_error_record_writes_failed_record_and_continues():
+    # summarize's output violates its schema; with on_error='record' the run does NOT raise.
+    dag, manifests = _chain()
+    broken = _fake_outputs()
+    broken["arn:summarize"] = {"not_summary": "oops"}
+    fake = FakeInvoker(broken)
+    store = InProcessStateStore()
+    sup = Supervisor(
+        _plan(dag, manifests),
+        manifests,
+        invoke_fn=fake,
+        arns=_ARNS,
+        state_store=store,
+        on_error="record",
+    )
+
+    outputs = sup.run({"uri": "s3://doc"})
+
+    # ingest completed and is returned; summarize failed + critique blocked -> pruned from return.
+    assert set(outputs) == {"ingest"}
+    assert outputs["ingest"] == {"document": "DOC", "extra": 1}
+    assert "summarize" not in outputs
+    assert "critique" not in outputs
+
+    # exactly one failed record was written for summarize.
+    failed = [r for r in store.records() if r.node == "summarize" and r.status == "failed"]
+    assert len(failed) == 1
+
+    # summary() is operator-legible and read-only.
+    s = sup.summary()
+    assert s["completed"] == 1
+    assert s["total"] == 3
+    assert "summarize" in s["failed"]
+    assert "critique" in s["failed"]
+
+
+def test_max_attempts_retries_flaky_node_then_succeeds():
+    # summarize's transport fails twice, then succeeds on the 3rd attempt.
+    dag, manifests = _chain()
+    fake = FlakyInvoker(_fake_outputs(), flaky_arn="arn:summarize", fail_times=2)
+    store = InProcessStateStore()
+    sup = Supervisor(
+        _plan(dag, manifests),
+        manifests,
+        invoke_fn=fake,
+        arns=_ARNS,
+        state_store=store,
+        on_error="record",
+        max_attempts=3,
+    )
+
+    outputs = sup.run({"uri": "s3://doc"})
+
+    # all three nodes completed; the retried node re-invoked the SAME arn (never branched).
+    assert set(outputs) == {"ingest", "summarize", "critique"}
+    assert outputs["summarize"] == {"summary": "SUM"}
+    assert outputs["critique"] == {"critique": "OK"}
+    # summarize was stored exactly once (only the successful attempt is put()).
+    summarize = [r for r in store.records() if r.node == "summarize"]
+    assert len(summarize) == 1
+    assert summarize[0].status == "validated"
+
+
+def test_max_attempts_exhausted_records_single_failed_record():
+    dag, manifests = _chain()
+    fake = FlakyInvoker(_fake_outputs(), flaky_arn="arn:summarize", fail_times=99)
+    store = InProcessStateStore()
+    sup = Supervisor(
+        _plan(dag, manifests),
+        manifests,
+        invoke_fn=fake,
+        arns=_ARNS,
+        state_store=store,
+        on_error="record",
+        max_attempts=2,
+    )
+
+    sup.run({"uri": "s3://doc"})
+
+    # exactly one failed record after exhausting 2 attempts (not one per attempt).
+    failed = [r for r in store.records() if r.node == "summarize" and r.status == "failed"]
+    assert len(failed) == 1
+    # the transport was actually retried max_attempts times.
+    assert fake._seen == 2
+
+
+def test_blocked_downstream_skipped_and_independent_branch_returns():
+    # diamond a->b, a->c, b->d, c->d. 'b' fails -> d is blocked on b; c is independent, returns.
+    dag, manifests = _diamond()
+    fake = FlakyInvoker(_diamond_outputs(), flaky_arn="arn:b", fail_times=99)
+    store = InProcessStateStore()
+    sup = Supervisor(
+        _plan(dag, manifests),
+        manifests,
+        invoke_fn=fake,
+        arns=_DIAMOND_ARNS,
+        state_store=store,
+        on_error="record",
+    )
+
+    outputs = sup.run({"seed": "s3://doc"})
+
+    # a and c completed (independent branch); b failed; d blocked on b -> both pruned from return.
+    assert set(outputs) == {"a", "c"}
+    assert outputs["a"] == {"doc": "DOC"}
+    assert outputs["c"] == {"sc": "SC"}
+    assert "b" not in outputs
+    assert "d" not in outputs
+
+    # d's failed record carries a blocked_on reason naming its missing producer b.
+    d_failed = [r for r in store.records() if r.node == "d" and r.status == "failed"]
+    assert len(d_failed) == 1
+    assert "b" in (d_failed[0].blocked_on or "")
+
+    # summary_line is operator-legible.
+    line = sup.summary_line()
+    assert line.startswith("completed 2/4")
+    assert "node d blocked on b" in line
+
+
+def test_run_default_max_attempts_one_does_not_retry():
+    # Default max_attempts=1 with on_error='record' means no retry (single invoke, then fail).
+    dag, manifests = _chain()
+    fake = FlakyInvoker(_fake_outputs(), flaky_arn="arn:summarize", fail_times=99)
+    sup = Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS, on_error="record"
+    )
+    sup.run({"uri": "s3://doc"})
+    assert fake._seen == 1  # invoked once, no retry
+
+
+def test_invalid_on_error_and_max_attempts_rejected():
+    dag, manifests = _chain()
+    with pytest.raises(ValueError, match="on_error"):
+        Supervisor(_plan(dag, manifests), manifests, on_error="nope")
+    with pytest.raises(ValueError, match="max_attempts"):
+        Supervisor(_plan(dag, manifests), manifests, max_attempts=0)
+
+
 # -- arn fallback -----------------------------------------------------------
 def test_arn_falls_back_to_manifest_registry():
     dag, manifests = _chain()

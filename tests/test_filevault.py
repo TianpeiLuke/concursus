@@ -100,7 +100,7 @@ def test_failed_record_excluded_from_completed(tmp_path):
 # -- persistence + resume ---------------------------------------------------
 def test_notes_written_to_disk(tmp_path):
     run = tmp_path / "run"
-    fv = FileVaultStateStore(run)
+    fv = FileVaultStateStore(run, slipbox_form=True)  # opt into the authentic-SlipBox form
     fv.put("a", {"x": 1})
     fv.put("b", {"y": 2})
     record_notes = sorted(p for p in run.glob("*.md") if p.name != "_run.md")
@@ -112,6 +112,55 @@ def test_notes_written_to_disk(tmp_path):
         assert text.startswith("---")
         assert "\npayload: b64:" in text
         assert "\nmeta: b64:" in text
+
+
+def test_default_form_is_slipbox_and_roundtrips(tmp_path):
+    """The DEFAULT posture is the authentic Abuse-SlipBox form: a ``_run.md`` entry point plus
+    per-record notes carrying SlipBox scaffolding (building_block/folgezettel/Related-Notes), and
+    the durable log still round-trips arbitrary outputs exactly and resumes from a fresh store."""
+    run = tmp_path / "run"
+    fv = FileVaultStateStore(run)  # no slipbox_form -> default
+    assert fv._slipbox_form is True
+    fv.put("summarize", {"summary": "multi\nline\n---\ntext", "n": 3, "s": "0123"},
+           meta={"producer": "summarize", "consumes": ["ingest:$.document"]})
+
+    # The SlipBox form writes a Folgezettel entry point + a conformant record note.
+    assert (run / "_run.md").exists()
+    record_notes = [p for p in run.glob("*.md") if p.name != "_run.md"]
+    assert len(record_notes) == 1
+    text = record_notes[0].read_text()
+    assert "\npayload: b64:" in text and "\nmeta: b64:" in text
+    assert "building_block:" in text
+    assert "folgezettel:" in text
+    assert "## Related Notes" in text
+
+    # Resume-by-reload from a fresh store reconstructs the frontier and the exact output.
+    resumed = FileVaultStateStore(run)
+    assert resumed.completed() == {"summarize"}
+    assert resumed.get("summarize") == {"summary": "multi\nline\n---\ntext", "n": 3, "s": "0123"}
+
+
+def test_lean_form_opt_out_omits_slipbox_scaffolding_and_roundtrips(tmp_path):
+    """``slipbox_form=False`` is the lean opt-out: no ``_run.md`` entry point and none of the
+    SlipBox scaffolding, yet the durable log still round-trips arbitrary outputs exactly."""
+    run = tmp_path / "run"
+    fv = FileVaultStateStore(run, slipbox_form=False)
+    assert fv._slipbox_form is False
+    fv.put("summarize", {"summary": "multi\nline\n---\ntext", "n": 3, "s": "0123"},
+           meta={"producer": "summarize", "consumes": ["ingest:$.document"]})
+
+    assert not (run / "_run.md").exists()
+    record_notes = [p for p in run.glob("*.md")]
+    assert len(record_notes) == 1
+    text = record_notes[0].read_text()
+    assert "\npayload: b64:" in text and "\nmeta: b64:" in text
+    assert "building_block:" not in text
+    assert "folgezettel:" not in text
+    assert "## Related Notes" not in text
+
+    resumed = FileVaultStateStore(run, slipbox_form=False)
+    assert resumed.completed() == {"summarize"}
+    assert resumed.get("summarize") == {"summary": "multi\nline\n---\ntext", "n": 3, "s": "0123"}
 
 
 def test_resume_by_reload_from_fresh_store(tmp_path):
@@ -171,7 +220,8 @@ def test_run_db_mirrors_records_and_edges(tmp_path):
 
 def test_slipbox_form_frontmatter_is_conformant(tmp_path):
     fv = FileVaultStateStore.from_config(
-        vault_path=tmp_path, session_id="concursus-" + "a" * 40, date="2026-07-10"
+        vault_path=tmp_path, session_id="concursus-" + "a" * 40, date="2026-07-10",
+        slipbox_form=True,  # opt into the authentic-SlipBox form under test
     )
     fv.put("summarize", {"summary": "s"},
            meta={"producer": "summarize", "consumes": ["ingest:$.document"], "schema": "sum"})
@@ -192,7 +242,8 @@ def test_slipbox_form_frontmatter_is_conformant(tmp_path):
 def test_building_block_is_derived_from_record_kind(tmp_path):
     import glob
     fv = FileVaultStateStore.from_config(
-        vault_path=tmp_path, session_id="concursus-" + "b" * 40, date="2026-07-10"
+        vault_path=tmp_path, session_id="concursus-" + "b" * 40, date="2026-07-10",
+        slipbox_form=True,  # building_block is a SlipBox-form field
     )
     fv.put("ok", {"x": 1})                                   # validated -> empirical_observation
     fv.put("bad", {"e": "boom"}, meta={"status": "failed"})  # failed -> counter_argument

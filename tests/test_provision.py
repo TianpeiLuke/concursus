@@ -285,6 +285,45 @@ def test_provision_agent_without_role_raises():
         provision_agent(entry, clients=clients, run=run)
 
 
+# -- reuse-by-content (fingerprint / AI-11) ---------------------------------
+def test_provision_agent_reuses_on_matching_fingerprint(tmp_path):
+    clients, run = _fakes()
+    entry = _container_entry()
+    res = provision_agent(
+        entry,
+        clients=clients,
+        source_dir=str(tmp_path),
+        run=run,
+        known_fingerprints={entry.name: entry.fingerprint},
+    )
+    assert res["action"] == "reused"
+    assert clients.control.calls == []  # nothing re-created
+    assert run.cmds == []  # nothing rebuilt
+
+
+def test_provision_agent_updates_on_changed_fingerprint(tmp_path):
+    clients, run = _fakes()
+    entry = _container_entry()
+    res = provision_agent(
+        entry,
+        clients=clients,
+        source_dir=str(tmp_path),
+        run=run,
+        known_fingerprints={entry.name: "stale-fingerprint"},
+    )
+    assert res["action"] == "updated"
+    assert len(clients.control.calls) == 1  # re-provisioned
+    assert res["arn"].startswith("arn:aws:bedrock-agentcore:")
+
+
+def test_provision_agent_defaults_to_created_without_known_fingerprints(tmp_path):
+    # Default path is byte-for-byte unchanged: no known_fingerprints ⇒ always "created".
+    clients, run = _fakes()
+    entry = _container_entry()
+    res = provision_agent(entry, clients=clients, source_dir=str(tmp_path), run=run)
+    assert res["action"] == "created"
+
+
 # -- provision_plan ---------------------------------------------------------
 def test_provision_plan_runs_every_node_in_order(tmp_path):
     from concursus.assemble import OrchestrationAssembler

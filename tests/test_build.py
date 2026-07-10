@@ -12,6 +12,7 @@ from concursus.build import (
     McpAgentTemplate,
     PreBuiltRegistrar,
     RuntimeBuilderFactory,
+    fingerprint,
     render_execution_role,
 )
 
@@ -282,3 +283,70 @@ def test_build_plan_entry_to_dict_round_trips():
     assert d["name"] == "summarize"
     assert d["invoke"]["protocol"] == "HTTP"
     assert d["create_agent_runtime"]["protocolConfiguration"]["serverProtocol"] == "HTTP"
+    assert d["fingerprint"] == entry.fingerprint
+
+
+# -- content fingerprint (DEPLOY-IDENTITY / AI-11) --------------------------
+def test_identical_manifests_produce_equal_fingerprints():
+    a = RuntimeBuilderFactory.synthesize(_manifest())
+    b = RuntimeBuilderFactory.synthesize(_manifest())
+    assert a.fingerprint == b.fingerprint
+    assert a.fingerprint  # non-empty
+    # the free helper agrees with the value stamped on the entry
+    assert fingerprint(_manifest()) == a.fingerprint
+
+
+def test_fingerprint_changes_when_container_uri_changes():
+    base = fingerprint(_manifest())
+    other = fingerprint(_manifest(container_uri="acct.dkr.ecr.us-east-1.amazonaws.com/other:2"))
+    assert base != other
+
+
+def test_fingerprint_changes_when_protocol_changes():
+    assert fingerprint(_manifest(protocol="HTTP")) != fingerprint(_manifest(protocol="MCP"))
+
+
+def test_fingerprint_changes_when_output_schema_changes():
+    m1 = _manifest()
+    m2 = _manifest()
+    m2.contract["outputs"] = {"summary": {"type": "string"}, "score": {"type": "number"}}
+    assert fingerprint(m1) != fingerprint(m2)
+
+
+def test_fingerprint_stable_across_registry_key_order():
+    # Same hosting inputs supplied in a different dict order hash identically (canonical JSON).
+    m1 = _manifest()
+    m2 = AgentManifest.from_dict(
+        {
+            "name": "summarize",
+            "registry": {
+                "role_arn": "arn:aws:iam::123456789012:role/agent",
+                "entry": "agents.summarize:run",
+                "protocol": "HTTP",
+                "container_uri": "acct.dkr.ecr.us-east-1.amazonaws.com/agents:latest",
+            },
+            "contract": {
+                "inputs": {"lang": {"type": "string"}, "document": {"type": "string"}},
+                "outputs": {"summary": {"type": "string"}},
+            },
+        }
+    )
+    assert fingerprint(m1) == fingerprint(m2)
+
+
+def test_fingerprint_ignores_agent_behavior_inputs():
+    # Behavior inputs (model/prompt/sops) are NOT hosting identity — they must not shift the fp.
+    base = fingerprint(_manifest())
+    with_behavior = fingerprint(
+        _manifest(model="anthropic.claude-3", prompt="be terse", sops=["sop-1"])
+    )
+    assert base == with_behavior
+
+
+def test_fingerprint_folds_synthesized_role_when_no_role_arn():
+    m = _manifest()
+    m.registry.pop("role_arn")
+    fp = fingerprint(m, account="123456789012", region="us-east-1")
+    assert fp
+    # a synthesized-role fingerprint differs from the explicit-role one
+    assert fp != fingerprint(_manifest())

@@ -93,6 +93,64 @@ def load_records(run_dir) -> List[Record]:
     return records
 
 
+_PRECEDENT_SCHEMA = """
+CREATE TABLE precedents (
+    trail_id   TEXT PRIMARY KEY,   -- one row per distilled run/family
+    status     TEXT NOT NULL,      -- completed | partial | failed (derived verdict)
+    total      INTEGER NOT NULL,
+    completed  INTEGER NOT NULL,
+    n_failed   INTEGER NOT NULL,
+    nodes_json TEXT NOT NULL,      -- the executed node set
+    payload_json TEXT NOT NULL     -- the full precedent payload (source of truth is the note)
+);
+CREATE INDEX ix_precedents_status ON precedents(status);
+"""
+
+
+def build_precedent_db(vault_path, db_path: Optional[str] = None) -> str:
+    """Rebuild the derived cross-run precedent DB from the precedent notes; return the DB path.
+
+    The at-rest analogue of :func:`~concursus.distill.render_precedent_hub`: reads ONLY the notes
+    under ``<vault>/precedents/`` (the source of truth), DROP+recreates the table (a pure
+    projection), and writes ``<vault>/precedents/index/precedents.sqlite`` by default. It is a
+    read-only *retrieval index* over finished runs — never a live router; deleting it loses
+    nothing. Idempotent and disposable.
+    """
+    from .distill import load_precedents, precedents_dir
+
+    vault_path = Path(vault_path)
+    if db_path is None:
+        index_dir = precedents_dir(vault_path) / "index"
+        index_dir.mkdir(parents=True, exist_ok=True)
+        db_path = str(index_dir / "precedents.sqlite")
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.executescript("DROP TABLE IF EXISTS precedents;")
+        con.executescript(_PRECEDENT_SCHEMA)
+        for r in load_precedents(vault_path):
+            payload = r.output if isinstance(r.output, dict) else {}
+            trail_id = str(payload.get("trail_id") or r.node)
+            outcome = payload.get("outcome") or {}
+            failed = outcome.get("failed") or {}
+            con.execute(
+                "INSERT OR REPLACE INTO precedents VALUES (?,?,?,?,?,?,?)",
+                (
+                    trail_id,
+                    str(payload.get("status", "")),
+                    int(outcome.get("total", 0) or 0),
+                    int(outcome.get("completed", 0) or 0),
+                    len(failed),
+                    json.dumps(payload.get("nodes") or [], sort_keys=True),
+                    json.dumps(payload, sort_keys=True),
+                ),
+            )
+        con.commit()
+    finally:
+        con.close()
+    return db_path
+
+
 def build_run_db(run_dir, db_path: Optional[str] = None) -> str:
     """Rebuild the derived SQLite DB for one run from its note files; return the DB path.
 

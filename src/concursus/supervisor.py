@@ -119,12 +119,22 @@ class Supervisor:
         session_id: Optional[str] = None,
         arns: Optional[Dict[str, str]] = None,
         state_store: Optional[StateStore] = None,
+        on_error: str = "raise",
+        max_attempts: int = 1,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
         self._invoke_fn: InvokeFn = invoke_fn or _default_invoke_fn
         self._session_id = session_id or _new_session_id()
         self._store: StateStore = state_store or InProcessStateStore()
+
+        if on_error not in ("raise", "record"):
+            raise ValueError(f"on_error must be 'raise' or 'record', got {on_error!r}")
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+        # DEFAULTS ('raise', 1) preserve today's byte-for-byte fail-fast single forward pass.
+        self._on_error = on_error
+        self._max_attempts = max_attempts
 
         supplied = dict(arns or {})
         self._arns: Dict[str, str] = {}
@@ -158,43 +168,108 @@ class Supervisor:
     def run(self, inputs: Dict[str, Any]) -> Dict[str, Dict]:
         """Invoke every agent in topological order; return ``{node_id: output_dict}``.
 
-        For each node, a node already in ``self._store.completed()`` is skipped (resume — its
-        validated output was recorded on a prior run). Otherwise the payload starts from
-        :meth:`_external_inputs`, then each wiring :class:`AgentRef` overlays
-        ``payload[ref.input_name] = extract(self._store.get(ref.producer), ref.path)`` — the
-        upstream field the resolver promised. The invoke result is :func:`validate_output`-checked
-        against the manifest's output schema, then ``put`` into the store (with its ``producer`` /
-        ``consumes`` edges / ``schema`` tag) and so made available to downstream nodes.
+        A single forward pass over the frozen ``plan.order``. For each node, one already in
+        ``self._store.completed()`` is skipped (resume — its validated output was recorded on a
+        prior run); one whose upstream producers have not completed is recorded ``failed`` with a
+        ``blocked_on`` reason and skipped (so :func:`extract` never hits a missing-producer
+        ``KeyError``); otherwise it is handed to :meth:`_dispatch`.
+
+        Default behavior (``on_error='raise'``, ``max_attempts=1``) is byte-for-byte the original
+        fail-fast pass. With ``on_error='record'`` a terminal invoke/validate failure is recorded
+        (never raised) and the pass continues, so a failure prunes only its dependent subtree —
+        the return is ``{node: output for node in plan.order if node in completed()}``, so
+        independent branches still return.
         """
         for node in self._plan.order:
             if node in self._store.completed():
                 continue  # resume: this node already has a recorded validated output
-            manifest = self._manifests.get(node)
             wiring: List["AgentRef"] = list(self._plan.wiring.get(node, []))
-            payload = self._external_inputs(node, inputs, wiring)
-            for ref in wiring:
-                payload[ref.input_name] = extract(self._store.get(ref.producer), ref.path)
 
-            arn = self._arns.get(node, _ARN_PLACEHOLDER)
-            qualifier = (
-                str(manifest.registry.get("qualifier", "DEFAULT"))
-                if manifest is not None
-                else "DEFAULT"
-            )
-            result = self._invoke_fn(
-                arn, qualifier, self._session_id, json.dumps(payload).encode()
-            )
-            validate_output(result, manifest.output_schema if manifest else {})
+            # blocked-skip: a producer this node consumes never completed (e.g. it failed or was
+            # itself blocked). Record the node failed with the reason and skip — this prunes
+            # WITHIN plan.wiring, never rewrites the topology.
+            completed = self._store.completed()
+            blocked = [ref.producer for ref in wiring if ref.producer not in completed]
+            if blocked:
+                reason = f"blocked on {', '.join(sorted(set(blocked)))}"
+                self._store.put(
+                    node,
+                    {},
+                    meta={
+                        "status": "failed",
+                        "producer": node,
+                        "blocked_on": reason,
+                        "address": node,
+                    },
+                )
+                continue
+
+            self._dispatch(node, inputs, wiring)
+        return {node: self._store.get(node) for node in self._plan.order if node in self._store.completed()}
+
+    def _dispatch(
+        self, node: str, inputs: Dict[str, Any], wiring: List["AgentRef"]
+    ) -> None:
+        """Invoke one manifest-pinned node id and admit its validated output to the store.
+
+        The payload starts from :meth:`_external_inputs`, then each wiring :class:`AgentRef`
+        overlays ``payload[ref.input_name] = extract(self._store.get(ref.producer), ref.path)`` —
+        the upstream field the resolver promised. The invoke result is
+        :func:`validate_output`-checked against the manifest's output schema, then ``put`` into the
+        store (with its ``producer`` / ``consumes`` edges / ``schema`` tag).
+
+        With ``on_error='record'`` a transport/validation exception retries the SAME pinned node
+        id up to ``max_attempts`` (never branching or synthesizing a node); on terminal failure it
+        writes ONE failed record and returns. With the default ``on_error='raise'`` the exception
+        propagates unchanged (fail-fast).
+        """
+        manifest = self._manifests.get(node)
+        payload = self._external_inputs(node, inputs, wiring)
+        for ref in wiring:
+            payload[ref.input_name] = extract(self._store.get(ref.producer), ref.path)
+
+        arn = self._arns.get(node, _ARN_PLACEHOLDER)
+        qualifier = (
+            str(manifest.registry.get("qualifier", "DEFAULT"))
+            if manifest is not None
+            else "DEFAULT"
+        )
+        payload_bytes = json.dumps(payload).encode()
+        consumes = [f"{r.producer}:{r.path}" for r in wiring]
+        schema = manifest.name if manifest else None
+
+        # Local attempt counter: Record.attempt only auto-increments INSIDE store.put(), which
+        # runs after a successful invoke — so we track retries ourselves rather than reading it.
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = self._invoke_fn(arn, qualifier, self._session_id, payload_bytes)
+                validate_output(result, manifest.output_schema if manifest else {})
+            except Exception as exc:
+                if self._on_error != "record":
+                    raise  # fail-fast: default path propagates unchanged
+                if attempt < self._max_attempts:
+                    continue  # retry the SAME manifest-pinned node id
+                # terminal failure: write ONE failed record and stop (prune the subtree).
+                self._store.put(
+                    node,
+                    {"error": str(exc), "error_type": type(exc).__name__},
+                    meta={
+                        "status": "failed",
+                        "producer": node,
+                        "consumes": consumes,
+                        "schema": schema,
+                        "address": f"{node}/{attempt}",
+                    },
+                )
+                return
             self._store.put(
                 node,
                 result,
-                meta={
-                    "producer": node,
-                    "consumes": [f"{r.producer}:{r.path}" for r in wiring],
-                    "schema": manifest.name if manifest else None,
-                },
+                meta={"producer": node, "consumes": consumes, "schema": schema},
             )
-        return {node: self._store.get(node) for node in self._plan.order}
+            return
 
     # -- graph-aware context (v2) -------------------------------------------
     def context(self, node: str) -> Dict[str, dict]:
@@ -213,3 +288,43 @@ class Supervisor:
         traversal (retries / fan-out / branches) plus metadata queries (``status`` / ``schema`` /
         ``record_type`` / ``producer``) without scanning payloads."""
         return RunIndex.from_store(self._store)
+
+    def summary(self) -> Dict[str, Any]:
+        """A read-only, operator-legible partial-run summary derived purely from the store's log.
+
+        Computed from ``RunIndex.query(status='failed')`` + ``store.completed()`` +
+        ``len(plan.order)`` — no side effects, no change to the ``{node: output}`` return contract.
+        Returns ``total`` / ``completed`` counts, the completed node set, and per-failed-node rows
+        distinguishing a genuine failure from a ``blocked_on`` skip (the reason is read from the
+        failed record's ``blocked_on`` meta).
+        """
+        order = list(self._plan.order)
+        completed = self._store.completed()
+        failed_records = RunIndex.from_store(self._store).query(status="failed")
+        # latest failed record per node wins (a node may have multiple failed attempts).
+        failed: Dict[str, str] = {}
+        for r in failed_records:
+            if r.node in completed:
+                continue  # a later attempt validated — not a terminal failure
+            failed[r.node] = getattr(r, "blocked_on", None) or ""
+        return {
+            "total": len(order),
+            "completed": len(completed),
+            "completed_nodes": sorted(completed),
+            "failed": failed,
+            "order": order,
+        }
+
+    def summary_line(self) -> str:
+        """A one-line human rendering of :meth:`summary` for the CLI failure path.
+
+        E.g. ``"completed 4/6; node summarize failed; node critique blocked on summarize"``.
+        """
+        s = self.summary()
+        parts = [f"completed {s['completed']}/{s['total']}"]
+        for node in s["order"]:
+            reason = s["failed"].get(node)
+            if reason is None:
+                continue
+            parts.append(f"node {node} {reason}" if reason else f"node {node} failed")
+        return "; ".join(parts)

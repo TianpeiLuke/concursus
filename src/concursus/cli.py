@@ -295,6 +295,7 @@ def _make_run_supervisor(
             vault_path=vault,
             session_id=supervisor.session_id,
             date=datetime.date.today().isoformat(),
+            slipbox_form=not getattr(args, "lean_form", False),
         )
     else:
         from .statestore import MemoryStateStore
@@ -317,11 +318,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not args.execute:
         _print_run_dryrun(plan, manifests, inputs)
         return 0
+    supervisor = None
     try:
         supervisor = _make_run_supervisor(args, plan, manifests)
         outputs = supervisor.run(inputs)
     except Exception as exc:  # surface AWS/runtime/schema failures as a clean CLI error
         print(f"FAIL  {exc}", file=sys.stderr)
+        if supervisor is not None:  # operator-legible partial summary (read-only, from the log)
+            try:
+                print(supervisor.summary_line(), file=sys.stderr)
+            except Exception:  # a summary must never mask the original failure
+                pass
         return 1
     print(json.dumps(outputs, indent=2))
     vault = getattr(args, "vault", None)
@@ -406,6 +413,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Persist the run as durable markdown notes under DIR/runs/<session>/ (offline, "
         "resumable, no AWS) and build a derived SQLite run DB. Omit for the in-process store.",
+    )
+    rn.add_argument(
+        "--lean-form",
+        action="store_true",
+        help="With --vault, emit the lean machine form (node/attempt/status/consumes/payload) "
+        "instead of the default authentic Abuse-SlipBox notes (FZ/lineage/building_block/"
+        "Related-Notes + a _run.md entry point). Use for a smaller, non-indexed durable log.",
     )
     rn.add_argument(
         "--memory-id",

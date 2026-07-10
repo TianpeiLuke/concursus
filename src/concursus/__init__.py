@@ -60,9 +60,16 @@ from .filevault import FileVaultStateStore
 from .manifest import AgentManifest, ManifestError
 from .provision import Clients, ProvisionError, provision_plan
 from .resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
-from .rundb import build_run_db
+from .distill import (
+    build_precedent_payload,
+    distill_run,
+    distill_store,
+    load_precedents,
+    render_precedent_hub,
+)
+from .rundb import build_precedent_db, build_run_db
 from .rungraph import RunGraph, RunGraphError
-from .runindex import RunIndex
+from .runindex import PrecedentIndex, RunIndex
 from .statestore import (
     InProcessStateStore,
     MemoryStateStore,
@@ -96,7 +103,14 @@ __all__ = [
     "RunGraph",
     "RunGraphError",
     "RunIndex",
+    "PrecedentIndex",
     "build_run_db",
+    "build_precedent_db",
+    "distill_run",
+    "distill_store",
+    "build_precedent_payload",
+    "render_precedent_hub",
+    "load_precedents",
     "provision_plan",
     "Clients",
     "ProvisionError",

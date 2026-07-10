@@ -64,6 +64,7 @@ db.sqlite3-journal
 # Concursus persisted run vaults + derived run DBs (notes are source of truth; DB is disposable)
 .concursus/
 **/runs/*/index/
+**/precedents/index/
 
 # Flask stuff:
 instance/

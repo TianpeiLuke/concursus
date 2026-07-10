@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Failure-tolerant `Supervisor` (opt-in)** — `Supervisor(on_error='record', max_attempts=N)`
+  turns the static topo executor into a *fault-tolerant* one **without making it dynamic**: a
+  failed node is recorded (`status='failed'`) and the run continues, transitively-blocked
+  downstream nodes are skipped with a `blocked_on` reason, and `run()` returns the partial
+  `{node: output}` of everything that completed. Bounded retry re-invokes the **same**
+  manifest-pinned node id up to `max_attempts` (never branches/replans the topology). A new
+  read-only `summary()` / `summary_line()` folds the partial outcome purely from the store, and
+  the CLI prints it on failure. **Defaults are byte-for-byte fail-fast** (`on_error='raise'`,
+  `max_attempts=1`) — the tested schema-error contract is unchanged.
+- **Typed, self-validating `Record` fields** — `RecordStatus` / `RecordType` (`str`-subclass
+  enums) + `Record.__post_init__` + `StateStoreError`: an unknown `status` now fails loudly at
+  construction instead of silently dropping a node from `completed()`; unknown `record_type`
+  widens-and-warns. Str-subclass enums keep every `== 'validated'` comparison and the on-disk
+  form byte-identical.
+- **Reentrant-lock guard** on `InProcessStateStore` / `MemoryStateStore` (`threading.RLock`
+  around read-then-write bodies) so a future concurrent-dispatch supervisor cannot lose-update
+  internal state. RLock only — the in-memory stores don't take on `FileVaultStateStore`'s
+  fcntl+OCC.
+- **Content fingerprint + reuse-by-content on deploy** — `build.fingerprint(manifest)` hashes an
+  agent's **hosting identity** (container/protocol/entry/network/role/input-keys/output-schema —
+  *not* model/prompt/behavior) with the same sha256-canonical-JSON discipline as
+  `content_hash`, stamped onto `BuildPlanEntry.fingerprint`. `provision_agent(..., known_fingerprints=)`
+  (opt-in) then reports `action='reused'` on a matching fingerprint and `'updated'` on a changed
+  one — deploy dedup + real-change detection, never a dispatch-time version chooser.
+- **`distill` — post-run precedent notes + a cross-run hub** — `distill.distill_run(store)` folds
+  a finished run's `{node: output}` + recorded `consumes` graph + outcome into one compact
+  precedent note under `<vault>/precedents/` (a sibling of `runs/`, deliberately isolated so a
+  precedent is never reloaded as a run record). `distill.render_precedent_hub` is a pure,
+  idempotent `entry_folgezettel_trails`-style projection over the set of precedent notes (one row
+  per run), with a `runindex.PrecedentIndex` cross-run query surface and a disposable
+  `rundb.build_precedent_db`. All read-only / post-run — the compiler identity is untouched.
+- **`concursus run --vault --lean-form`** — the on-disk `StateStore` emits authentic
+  Abuse-SlipBox notes by default (`slipbox_form=True` — indexer-ingestible, with a `_run.md`
+  entry point); the new **`--lean-form`** CLI flag (or `slipbox_form=False`) opts into the lean
+  machine schema (`node`/`attempt`/`status`/`consumes`/`payload`) for a smaller, non-indexed
+  round-trip-exact durable log.
 - **`FileVaultStateStore`** — a persistent, on-disk `StateStore` backend (no AWS), closing the
   gap that the in-memory `InProcessStateStore` (state lost on exit) and the opaque-Blob
   `MemoryStateStore` left open. Each record is written as a **round-trip-exact markdown note**

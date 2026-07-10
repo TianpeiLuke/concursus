@@ -51,10 +51,12 @@ _BLOB_PREFIX = "b64:"
 _LOCK_NAME = ".concursus.lock"
 _GEN_NAME = ".concursus.gen"
 
-# The default vault posture: emit notes conformant to the Abuse SlipBox format (validate under
-# ``check_note_format.py`` / ``validate_fz_trails.py``) so a run's on-disk notes are a genuine,
-# indexer-ingestible slipbox trail — not merely durable markdown. Set ``slipbox_form=False`` for
-# the leaner machine schema (see FZ 35e1b1: the authentic form is optional for ephemeral run-state).
+# The vault posture: by DEFAULT the store emits notes conformant to the Abuse SlipBox format
+# (``slipbox_form=True`` — validate under ``check_note_format.py`` / ``validate_fz_trails.py``) so a
+# run's on-disk notes read as a genuine, indexer-ingestible slipbox trail (FZ/lineage/building_block/
+# Related-Notes + a ``_run.md`` entry point). Pass ``slipbox_form=False`` to emit the lean machine
+# schema (``node`` / ``attempt`` / ``status`` / ``consumes`` / ``payload``) — a leaner, round-trip-exact
+# durable log — when the run's notes are not meant to be human-browsable/indexer-ingestible.
 _SLIPBOX_TOPICS = ["Multi-Agent Orchestration", "Concursus Run State"]
 
 # A record's status maps onto the SlipBox status vocabulary (validated→active, failed→draft).
@@ -153,13 +155,13 @@ def _record_to_note(
     blob plus the machine frontmatter keys, never the display fields, so the round-trip is exact
     either way:
 
+    * ``slipbox_form=False`` (opt-out) emits the lean machine schema (``node`` / ``attempt`` /
+      ``status`` / ``consumes`` / ``payload``) — a smaller, non-indexed durable log;
     * ``slipbox_form=True`` (default) emits a note conformant to the Abuse SlipBox format —
       P.A.R.A. ``tags`` / ``keywords`` / ``topics`` / ``building_block`` / valid ``status`` /
       ``folgezettel`` / ``lineage`` / ``access_control_group``, a typed H1, and a
       ``## Related Notes`` section — so it validates under ``check_note_format.py`` and reads as a
-      genuine, indexer-ingestible slipbox trail;
-    * ``slipbox_form=False`` emits the lean machine schema (``node`` / ``attempt`` / ``status`` /
-      ``consumes`` / ``payload``) for a smaller, non-indexed durable log.
+      genuine, indexer-ingestible slipbox trail.
     """
     machine = _build_metadata(record)  # the authoritative, all-string run-state keys
     # Two authoritative, lossless lines the reader reconstructs from — the HiveFleet discipline:
@@ -340,13 +342,25 @@ class FileVaultStateStore:
         """Bind a run to ``<vault_path>/runs/<slug(session_id)>/`` (persistence-by-default posture).
 
         Emits SlipBox-conformant notes by default (``slipbox_form=True`` — validate under
-        ``check_note_format.py``); pass ``slipbox_form=False`` for the lean machine schema. The
-        run's ``trail_id`` (SlipBox lineage path id) is derived from ``session_id``. Callers that
-        want ephemeral behaviour keep the bare :class:`InProcessStateStore` default; this is the
+        ``check_note_format.py``, indexer-ingestible); pass ``slipbox_form=False`` for the lean
+        machine schema (a smaller, non-indexed round-trip-exact durable log). The run's
+        ``trail_id`` (SlipBox lineage path id) is derived from ``session_id``. Callers that want
+        ephemeral behaviour keep the bare :class:`InProcessStateStore` default; this is the
         explicit persistent choice (mirrors ``MemoryService.from_config``).
         """
         run_dir = Path(vault_path) / "runs" / _slug(session_id)
         return cls(run_dir, slipbox_form=slipbox_form, trail_id=_trail_id(session_id), date=date)
+
+    # -- run identity (for post-run distillation; read-only accessors) ------
+    @property
+    def run_dir(self) -> Path:
+        """The run's on-disk directory (the note substrate for this run)."""
+        return self._dir
+
+    @property
+    def trail_id(self) -> str:
+        """The run's SlipBox lineage/trail id (the family key for cross-run precedent)."""
+        return self._trail_id
 
     # -- write --------------------------------------------------------------
     def put(self, node: str, output: dict, *, meta: Optional[dict] = None) -> None:

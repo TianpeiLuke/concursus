@@ -173,3 +173,45 @@ class RunIndex:
             "descendants": self.descendants(address),
             "siblings": self.siblings(address),
         }
+
+
+class PrecedentIndex:
+    """A read-only, cross-run retrieval index over distilled precedent notes (the AI-16 in-process
+    analogue of :func:`~concursus.distill.render_precedent_hub`).
+
+    Where :class:`RunIndex` indexes ONE run's log, this indexes the SET of per-run precedent
+    payloads — one entry per run/family, keyed by ``trail_id`` — so accumulated runs become
+    retrievable precedent (query by ``status``, look up one run, list all). It is a pure
+    projection: it reads the precedent notes and selects/queries, never a live router or scheduler
+    (it starts and seeds no run). Deleting the notes empties it; nothing is a source of truth here.
+    """
+
+    def __init__(self, precedents: Iterable[Dict[str, object]]) -> None:
+        self._by_trail: Dict[str, Dict[str, object]] = {}
+        for payload in precedents:
+            tid = str(payload.get("trail_id") or "")
+            if tid:
+                self._by_trail[tid] = dict(payload)
+
+    @classmethod
+    def from_vault(cls, vault_path) -> "PrecedentIndex":
+        """Build the index over every precedent note under ``<vault>/precedents/`` (source of truth)."""
+        from .distill import _precedents_by_trail
+
+        return cls(_precedents_by_trail(vault_path).values())
+
+    def trails(self) -> List[str]:
+        """Every distilled run/family id, sorted."""
+        return sorted(self._by_trail)
+
+    def get(self, trail_id: str) -> Optional[Dict[str, object]]:
+        """The precedent payload for one run/family (``None`` if not distilled)."""
+        return self._by_trail.get(trail_id)
+
+    def query(self, *, status: Optional[str] = None) -> List[Dict[str, object]]:
+        """Precedent payloads, optionally filtered to a run ``status`` (``completed`` / ``partial``
+        / ``failed``); trail-id order."""
+        out = [self._by_trail[t] for t in sorted(self._by_trail)]
+        if status is not None:
+            out = [p for p in out if p.get("status") == status]
+        return out

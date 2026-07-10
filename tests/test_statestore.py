@@ -11,7 +11,15 @@ import json
 
 import pytest
 
-from concursus.statestore import InProcessStateStore, MemoryStateStore, content_hash
+from concursus.statestore import (
+    InProcessStateStore,
+    MemoryStateStore,
+    Record,
+    RecordStatus,
+    RecordType,
+    StateStoreError,
+    content_hash,
+)
 
 
 # -- fake AgentCore Memory data-plane client --------------------------------
@@ -138,6 +146,30 @@ def test_inprocess_content_hash_dedup_marker():
     assert store.completed() == {"ingest"}
 
 
+def test_inprocess_blocked_on_meta_is_recorded():
+    store = InProcessStateStore()
+    store.put(
+        "critique",
+        {},
+        meta={"status": "failed", "producer": "critique", "blocked_on": "blocked on summarize"},
+    )
+    rec = store.records()[0]
+    assert rec.status == "failed"
+    assert rec.blocked_on == "blocked on summarize"
+    assert "critique" not in store.completed()
+
+
+def test_inprocess_has_reentrant_lock_guard():
+    import threading
+
+    store = InProcessStateStore()
+    assert isinstance(store._lock, type(threading.RLock()))
+    # reentrancy: put (which locks) is callable from within a held lock without deadlock.
+    with store._lock:
+        store.put("n", {"x": 1})
+    assert store.get("n") == {"x": 1}
+
+
 def test_inprocess_failed_latest_is_not_completed_but_get_returns_prior_validated():
     store = InProcessStateStore()
     store.put("critique", {"critique": "OK"})
@@ -147,6 +179,48 @@ def test_inprocess_failed_latest_is_not_completed_but_get_returns_prior_validate
     assert "critique" not in store.completed()
     # ... but get still returns the latest VALIDATED output.
     assert store.get("critique") == {"critique": "OK"}
+
+
+# == (a2) Record self-validating typed enums =================================
+def test_record_coerces_status_and_record_type_through_enums():
+    r = Record(node="n", output={}, status="validated", record_type="agent_output")
+    # coerced to the enum members, which (being str subclasses) still compare == the bare value.
+    assert r.status == "validated"
+    assert isinstance(r.status, RecordStatus)
+    assert r.record_type == "agent_output"
+    assert isinstance(r.record_type, RecordType)
+    # str()/f-string render as the bare value (so _build_metadata stays byte-for-byte).
+    assert f"{r.status}" == "validated"
+    assert str(r.record_type) == "agent_output"
+
+
+def test_record_rejects_unknown_status():
+    with pytest.raises(StateStoreError, match="unknown record status"):
+        Record(node="n", output={}, status="bogus")
+
+
+def test_record_accepts_checkpoint_record_type():
+    # 'checkpoint' is a first-class RecordType member (test_runindex.py depends on it).
+    r = Record(node="n", output={}, record_type="checkpoint")
+    assert r.record_type == "checkpoint"
+    assert isinstance(r.record_type, RecordType)
+
+
+def test_record_unknown_record_type_widens_and_warns():
+    with pytest.warns(UserWarning, match="unknown record_type"):
+        r = Record(node="n", output={}, record_type="future_kind")
+    assert r.record_type == "future_kind"  # kept verbatim, not rejected
+
+
+def test_all_known_status_and_record_type_literals_are_enum_members():
+    assert {s.value for s in RecordStatus} == {"validated", "failed", "superseded"}
+    assert {"agent_output", "dedup", "checkpoint"} <= {t.value for t in RecordType}
+
+
+def test_put_with_unknown_status_meta_raises_statestoreerror():
+    store = InProcessStateStore()
+    with pytest.raises(StateStoreError, match="unknown record status"):
+        store.put("n", {"x": 1}, meta={"status": "bogus"})
 
 
 # == (b) MemoryStateStore: put writes a Blob event, get returns it ============

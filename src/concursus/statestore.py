@@ -18,8 +18,67 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import warnings
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol, Set, Tuple
+
+
+# -- typed run-state vocabulary ---------------------------------------------
+class StateStoreError(ValueError):
+    """Raised when a :class:`Record` field carries a value outside its typed vocabulary."""
+
+
+class RecordStatus(str, Enum):
+    """The lifecycle status of a :class:`Record` (a ``str`` subclass, so ``== "validated"``
+    and all-string metadata projection keep working untouched)."""
+
+    VALIDATED = "validated"
+    FAILED = "failed"
+    SUPERSEDED = "superseded"
+
+    def __str__(self) -> str:  # keep f-string / str() output == the bare value (Py3.11+ change)
+        return self.value
+
+
+class RecordType(str, Enum):
+    """The kind of a :class:`Record` (a ``str`` subclass; unknown values widen-and-warn rather
+    than reject, so a future record kind never hard-fails a run)."""
+
+    AGENT_OUTPUT = "agent_output"
+    DEDUP = "dedup"
+    CHECKPOINT = "checkpoint"
+
+    def __str__(self) -> str:  # keep f-string / str() output == the bare value (Py3.11+ change)
+        return self.value
+
+
+def _coerce_status(value: Any) -> str:
+    """Coerce ``value`` to a :class:`RecordStatus`; raise :class:`StateStoreError` if unknown."""
+    if isinstance(value, RecordStatus):
+        return value
+    try:
+        return RecordStatus(value)
+    except ValueError as exc:
+        allowed = sorted(s.value for s in RecordStatus)
+        raise StateStoreError(f"unknown record status {value!r} (allowed: {allowed})") from exc
+
+
+def _coerce_record_type(value: Any) -> str:
+    """Coerce ``value`` to a :class:`RecordType`; an unknown value is kept verbatim with a
+    warning (widen-and-warn) so a novel record kind never hard-fails a run."""
+    if isinstance(value, RecordType):
+        return value
+    try:
+        return RecordType(value)
+    except ValueError:
+        warnings.warn(
+            f"unknown record_type {value!r}; keeping it verbatim "
+            f"(known: {sorted(t.value for t in RecordType)})",
+            stacklevel=3,
+        )
+        return value
 
 
 # -- content addressing -----------------------------------------------------
@@ -70,6 +129,18 @@ class Record:
     timestamp: Optional[int] = None
     event_id: Optional[str] = None
     address: Optional[str] = None
+    blocked_on: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Self-validate the typed fields: coerce ``status``/``record_type`` through their enums.
+
+        Because both enums subclass ``str``, the coerced values compare equal to their bare
+        strings (``== "validated"``) and serialize as plain strings, so existing comparisons and
+        :func:`_build_metadata` keep working untouched. An unknown ``status`` raises
+        :class:`StateStoreError`; an unknown ``record_type`` widens-and-warns (kept verbatim).
+        """
+        self.status = _coerce_status(self.status)
+        self.record_type = _coerce_record_type(self.record_type)
 
 
 # The metadata keys :meth:`StateStore.put` merges from ``meta`` onto a :class:`Record`.
@@ -80,6 +151,7 @@ _META_KEYS: Tuple[str, ...] = (
     "record_type",
     "status",
     "address",
+    "blocked_on",
 )
 
 # The ``record_type`` marking a content-hash no-op re-put (identical to the latest output).
@@ -99,6 +171,10 @@ def _apply_meta(record: Record, meta: Optional[dict]) -> None:
             continue
         if key == "consumes":
             value = list(value)
+        elif key == "status":
+            value = _coerce_status(value)  # re-validate: __post_init__ already ran
+        elif key == "record_type":
+            value = _coerce_record_type(value)
         setattr(record, key, value)
 
 
@@ -185,40 +261,48 @@ class InProcessStateStore:
         self._projection: Dict[str, dict] = {}
         self._attempts: Dict[str, int] = {}
         self._clock: int = 0
+        # Reentrant: guards the read-then-write bodies (attempt++ / dedup lookup / append /
+        # projection) so a future concurrent-dispatch supervisor cannot lose-update this
+        # in-memory state. RLock (not fcntl/OCC) — these are single-process in-memory stores.
+        self._lock = threading.RLock()
 
     def put(self, node: str, output: dict, *, meta: Optional[dict] = None) -> None:
-        self._clock += 1
-        attempt = self._attempts.get(node, 0) + 1
-        self._attempts[node] = attempt
-        chash = content_hash(output)
-        dedup = node in self._projection and content_hash(self._projection[node]) == chash
+        with self._lock:
+            self._clock += 1
+            attempt = self._attempts.get(node, 0) + 1
+            self._attempts[node] = attempt
+            chash = content_hash(output)
+            dedup = node in self._projection and content_hash(self._projection[node]) == chash
 
-        record = Record(
-            node=node,
-            output=dict(output),
-            attempt=attempt,
-            content_hash=chash,
-            timestamp=self._clock,
-        )
-        _apply_meta(record, meta)
-        if dedup and record.record_type == "agent_output":
-            record.record_type = _DEDUP_RECORD_TYPE
+            record = Record(
+                node=node,
+                output=dict(output),
+                attempt=attempt,
+                content_hash=chash,
+                timestamp=self._clock,
+            )
+            _apply_meta(record, meta)
+            if dedup and record.record_type == "agent_output":
+                record.record_type = _DEDUP_RECORD_TYPE
 
-        self._records.append(record)
-        if record.status == "validated":
-            self._projection[node] = record.output
+            self._records.append(record)
+            if record.status == "validated":
+                self._projection[node] = record.output
 
     def get(self, node: str) -> dict:
-        if node not in self._projection:
-            raise KeyError(node)
-        return self._projection[node]
+        with self._lock:
+            if node not in self._projection:
+                raise KeyError(node)
+            return self._projection[node]
 
     def completed(self) -> Set[str]:
-        latest_overall, _, _ = _index_records(self._records)
-        return {node for node, r in latest_overall.items() if r.status == "validated"}
+        with self._lock:
+            latest_overall, _, _ = _index_records(self._records)
+            return {node for node, r in latest_overall.items() if r.status == "validated"}
 
     def records(self) -> List[Record]:
-        return list(self._records)
+        with self._lock:
+            return list(self._records)
 
 
 # -- agentcore memory store (opt-in) ----------------------------------------
@@ -256,59 +340,68 @@ class MemoryStateStore:
         self._last_event_id: Dict[str, str] = {}
         self._event_id_by_address: Dict[str, str] = {}  # FZ address -> event id (branch roots)
         self._loaded = False
+        # Reentrant: guards the read-then-write bodies (attempt++ / append / projection /
+        # replay) so a future concurrent-dispatch supervisor cannot lose-update the cached
+        # read model. RLock (not fcntl/OCC) — the durable log is AgentCore's; this only
+        # guards this process's in-memory cache.
+        self._lock = threading.RLock()
 
     # -- writes -------------------------------------------------------------
     def put(self, node: str, output: dict, *, meta: Optional[dict] = None) -> None:
         meta = meta or {}
-        attempt = self._attempts.get(node, 0) + 1
-        self._attempts[node] = attempt
+        with self._lock:
+            attempt = self._attempts.get(node, 0) + 1
+            self._attempts[node] = attempt
 
-        record = Record(
-            node=node,
-            output=dict(output),
-            attempt=attempt,
-            content_hash=content_hash(output),
-        )
-        _apply_meta(record, meta)
-        record.supersedes = meta.get("supersedes") or self._last_event_id.get(node)
+            record = Record(
+                node=node,
+                output=dict(output),
+                attempt=attempt,
+                content_hash=content_hash(output),
+            )
+            _apply_meta(record, meta)
+            record.supersedes = meta.get("supersedes") or self._last_event_id.get(node)
 
-        # FZ address -> AgentCore branch: a sub-address (has a parent segment) becomes a branch
-        # off its parent's event, so the retry/fan-out/branch tree lives in the Memory log.
-        branch = meta.get("branch")
-        if branch is None and record.address and _ADDR_SEP in record.address:
-            parent, _, name = record.address.rpartition(_ADDR_SEP)
-            root_event = self._event_id_by_address.get(parent)
-            if root_event:
-                branch = {"name": name, "rootEventId": root_event}
+            # FZ address -> AgentCore branch: a sub-address (has a parent segment) becomes a
+            # branch off its parent's event, so the retry/fan-out/branch tree lives in the log.
+            branch = meta.get("branch")
+            if branch is None and record.address and _ADDR_SEP in record.address:
+                parent, _, name = record.address.rpartition(_ADDR_SEP)
+                root_event = self._event_id_by_address.get(parent)
+                if root_event:
+                    branch = {"name": name, "rootEventId": root_event}
 
-        metadata = _build_metadata(record)
-        payload = [{"blob": json.dumps({node: record.output})}]
-        response = self._create_event(metadata=metadata, payload=payload, branch=branch)
-        record.event_id = response.get("eventId")
-        record.timestamp = response.get("eventTimestamp")
+            metadata = _build_metadata(record)
+            payload = [{"blob": json.dumps({node: record.output})}]
+            response = self._create_event(metadata=metadata, payload=payload, branch=branch)
+            record.event_id = response.get("eventId")
+            record.timestamp = response.get("eventTimestamp")
 
-        self._records.append(record)
-        if record.event_id:
-            self._last_event_id[node] = record.event_id
-            self._event_id_by_address[record.address or node] = record.event_id
-        if record.status == "validated":
-            self._projection[node] = record.output
+            self._records.append(record)
+            if record.event_id:
+                self._last_event_id[node] = record.event_id
+                self._event_id_by_address[record.address or node] = record.event_id
+            if record.status == "validated":
+                self._projection[node] = record.output
 
     # -- reads --------------------------------------------------------------
     def get(self, node: str) -> dict:
-        self._ensure_loaded()
-        if node not in self._projection:
-            raise KeyError(node)
-        return self._projection[node]
+        with self._lock:
+            self._ensure_loaded()
+            if node not in self._projection:
+                raise KeyError(node)
+            return self._projection[node]
 
     def completed(self) -> Set[str]:
-        self._ensure_loaded()
-        latest_overall, _, _ = _index_records(self._records)
-        return {node for node, r in latest_overall.items() if r.status == "validated"}
+        with self._lock:
+            self._ensure_loaded()
+            latest_overall, _, _ = _index_records(self._records)
+            return {node for node, r in latest_overall.items() if r.status == "validated"}
 
     def records(self) -> List[Record]:
-        self._ensure_loaded()
-        return list(self._records)
+        with self._lock:
+            self._ensure_loaded()
+            return list(self._records)
 
     # -- replay / resume ----------------------------------------------------
     def replay(self) -> None:
@@ -318,27 +411,28 @@ class MemoryStateStore:
         This is the resume path — a run survives micro-VM teardown / mid-run crashes because
         the supervisor re-reads the durable log rather than remembering.
         """
-        records: List[Record] = []
-        token: Optional[str] = None
-        while True:
-            response = self._list_events(includePayloads=True, nextToken=token)
-            for event in response.get("events", []):
-                records.append(_event_to_record(event))
-            token = response.get("nextToken")
-            if not token:
-                break
+        with self._lock:
+            records: List[Record] = []
+            token: Optional[str] = None
+            while True:
+                response = self._list_events(includePayloads=True, nextToken=token)
+                for event in response.get("events", []):
+                    records.append(_event_to_record(event))
+                token = response.get("nextToken")
+                if not token:
+                    break
 
-        latest_overall, latest_validated, attempts = _index_records(records)
-        self._records = records
-        self._projection = {node: r.output for node, r in latest_validated.items()}
-        self._attempts = attempts
-        self._last_event_id = {
-            node: r.event_id for node, r in latest_overall.items() if r.event_id
-        }
-        self._event_id_by_address = {
-            (r.address or r.node): r.event_id for r in records if r.event_id
-        }
-        self._loaded = True
+            latest_overall, latest_validated, attempts = _index_records(records)
+            self._records = records
+            self._projection = {node: r.output for node, r in latest_validated.items()}
+            self._attempts = attempts
+            self._last_event_id = {
+                node: r.event_id for node, r in latest_overall.items() if r.event_id
+            }
+            self._event_id_by_address = {
+                (r.address or r.node): r.event_id for r in records if r.event_id
+            }
+            self._loaded = True
 
     def _ensure_loaded(self) -> None:
         """Lazily :meth:`replay` the log exactly once before the first read."""

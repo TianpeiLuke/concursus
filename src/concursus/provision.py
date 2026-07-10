@@ -190,12 +190,21 @@ def provision_agent(
     source_dir: str = ".",
     tag: str = "latest",
     run: Optional[RunFn] = None,
+    known_fingerprints: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Provision one agent; return ``{"node", "arn", "action", "role_arn", "image_uri"}``.
 
     Order: reuse an existing ``agentRuntimeArn`` outright; otherwise ensure the IAM role, build +
     push the image when the URI is still a placeholder, substitute both into the request, and
     ``CreateAgentRuntime``.
+
+    Reuse-by-content (opt-in): pass ``known_fingerprints`` (node -> the fingerprint recorded for
+    the runtime already deployed for that node). When omitted the behavior is unchanged — every
+    provisioned runtime is reported ``action="created"``. When supplied, a node whose recorded
+    fingerprint equals ``entry.fingerprint`` is a no-op ``action="reused"`` (nothing is
+    re-created); a node whose fingerprint changed is re-provisioned and reported
+    ``action="updated"``. The fingerprint covers only *hosting* identity (see
+    :func:`concursus.build.fingerprint`); it is dedup metadata, never a dispatch-time selector.
     """
     run = run or _default_run
     req = copy.deepcopy(entry.create_agent_runtime)
@@ -204,6 +213,13 @@ def provision_agent(
     if "agentRuntimeArn" in req:  # arn-reuse: nothing to create
         result.update(arn=req["agentRuntimeArn"], action="reused")
         return result
+
+    # 0) Reuse-by-content (opt-in) — a matching recorded fingerprint is a no-op.
+    prior_fp = (known_fingerprints or {}).get(entry.name)
+    if prior_fp is not None and entry.fingerprint and prior_fp == entry.fingerprint:
+        result.update(arn=None, action="reused")
+        return result
+    changed = prior_fp is not None and entry.fingerprint and prior_fp != entry.fingerprint
 
     # 1) IAM execution role — the plan carries a role doc only when no role_arn was supplied.
     if entry.execution_role is not None:
@@ -229,7 +245,10 @@ def provision_agent(
 
     # 3) Register the runtime.
     created = clients.control.create_agent_runtime(**req)
-    result.update(arn=created.get("agentRuntimeArn"), action="created")
+    result.update(
+        arn=created.get("agentRuntimeArn"),
+        action="updated" if changed else "created",
+    )
     return result
 
 
@@ -242,12 +261,15 @@ def provision_plan(
     tag: str = "latest",
     clients: Optional[Clients] = None,
     run: Optional[RunFn] = None,
+    known_fingerprints: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Provision every agent in ``plan.order``; return one result dict per node (in order).
 
     ``clients``/``run`` default to real boto3 + the ``docker`` CLI; inject fakes to test the
     orchestration offline. ``source_dirs`` maps a node to its build-context directory (falling
-    back to ``default_source_dir``).
+    back to ``default_source_dir``). ``known_fingerprints`` (opt-in) maps a node to the hosting
+    fingerprint already deployed for it — enabling reuse-by-content (see :func:`provision_agent`);
+    omit it to keep today's unconditional ``created`` behavior.
     """
     clients = clients or Clients.default(region)
     run = run or _default_run
@@ -262,6 +284,7 @@ def provision_plan(
                 source_dir=source_dirs.get(node, default_source_dir),
                 tag=tag,
                 run=run,
+                known_fingerprints=known_fingerprints,
             )
         )
     return results

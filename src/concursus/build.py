@@ -10,6 +10,8 @@ imports boto3 or calls AWS (deploy consumes the plan later).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Tuple
@@ -256,6 +258,53 @@ def render_execution_role(
     return {"policy": policy, "trust": trust}
 
 
+# -- content fingerprint (DEPLOY-IDENTITY) ----------------------------------
+def _canonical_hash(obj: Any) -> str:
+    """SHA-256 of the canonical JSON of ``obj`` — mirrors ``statestore.content_hash``.
+
+    Canonical form is ``json.dumps(sort_keys=True, separators=(",", ":"))`` so equal inputs
+    hash identically regardless of key order or incidental whitespace.
+    """
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def fingerprint(
+    m: "AgentManifest",
+    *,
+    account: Optional[str] = None,
+    region: Optional[str] = None,
+) -> str:
+    """Content fingerprint of an agent's **hosting** identity (DEPLOY-IDENTITY inputs).
+
+    Hashes only what changes *how the runtime is deployed*: the image/source, serving protocol,
+    entrypoint, network mode, execution-role identity (an explicit ``role_arn`` or a hash of the
+    synthesized policy), the sorted set of declared input keys, and the output schema. It does
+    **not** fold in agent-behavior inputs (model / prompt / SOPs) — this is deploy dedup, not a
+    trust re-earning check, and it must never be used to select among versions at dispatch time.
+
+    Two manifests with identical hosting inputs produce the same fingerprint; a change to any
+    hosting input (e.g. a new ``container_uri``, protocol, or output schema) changes it.
+    """
+    reg = m.registry
+    build_mode = str(reg.get("build_mode", "container")).lower()
+    if reg.get("role_arn"):
+        role_identity: Dict[str, Any] = {"role_arn": reg["role_arn"]}
+    else:
+        role = render_execution_role(m, account, region, container=(build_mode == "container"))
+        role_identity = {"policy_hash": _canonical_hash(role["policy"])}
+    identity = {
+        "image": reg.get("container_uri") or reg.get("source_digest"),
+        "protocol": m.protocol,
+        "entry": reg.get("entry"),
+        "network": _network_configuration(reg),
+        "role": role_identity,
+        "input_keys": sorted(m.inputs.keys()),
+        "output_schema": m.output_schema,
+    }
+    return _canonical_hash(identity)
+
+
 # -- build plan entry -------------------------------------------------------
 @dataclass
 class BuildPlanEntry:
@@ -270,6 +319,9 @@ class BuildPlanEntry:
         create_agent_runtime: The ``create_agent_runtime`` param dict (or an arn-reuse marker).
         invoke: ``{"protocol": ..., "qualifier": ..., "port": ...}`` for the supervisor.
         ecr_repo: Target ECR repository for the image, when configured.
+        fingerprint: Content fingerprint of the agent's hosting identity (see :func:`fingerprint`).
+            Used at deploy time for reuse-by-content (a matching fingerprint ⇒ ``reused``,
+            a changed one ⇒ ``updated``); never consulted to select a version at dispatch time.
     """
 
     name: str
@@ -280,6 +332,7 @@ class BuildPlanEntry:
     create_agent_runtime: dict
     invoke: dict
     ecr_repo: Optional[str]
+    fingerprint: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -460,6 +513,7 @@ class PreBuiltRegistrar:
             create_agent_runtime=create_req,
             invoke=invoke,
             ecr_repo=reg.get("ecr_repo"),
+            fingerprint=fingerprint(m, account=account, region=region),
         )
 
 
@@ -526,4 +580,5 @@ class RuntimeBuilderFactory:
             create_agent_runtime=create_req,
             invoke=invoke,
             ecr_repo=reg.get("ecr_repo"),
+            fingerprint=fingerprint(m, account=account, region=region),
         )

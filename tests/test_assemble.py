@@ -5,7 +5,12 @@ import json
 import pytest
 
 from concursus import AgentDAG, AgentManifest
-from concursus.assemble import AssemblyError, OrchestrationAssembler, ProvisioningPlan
+from concursus.assemble import (
+    AssemblyError,
+    MonotonicityError,
+    OrchestrationAssembler,
+    ProvisioningPlan,
+)
 from concursus.build import BuildPlanEntry
 from concursus.resolve import AgentRef, AlignmentError
 
@@ -146,3 +151,112 @@ def test_assemble_raises_on_node_without_manifest():
     del manifests["format"]
     with pytest.raises(AssemblyError, match="format"):
         OrchestrationAssembler().assemble(dag, manifests)
+
+
+# -- AI-20: monotonic re-compile --------------------------------------------
+def _chain_plus_publish():
+    """The 4-node chain extended with a 5th node ``publish`` consuming format.report."""
+    dag, manifests = _chain()
+    dag.add_node("publish")
+    dag.add_edge("format", "publish")
+    manifests["publish"] = _agent(
+        "publish",
+        {"report": {"type": "string"}},
+        {"url": {"type": "string"}},
+        depends_on=[{"from": "format.report", "to": "report"}],
+    )
+    return dag, manifests
+
+
+def test_recompile_pins_executed_nodes_and_is_monotonic_superset():
+    dag, manifests = _chain()
+    asm = OrchestrationAssembler()
+    prior = asm.assemble(dag, manifests)
+    assert prior.revision == 0
+    assert prior.to_dict().get("revision") is None  # unchanged first-compile preview
+
+    # Two nodes have executed; re-compile the topology extended with a new `publish` node.
+    ext_dag, ext_manifests = _chain_plus_publish()
+    new_plan = asm.recompile(
+        prior,
+        completed={"ingest", "summarize"},
+        content_hashes={"ingest": "h0", "summarize": "h1"},
+        dag=ext_dag,
+        manifests=ext_manifests,
+    )
+    # fresh frozen plan, revision bumped, surfaced in to_dict
+    assert new_plan is not prior
+    assert new_plan.revision == 1
+    assert new_plan.to_dict()["revision"] == 1
+    # monotonic superset: prior order survives as a subsequence, publish appended
+    assert new_plan.order == ["ingest", "summarize", "critique", "format", "publish"]
+    # executed nodes pinned to the PRIOR entry/wiring objects (identity, not just equality)
+    assert new_plan.entries["ingest"] is prior.entries["ingest"]
+    assert new_plan.entries["summarize"] is prior.entries["summarize"]
+    assert new_plan.wiring["summarize"] == prior.wiring["summarize"]
+    # a brand-new node is present with freshly-compiled wiring
+    assert new_plan.wiring["publish"] == [
+        AgentRef(producer="format", path="$.report", input_name="report")
+    ]
+
+
+def test_check_monotonic_raises_on_edit_to_executed_node():
+    dag, manifests = _chain()
+    asm = OrchestrationAssembler()
+    prior = asm.assemble(dag, manifests)
+
+    # Re-author the EXECUTED node `summarize` so its hosting identity changes -> a new entry.
+    edited = {name: m for name, m in manifests.items()}
+    edited["summarize"] = _agent(
+        "summarize",
+        {"document": {"type": "string"}},
+        {"properties": {"summary": {"type": "string"}}},
+        depends_on=[{"from": "ingest.document", "to": "document"}],
+        protocol="MCP",  # changes fingerprint + create request -> a different BuildPlanEntry
+    )
+    with pytest.raises(MonotonicityError, match="summarize"):
+        asm.recompile(
+            prior,
+            completed={"ingest", "summarize"},
+            dag=dag,
+            manifests=edited,
+        )
+
+
+def test_recompile_refuses_past_max_revisions():
+    dag, manifests = _chain()
+    asm = OrchestrationAssembler()
+    prior = asm.assemble(dag, manifests)
+    prior.revision = 3  # pretend we're already at revision 3
+    with pytest.raises(MonotonicityError, match="max_revisions"):
+        asm.recompile(
+            prior,
+            completed={"ingest"},
+            dag=dag,
+            manifests=manifests,
+            max_revisions=3,
+        )
+
+
+def test_recompile_rejects_dropping_a_planned_node():
+    dag, manifests = _chain()
+    asm = OrchestrationAssembler()
+    prior = asm.assemble(dag, manifests)
+
+    # Re-author a smaller DAG that drops the (unexecuted) `format` node — not a superset.
+    smaller = AgentDAG()
+    for n in ["ingest", "summarize", "critique"]:
+        smaller.add_node(n)
+    smaller.add_edge("ingest", "summarize")
+    smaller.add_edge("summarize", "critique")
+    fewer = {k: manifests[k] for k in ["ingest", "summarize", "critique"]}
+    with pytest.raises(MonotonicityError, match="drop"):
+        asm.recompile(prior, completed={"ingest"}, dag=smaller, manifests=fewer)
+
+
+def test_recompile_requires_dag_and_manifests():
+    dag, manifests = _chain()
+    asm = OrchestrationAssembler()
+    prior = asm.assemble(dag, manifests)
+    with pytest.raises(AssemblyError, match="recompile requires"):
+        asm.recompile(prior, completed=set())

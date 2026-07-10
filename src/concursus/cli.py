@@ -355,6 +355,46 @@ def _make_run_supervisor(
     return Supervisor(plan, manifests, session_id=supervisor.session_id, state_store=store)
 
 
+def _plan_approval_gate(plan: "object", args: argparse.Namespace) -> bool:
+    """AI-21 between-phases gate: preview the FROZEN plan and require confirmation before invoke.
+
+    Off by default (``--approve`` absent) — today's ``run --execute`` path is byte-for-byte
+    unchanged. When on, this runs strictly BETWEEN ``_assemble`` and ``supervisor.run`` (before any
+    billed ``InvokeAgentRuntime``): it prints ``ProvisioningPlan.to_dict()`` and pauses. It is safe
+    precisely because the plan is FROZEN — approving invokes it, aborting invokes nothing, and any
+    "adjust" must route through :meth:`OrchestrationAssembler.recompile` (never a live executor).
+
+    Confirmation:
+      * ``--yes`` -> approved without prompting (scripted/non-interactive approval).
+      * an interactive TTY -> prompt ``Approve this plan and invoke? [y/N]``; only ``y``/``yes``
+        approves.
+      * non-interactive with no ``--yes`` -> ABORT (never auto-approve a billed run).
+
+    Returns ``True`` to proceed, ``False`` to abort (the caller prints a notice and exits 0).
+    """
+    print("PLAN PREVIEW (--approve): review before any billed InvokeAgentRuntime.\n")
+    print(json.dumps(plan.to_dict(), indent=2))
+    print()
+    if getattr(args, "yes", False):
+        print("Plan approved via --yes.", file=sys.stderr)
+        return True
+    if not sys.stdin.isatty():
+        print(
+            "Plan approval required but no TTY is attached; pass --yes to approve "
+            "non-interactively. Aborting (nothing invoked).",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        answer = input("Approve this plan and invoke? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer in ("y", "yes"):
+        return True
+    print("Plan not approved; aborting (nothing invoked).", file=sys.stderr)
+    return False
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     try:
         manifests, plan = _assemble(args)
@@ -364,6 +404,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 1
     if not args.execute:
         _print_run_dryrun(plan, manifests, inputs)
+        return 0
+    # AI-21: opt-in plan-approval gate, strictly between assemble and run (before any billed
+    # invoke). Default OFF preserves today's behavior byte-for-byte.
+    if getattr(args, "approve", False) and not _plan_approval_gate(plan, args):
         return 0
     supervisor = None
     try:
@@ -489,6 +533,20 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument(
         "--actor-id",
         help="Actor id scoping the Memory event stream (default 'run'); used with --memory-id.",
+    )
+    rn.add_argument(
+        "--approve",
+        "--plan-approval",
+        dest="approve",
+        action="store_true",
+        help="Preview the FROZEN provisioning plan and PAUSE for confirmation before any billed "
+        "InvokeAgentRuntime (a safe between-phases gate; the plan is frozen). Interactive by "
+        "default; in a non-TTY, requires --yes or it aborts. Off by default.",
+    )
+    rn.add_argument(
+        "--yes",
+        action="store_true",
+        help="Approve the --approve plan preview without prompting (non-interactive approval).",
     )
     rn.set_defaults(func=_cmd_run)
 

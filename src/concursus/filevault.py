@@ -62,6 +62,20 @@ _SLIPBOX_TOPICS = ["Multi-Agent Orchestration", "Concursus Run State"]
 # A record's status maps onto the SlipBox status vocabulary (validated→active, failed→draft).
 _SLIPBOX_STATUS = {"validated": "active", "failed": "draft", "superseded": "superseded"}
 
+# The durable run-plan snapshot note (AI-18): a 'model'+navigation note written ALONGSIDE ``_run.md``
+# under the run dir. It is NOT a run record — it carries no ``payload``/``meta`` blob and is stamped
+# with ``concursus_note_kind: run_plan`` so :func:`_note_to_record` REFUSES to parse it (raises), and
+# the ``*.md`` record globs in :meth:`FileVaultStateStore._load` / :mod:`concursus.rundb` therefore
+# skip it (their loaders catch the parse error) without corrupting ``load_records``.
+_PLAN_NOTE_NAME = "_plan.md"
+_PLAN_NOTE_MARKER = "concursus_note_kind"
+_PLAN_NOTE_KIND = "run_plan"
+
+# Machine-finding keys a renderer surfaces IF THEY HAPPEN to be present in an agent's output dict.
+# Purely reflective: the renderer copies whatever the agent emitted — it NEVER derives, judges, or
+# generates a verdict/hypothesis of its own (that reasoning tier is Phase 5, deliberately excluded).
+_FINDING_KEYS = ("root_cause", "failure_mode", "family", "confidence")
+
 
 def _building_block_for(record: Record) -> str:
     """Derive the SlipBox ``building_block`` for a record from its kind (mirrors HiveFleet's
@@ -137,6 +151,67 @@ def _decode_blob(token: str) -> dict:
         token = token[len(_BLOB_PREFIX) :]
     raw = base64.urlsafe_b64decode(token.encode("ascii"))
     return json.loads(raw.decode("utf-8"))
+
+
+def _compact_value(value: object, *, maxlen: int = 120) -> str:
+    """A one-line, truncated display of a scalar/collection for the human summary (never parsed)."""
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, sort_keys=True)
+    text = " ".join(text.split())  # collapse newlines/runs of whitespace to keep it one line
+    return text if len(text) <= maxlen else text[: maxlen - 1] + "…"
+
+
+def _machine_findings(output: dict) -> Dict[str, object]:
+    """The subset of :data:`_FINDING_KEYS` that HAPPEN to be present in ``output``.
+
+    Purely reflective — it copies whatever the agent emitted and derives/judges nothing (a run's
+    verdict/hypothesis tier is Phase 5, deliberately excluded here). Returns ``{}`` when the output
+    carries none of the finding keys (the common case), so a normal note gains no findings block.
+    """
+    if not isinstance(output, dict):
+        return {}
+    return {k: output[k] for k in _FINDING_KEYS if k in output}
+
+
+def _did_observed_outcome(record: Record) -> List[str]:
+    """A compact **Did → Observed → Outcome** summary of a record for the note body (AI-18).
+
+    A record-only projection: *Did* = which node ran (record kind + attempt), *Observed* = a
+    truncated one-line digest of the produced output's top-level keys, *Outcome* = the record's
+    status. It reads only the record's own fields — it generates no verdict/hypothesis and makes
+    no runtime decision. The authoritative value stays the ``payload`` blob; this is display only.
+    """
+    lines = ["### Did → Observed → Outcome", ""]
+    lines.append(
+        f"- **Did**: ran `{record.node}` (attempt {record.attempt}, record type "
+        f"`{record.record_type}`)."
+    )
+    output = record.output if isinstance(record.output, dict) else {}
+    if output:
+        fields = ", ".join(
+            f"`{k}`={_compact_value(output[k], maxlen=60)}" for k in sorted(output)
+        )
+        observed = _compact_value(fields, maxlen=280)
+    else:
+        observed = _compact_value(record.output)
+    lines.append(f"- **Observed**: {observed}")
+    lines.append(f"- **Outcome**: status `{record.status}`.")
+    findings = _machine_findings(output)
+    if findings:
+        lines.append("")
+        lines.append("### Machine Findings")
+        lines.append("")
+        lines.append(
+            "> Copied verbatim from the agent's output (reflective only — no verdict is generated)."
+        )
+        lines.append("")
+        for key in _FINDING_KEYS:
+            if key in findings:
+                lines.append(f"- **{key}**: {_compact_value(findings[key])}")
+    lines.append("")
+    return lines
 
 
 def _record_to_note(
@@ -235,10 +310,13 @@ def _record_to_note(
     lines.append("")
     lines.append(
         f"The `{record.node}` node's output on this run (record type `{record.record_type}`). "
-        "The authoritative value is the `payload` frontmatter blob; the JSON below is a derived, "
-        "human-readable display copy."
+        "The authoritative value is the `payload` frontmatter blob; the summary and JSON below are "
+        "derived, human-readable display copies."
     )
     lines.append("")
+    # A compact Did -> Observed -> Outcome digest (+ any machine findings the output HAPPENS to
+    # carry) — a record-only projection that augments the raw JSON dump; it generates no verdict.
+    lines.extend(_did_observed_outcome(record))
     lines.append("```json")
     lines.append(json.dumps(record.output, indent=2, sort_keys=True))
     lines.append("```")
@@ -268,6 +346,11 @@ def _note_to_record(text: str) -> Record:
         raise ValueError("note missing frontmatter")
     _, _, rest = text.partition("---\n")
     fm_block, _, _ = rest.partition("\n---")
+
+    # A non-record note (the run-plan snapshot) is explicitly stamped so it is never parsed back as
+    # a run Record — the loaders catch this and skip it, so it never corrupts ``load_records``.
+    if f"{_PLAN_NOTE_MARKER}:" in fm_block:
+        raise ValueError(f"not a run record ({_PLAN_NOTE_MARKER} note)")
 
     meta_token = ""
     payload_token = ""
@@ -307,6 +390,238 @@ def _coerce_int(value: object) -> Optional[int]:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+# --------------------------------------------------------------------- AI-18: ingestion renderers
+# Write-time / read-only NOTE PROJECTIONS over already-frozen run state. None of them influences
+# dispatch order or makes a runtime decision — they render what has already happened (or, for the
+# plan snapshot, the already-FROZEN compiled plan). The log->note promotion trigger is FAILURE-only.
+
+
+def _plan_mermaid(order: List[str], wiring: Dict[str, list]) -> List[str]:
+    """Render a frozen plan's ``order`` + ``wiring`` as a Mermaid DAG (producer→consumer edges).
+
+    Reads only the compiled topology (never AWS, never a live plan): each ``wiring`` edge becomes a
+    ``producer --> consumer`` arrow labelled with its consumer input; isolated nodes are emitted as
+    bare nodes so the whole ``order`` is visible. Pure display — it drives no dispatch.
+    """
+    lines = ["```mermaid", "graph TD"]
+    node_ids = {name: f"n{i}" for i, name in enumerate(order)}
+    extra = [n for n in wiring if n not in node_ids]
+    for i, name in enumerate(extra):
+        node_ids[name] = f"x{i}"
+    for name in list(order) + extra:
+        lines.append(f'    {node_ids[name]}["{name}"]')
+    seen_edge = set()
+    for consumer, refs in wiring.items():
+        for ref in refs:
+            producer = ref["producer"] if isinstance(ref, dict) else getattr(ref, "producer", "")
+            input_name = (
+                ref.get("input_name") if isinstance(ref, dict) else getattr(ref, "input_name", "")
+            )
+            if producer not in node_ids:
+                node_ids[producer] = f"p{len(node_ids)}"
+                lines.append(f'    {node_ids[producer]}["{producer}"]')
+            key = (producer, consumer, input_name)
+            if key in seen_edge:
+                continue
+            seen_edge.add(key)
+            label = f"|{input_name}|" if input_name else ""
+            lines.append(f"    {node_ids[producer]} -->{label} {node_ids[consumer]}")
+    lines.append("```")
+    return lines
+
+
+def capture_run_plan_note(
+    plan,
+    run_dir,
+    *,
+    trail_id: str = "run",
+    date: str = "",
+    slipbox_form: bool = True,
+) -> str:
+    """**AI-18.** Persist a compiled :class:`~concursus.assemble.ProvisioningPlan` as a durable
+    ``model``+navigation note (``<run_dir>/_plan.md``); return its path.
+
+    Genuinely unbuilt before this: the plan is never written to disk, so a run's topology snapshot
+    is lost on teardown. This captures it ALONGSIDE ``_run.md`` — a Mermaid DAG of ``plan.order`` +
+    ``wiring`` in the body plus the plan's COMPACT ``to_summary_dict()`` projection (which DROPS the
+    bulky per-node ``BuildPlanEntry`` deploy payload — wrapper source / dockerfile /
+    ``create_agent_runtime`` — keeping only a hosting digest, so a note is never megabytes).
+
+    It is NOT a run record: the note carries no ``payload``/``meta`` blob and is stamped
+    ``concursus_note_kind: run_plan``, so :func:`_note_to_record` REFUSES to parse it and the record
+    loaders (:meth:`FileVaultStateStore._load`, :func:`~concursus.rundb.load_records`) skip it — it
+    never corrupts ``load_records`` or a resume/replay. Pure write-time projection of the frozen
+    plan: it influences no dispatch and mutates nothing.
+    """
+    summary = plan.to_summary_dict()
+    order = summary["order"]
+    wiring = summary["wiring"]
+
+    lines: List[str] = []
+    if slipbox_form:
+        fm = {
+            "tags": ["resource", "concursus", "run_state", "run_plan"],
+            "keywords": ["concursus plan", "provisioning plan", "run topology snapshot"],
+            "topics": _SLIPBOX_TOPICS,
+            "language": "markdown",
+            "date of note": date,
+            "status": "active",
+            "building_block": "model",  # a compiled topology model (not a run record)
+            "folgezettel": "1",
+            "lineage": [f"{trail_id}:1"],
+            _PLAN_NOTE_MARKER: _PLAN_NOTE_KIND,  # the non-record stamp: never parsed as a Record
+            "access_control_group": ["general"],
+        }
+        lines.append("---")
+        for key, value in fm.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                lines.extend(f"  - {json.dumps(v)}" for v in value)
+            else:
+                lines.append(f"{key}: {json.dumps(value)}")
+        lines.append("---")
+        lines.append("")
+    else:
+        # Lean form still carries the non-record stamp so it is never parsed back as a Record.
+        lines += ["---", f"{_PLAN_NOTE_MARKER}: {json.dumps(_PLAN_NOTE_KIND)}", "---", ""]
+
+    lines.append(f"# Run Plan: {trail_id}")
+    lines.append("")
+    lines.append(
+        "A durable snapshot of this run's FROZEN provisioning plan — its dispatch `order` and "
+        "resolved data `wiring`, rendered below as a DAG. The bulky per-node deploy payload "
+        "(wrapper source / dockerfile / `create_agent_runtime` request) is intentionally DROPPED; "
+        "only a compact hosting digest is kept. This is a read-only topology snapshot: it drives "
+        "no dispatch."
+    )
+    lines.append("")
+    lines.append("## Topology")
+    lines.append("")
+    lines.extend(_plan_mermaid(order, wiring))
+    lines.append("")
+    lines.append("## Dispatch Order")
+    lines.append("")
+    for i, name in enumerate(order, 1):
+        entry = summary["entries"].get(name, {})
+        proto = entry.get("protocol") or "?"
+        mode = entry.get("build_mode") or "?"
+        lines.append(f"{i}. `{name}` — {mode}/{proto}")
+    lines.append("")
+    lines.append("## Compact Plan Summary")
+    lines.append("")
+    lines.append(
+        "> The full byte-exact plan is `ProvisioningPlan.to_dict()`; this drops the deploy payload."
+    )
+    lines.append("")
+    lines.append("```json")
+    lines.append(json.dumps(summary, indent=2, sort_keys=True))
+    lines.append("```")
+    lines.append("")
+
+    path = Path(run_dir) / _PLAN_NOTE_NAME
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    FileVaultStateStore._atomic_write(path, "\n".join(lines))
+    return str(path)
+
+
+def capture_agent_response_note(
+    record: Record,
+    *,
+    slipbox_form: bool = True,
+    position: int = 1,
+    trail_id: str = "run",
+    date: str = "",
+    related: Optional[List[str]] = None,
+) -> str:
+    """**AI-18.** Render one agent response :class:`Record` as a durable note.
+
+    A thin, named seam over :func:`_record_to_note` (the round-trip-exact renderer): the slipbox
+    body carries the compact **Did → Observed → Outcome** summary plus any machine findings the
+    output HAPPENS to carry, while the authoritative ``payload``/``meta`` b64 blobs stay untouched,
+    so :func:`_note_to_record` reloads it byte-exact. Record-only — it generates no verdict or
+    hypothesis.
+    """
+    return _record_to_note(
+        record,
+        slipbox_form=slipbox_form,
+        position=position,
+        trail_id=trail_id,
+        date=date,
+        related=related,
+    )
+
+
+def capture_agent_log_note(
+    record: Record,
+    *,
+    slipbox_form: bool = True,
+    position: int = 1,
+    trail_id: str = "run",
+    date: str = "",
+    related: Optional[List[str]] = None,
+) -> Optional[str]:
+    """**AI-18 — selective-ingestion POLICY.** Promote a raw agent log to a durable note ONLY on
+    failure; otherwise return ``None`` (the verbose log stays a derived, non-promoted sidecar).
+
+    For concursus the ONLY promotion trigger for a raw log is ``status == "failed"`` — a failed
+    record is already a ``counter_argument`` note (see :func:`_building_block_for`). This
+    deliberately does NOT build a ``.3``-verdict-citation promotion path: turning a log into a
+    cited verdict is the reasoning tier (Phase 5), out of scope for these write-time renderers. A
+    non-failed log is not worth a durable note here — the run's append-only record log already
+    captures it — so this returns ``None`` (the caller keeps it as a gitignored/derived sidecar or
+    drops it). When the record IS failed, it renders through the same round-trip-exact path as any
+    other response note, so the promoted note reloads byte-exact.
+    """
+    if record.status != "failed":
+        return None  # POLICY: non-failure logs are never promoted to a durable note
+    return _record_to_note(
+        record,
+        slipbox_form=slipbox_form,
+        position=position,
+        trail_id=trail_id,
+        date=date,
+        related=related,
+    )
+
+
+# A record_type -> renderer dispatch table (AI-18 umbrella), parallel to :func:`_building_block_for`'s
+# switch: pick the note renderer by the record's kind. Unknown kinds fall back to the response
+# renderer (widen-and-render, mirroring statestore's widen-and-warn for unknown record types).
+_RENDERER_BY_RECORD_TYPE = {
+    _DEDUP_RECORD_TYPE: capture_agent_response_note,  # a no-op re-put: a navigation marker note
+    "agent_output": capture_agent_response_note,
+    "checkpoint": capture_agent_response_note,
+}
+
+
+def capture_run_output_note(
+    record: Record,
+    *,
+    slipbox_form: bool = True,
+    position: int = 1,
+    trail_id: str = "run",
+    date: str = "",
+    related: Optional[List[str]] = None,
+) -> str:
+    """**AI-18.** Dispatch a run-output :class:`Record` to the renderer for its ``record_type``.
+
+    A thin umbrella over the per-kind renderers (parallel to :func:`_building_block_for`'s
+    kind-switch): it picks a renderer by ``record.record_type`` — a ``failed`` record still routes
+    through the response renderer here (this umbrella renders *every* record; the FAILURE-only
+    promotion policy lives in :func:`capture_agent_log_note`). Unknown record types fall back to
+    the response renderer. Read-only projection — it makes no runtime decision.
+    """
+    renderer = _RENDERER_BY_RECORD_TYPE.get(record.record_type, capture_agent_response_note)
+    return renderer(
+        record,
+        slipbox_form=slipbox_form,
+        position=position,
+        trail_id=trail_id,
+        date=date,
+        related=related,
+    )
 
 
 class FileVaultStateStore:
@@ -489,8 +804,8 @@ class FileVaultStateStore:
         """
         records: List[Record] = []
         for note in sorted(self._dir.glob("*.md")):
-            if note.name == "_run.md":
-                continue  # the entry-point navigation note, not a record
+            if note.name in ("_run.md", _PLAN_NOTE_NAME):
+                continue  # navigation / plan-snapshot notes, not records
             try:
                 records.append(_note_to_record(note.read_text(encoding="utf-8")))
             except (ValueError, json.JSONDecodeError, OSError):

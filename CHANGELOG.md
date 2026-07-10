@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Adaptive-compiler tier (opt-in, identity-preserving)** — the plan-generation feedback edge is
+  now expressible AROUND the compiler without ever entering `Supervisor.run`:
+  - **AI-22 `planner.plan_from_goal(goal, *, precedents=, operator_directives=, plan_model_fn=)`** —
+    the generative FRONT of the compiler (emit -> validate -> freeze -> replay). It authors an
+    `AgentDAG` that `OrchestrationAssembler.assemble` then validates + freezes + lowers; it
+    dispatches nothing and emits no plan mid-run. The LLM is an **injected, optional**
+    `plan_model_fn` seam — default `None` falls back to a trivial DETERMINISTIC template, so
+    importing/using concursus needs **no** model. Retrieved precedents (AI-17) + operator
+    directives are read-only context to the seam.
+  - **AI-20 `OrchestrationAssembler.recompile(prior_plan, *, completed, content_hashes=, dag=,
+    manifests=, max_revisions=)`** — the ONLY sanctioned plan mutation: a **bounded, monotonic**
+    re-compile that emits a FRESH FROZEN SUPERSET plan **pinning** already-executed nodes
+    (`completed()`/`content_hash`) to their prior entry/wiring, with a `_check_monotonic` guard
+    that RAISES `MonotonicityError` on any edit/removal/reorder of an executed (or already-planned)
+    node, and a `max_revisions` cap. A `ProvisioningPlan.revision` field (default `0`, surfaced in
+    `to_dict()` only when non-zero) tracks the re-compile count. The prior/running plan is never
+    mutated; resume-as-replay survives.
+  - **AI-21 `concursus run --approve/--plan-approval` (+ `--yes`)** — an opt-in between-phases gate
+    that previews the FROZEN `ProvisioningPlan.to_dict()` and PAUSES for confirmation BEFORE any
+    billed `InvokeAgentRuntime` (safe precisely because the plan is frozen). Interactive by
+    default; a non-TTY requires `--yes` or aborts. **Off by default** — today's `run --execute`
+    path is byte-for-byte unchanged.
+  - **AI-19 `docs/agentcore_placement.md`** — a design note (no runtime code, no boto3) for
+    AgentCore-aligned durable placement: AgentCore Memory as the canonical append-only log + a
+    derived on-disk `FileVault` vault (notes + `rundb`) on a BYO EFS mount via
+    `filesystemConfigurations`, kept EXTERNAL/opt-in behind the `StateStore` seam, plus the
+    session-scoped-writes / `VPC`+2049 / `HealthyBusy` / EFS-advisory-lock alignment checklist.
 - **Deterministic `MemoryStateStore` ordering** — a store-local strict-monotonic sequence
   (`Record.seq`, mirroring `InProcessStateStore._clock`) is now the primary tie-break in
   `_is_newer`, replacing reliance on the ambiguous AgentCore `eventTimestamp` (kept for display).

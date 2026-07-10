@@ -53,10 +53,21 @@ def _resolve_version() -> str:
 
 __version__ = _resolve_version()
 
-from .assemble import OrchestrationAssembler, ProvisioningPlan
+from .assemble import (
+    AssemblyError,
+    MonotonicityError,
+    OrchestrationAssembler,
+    ProvisioningPlan,
+)
 from .build import BuildPlanEntry, RuntimeBuilderFactory
 from .dag import AgentDAG, DAGError
-from .filevault import FileVaultStateStore
+from .filevault import (
+    FileVaultStateStore,
+    capture_agent_log_note,
+    capture_agent_response_note,
+    capture_run_output_note,
+    capture_run_plan_note,
+)
 from .manifest import AgentManifest, ManifestError
 from .ledger import DeployLedger, DeployRow
 from .provision import Clients, ProvisionError, provision_agent, provision_plan
@@ -69,6 +80,8 @@ from .distill import (
     load_precedents,
     render_precedent_hub,
 )
+from .planner import PlanAuthorError, plan_from_goal
+from .precedent import PrecedentRetriever, RetrievedPrecedent
 from .rundb import build_precedent_db, build_run_db
 from .rungraph import RunGraph, RunGraphError
 from .runindex import PrecedentIndex, RunIndex
@@ -94,18 +107,28 @@ __all__ = [
     "BuildPlanEntry",
     "OrchestrationAssembler",
     "ProvisioningPlan",
+    "AssemblyError",
+    "MonotonicityError",
+    "plan_from_goal",
+    "PlanAuthorError",
     "Supervisor",
     "SchemaError",
     "StateStore",
     "InProcessStateStore",
     "MemoryStateStore",
     "FileVaultStateStore",
+    "capture_run_plan_note",
+    "capture_agent_response_note",
+    "capture_agent_log_note",
+    "capture_run_output_note",
     "Record",
     "content_hash",
     "RunGraph",
     "RunGraphError",
     "RunIndex",
     "PrecedentIndex",
+    "PrecedentRetriever",
+    "RetrievedPrecedent",
     "build_run_db",
     "build_precedent_db",
     "distill_run",

@@ -3,7 +3,7 @@
 import pytest
 
 from concursus import AgentManifest
-from concursus.build import (
+from concursus.build.build import (
     PORTS,
     A2AAgentTemplate,
     BuildError,

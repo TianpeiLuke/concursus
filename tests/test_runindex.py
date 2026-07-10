@@ -2,8 +2,8 @@
 
 import pytest
 
-from concursus.runindex import RunIndex, RunIndexError, address_of
-from concursus.statestore import InProcessStateStore, Record
+from concursus.state.runindex import RunIndex, RunIndexError, address_of
+from concursus.state.statestore import InProcessStateStore, Record
 
 
 def _rec(

@@ -9,7 +9,7 @@ the Dung grounded-semantics labels. Every driver here is bounded and terminates;
 
 import pytest
 
-from concursus.trailstore import (
+from concursus.reasoning.trailstore import (
     HypothesisTrail,
     ThreadNotResolved,
     TrailStoreError,
@@ -192,7 +192,7 @@ def test_resume_by_replay_across_fresh_trail(tmp_path):
 
 
 def test_from_config_binds_same_run_dir_as_filevault(tmp_path):
-    from concursus.filevault import FileVaultStateStore
+    from concursus.state.filevault import FileVaultStateStore
 
     store = FileVaultStateStore.from_config(vault_path=tmp_path, session_id="ticket-42")
     trail = HypothesisTrail.from_config(vault_path=tmp_path, session_id="ticket-42")

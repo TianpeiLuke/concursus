@@ -39,7 +39,7 @@ def _cmd_info(_args: argparse.Namespace) -> int:
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
-    from .manifest import AgentManifest, ManifestError
+    from .core.manifest import AgentManifest, ManifestError
 
     rc = 0
     for path in args.manifests:
@@ -55,7 +55,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 # -- shared helpers ---------------------------------------------------------
 def _load_manifests(paths: List[str]) -> Dict[str, "object"]:
     """Load ``.agent.yaml`` files into ``{agent_name: AgentManifest}``."""
-    from .manifest import AgentManifest
+    from .core.manifest import AgentManifest
 
     manifests: Dict[str, object] = {}
     for path in paths:
@@ -86,7 +86,7 @@ def _build_dag(manifests: Dict[str, "object"], dag_edges: List[Tuple[str, str]])
     the edge ``producer -> node``. Unresolvable producers are left for the assembler's alignment
     check to report.
     """
-    from .dag import AgentDAG
+    from .core.dag import AgentDAG
 
     dag = AgentDAG()
     for name in manifests:
@@ -105,7 +105,7 @@ def _build_dag(manifests: Dict[str, "object"], dag_edges: List[Tuple[str, str]])
 
 def _assemble(args: argparse.Namespace) -> "object":
     """Load manifests, build the DAG, and assemble the provisioning plan (raises on error)."""
-    from .assemble import OrchestrationAssembler
+    from .assemble.assemble import OrchestrationAssembler
 
     manifests = _load_manifests(args.manifests)
     dag = _build_dag(manifests, _parse_dag_edges(getattr(args, "dag", None)))
@@ -218,7 +218,7 @@ def _execute_deploy(
     partial-result safe: a node that fails is reported ``FAILED`` and, since the CLI opts out of
     fail-fast, the remaining nodes are still attempted; a non-zero exit reflects any failure.
     """
-    from .provision import provision_plan
+    from .build.provision import provision_plan
 
     try:
         results = provision_plan(
@@ -262,7 +262,7 @@ def _parse_min_autonomy(value: Optional[str]) -> Optional["object"]:
     """Parse ``--min-autonomy`` (a TrustGrade name or 0-3) into a ``TrustGrade`` (``None`` off)."""
     if value is None:
         return None
-    from .trust import TrustGrade
+    from .build.trust import TrustGrade
 
     return TrustGrade.parse(value)
 
@@ -324,7 +324,7 @@ def _make_run_supervisor(
     (default ``"run"``). With neither, the supervisor keeps its offline in-process default. boto3
     is imported lazily (only the Memory backend needs it, and only on the first put).
     """
-    from .supervisor import Supervisor
+    from .execute.supervisor import Supervisor
 
     vault = getattr(args, "vault", None)
     memory_id = getattr(args, "memory_id", None)
@@ -336,7 +336,7 @@ def _make_run_supervisor(
     if vault:
         import datetime
 
-        from .filevault import FileVaultStateStore
+        from .state.filevault import FileVaultStateStore
 
         store = FileVaultStateStore.from_config(
             vault_path=vault,
@@ -345,7 +345,7 @@ def _make_run_supervisor(
             slipbox_form=not getattr(args, "lean_form", False),
         )
     else:
-        from .statestore import MemoryStateStore
+        from .state.statestore import MemoryStateStore
 
         store = MemoryStateStore(
             memory_id=memory_id,
@@ -424,8 +424,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(json.dumps(outputs, indent=2))
     vault = getattr(args, "vault", None)
     if vault:
-        from .filevault import _slug
-        from .rundb import build_run_db
+        from .state.filevault import _slug
+        from .state.rundb import build_run_db
 
         run_dir = os.path.join(vault, "runs", _slug(supervisor.session_id))
         db = build_run_db(run_dir)

@@ -11,9 +11,9 @@ import types
 import pytest
 
 from concursus import AgentDAG, AgentManifest
-from concursus.resolve import resolve_edges
-from concursus.statestore import InProcessStateStore
-from concursus.supervisor import (
+from concursus.core.resolve import resolve_edges
+from concursus.state.statestore import InProcessStateStore
+from concursus.execute.supervisor import (
     _ARN_PLACEHOLDER,
     SchemaError,
     Supervisor,

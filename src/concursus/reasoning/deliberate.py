@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional, Sequence
 
-from .dag import AgentDAG
+from ..core.dag import AgentDAG
 from .dks_engine import DKSEngine
 from .inner_graph import (
     InnerGraphDigest,

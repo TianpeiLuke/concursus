@@ -11,7 +11,7 @@ they are never globbed back as run records and can never leak into a resume/repl
 import json
 import sqlite3
 
-from concursus.distill import (
+from concursus.state.distill import (
     build_precedent_payload,
     distill_run,
     distill_store,
@@ -19,10 +19,10 @@ from concursus.distill import (
     precedents_dir,
     render_precedent_hub,
 )
-from concursus.filevault import FileVaultStateStore, _note_to_record
-from concursus.rundb import build_precedent_db, build_run_db, load_records
-from concursus.runindex import PrecedentIndex
-from concursus.statestore import Record
+from concursus.state.filevault import FileVaultStateStore, _note_to_record
+from concursus.state.rundb import build_precedent_db, build_run_db, load_records
+from concursus.state.runindex import PrecedentIndex
+from concursus.state.statestore import Record
 
 
 def _finished_run(vault, session, *, slipbox_form=False):

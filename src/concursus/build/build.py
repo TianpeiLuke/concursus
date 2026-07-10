@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - hints only; keeps the runtime import graph pure
-    from .manifest import AgentManifest
+    from ..core.manifest import AgentManifest
 
 # HTTP serves POST /invocations + GET /ping on 8080; MCP serves /mcp on 8000; A2A serves the
 # JSON-RPC 2.0 root on 9000. The serving contract fixes one port per protocol.

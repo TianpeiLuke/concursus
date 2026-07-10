@@ -41,8 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
-from .filevault import FileVaultStateStore, _slug
-from .statestore import content_hash
+from ..state.filevault import FileVaultStateStore, _slug
+from ..state.statestore import content_hash
 from .trailstore import Hypothesis, HypothesisTrail
 
 # The ``.2`` worker-log lane — the SAME reserved branch a run's per-worker execution logs live in.

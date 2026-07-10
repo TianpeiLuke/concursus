@@ -2,7 +2,7 @@
 
 import pytest
 
-from concursus.trust import (
+from concursus.build.trust import (
     DEFAULT_QUALIFIER,
     HOLD,
     LIVE,
@@ -100,7 +100,7 @@ def test_gate_exactly_at_floor_above_l0_is_live():
 
 # -- manifest integration ---------------------------------------------------
 def test_manifest_parses_trust_fields():
-    from concursus.manifest import AgentManifest
+    from concursus.core.manifest import AgentManifest
 
     m = AgentManifest.from_dict(
         {
@@ -118,7 +118,7 @@ def test_manifest_parses_trust_fields():
 
 
 def test_manifest_defaults_are_ungated_l0():
-    from concursus.manifest import AgentManifest
+    from concursus.core.manifest import AgentManifest
 
     m = AgentManifest.from_dict(
         {
@@ -132,7 +132,7 @@ def test_manifest_defaults_are_ungated_l0():
 
 
 def test_manifest_rejects_malformed_trust_seed():
-    from concursus.manifest import AgentManifest, ManifestError
+    from concursus.core.manifest import AgentManifest, ManifestError
 
     with pytest.raises(ManifestError):
         AgentManifest.from_dict(

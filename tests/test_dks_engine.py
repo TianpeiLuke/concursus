@@ -11,7 +11,7 @@ import sys
 
 import pytest
 
-from concursus.dks_engine import (
+from concursus.reasoning.dks_engine import (
     BAND_ARGUE_COUNTER,
     BAND_AUTO_ACCEPT,
     BAND_ESCALATE,
@@ -22,7 +22,7 @@ from concursus.dks_engine import (
     compute_ccs,
     route_by_confidence,
 )
-from concursus.trailstore import HypothesisTrail, ThreadNotResolved, require_resolved
+from concursus.reasoning.trailstore import HypothesisTrail, ThreadNotResolved, require_resolved
 
 
 # -- (i) runs to termination on a stub investigator with NO langgraph -------

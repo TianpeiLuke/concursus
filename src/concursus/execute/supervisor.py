@@ -19,15 +19,15 @@ import json
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
-from .resolve import extract
-from .rungraph import RunGraph
-from .runindex import RunIndex
-from .statestore import InProcessStateStore, StateStore
+from ..core.resolve import extract
+from ..state.rungraph import RunGraph
+from ..state.runindex import RunIndex
+from ..state.statestore import InProcessStateStore, StateStore
 
 if TYPE_CHECKING:  # pragma: no cover - hints only; keeps the runtime import graph AWS-free
-    from .assemble import ProvisioningPlan
-    from .manifest import AgentManifest
-    from .resolve import AgentRef
+    from ..assemble.assemble import ProvisioningPlan
+    from ..core.manifest import AgentManifest
+    from ..core.resolve import AgentRef
 
 # The invoke transport: ``(arn, qualifier, session_id, payload_bytes) -> parsed output dict``.
 InvokeFn = Callable[[str, str, str, bytes], dict]

@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from concursus.statestore import (
+from concursus.state.statestore import (
     InProcessStateStore,
     MemoryStateStore,
     Record,

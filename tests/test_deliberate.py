@@ -12,10 +12,10 @@ import importlib.util
 
 import pytest
 
-from concursus.assemble import OrchestrationAssembler
-from concursus.dag import AgentDAG
-from concursus.deliberate import form_plan, lower_to_dag, seed
-from concursus.trailstore import HypothesisTrail, ThreadNotResolved
+from concursus.assemble.assemble import OrchestrationAssembler
+from concursus.core.dag import AgentDAG
+from concursus.reasoning.deliberate import form_plan, lower_to_dag, seed
+from concursus.reasoning.trailstore import HypothesisTrail, ThreadNotResolved
 
 
 def _trail(tmp_path):

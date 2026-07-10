@@ -27,10 +27,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 from .trust import HOLD, SHADOW, TrustGrade, evaluate_deploy_gate
 
 if TYPE_CHECKING:  # pragma: no cover - hints only
-    from .assemble import ProvisioningPlan
+    from ..assemble.assemble import ProvisioningPlan
     from .build import BuildPlanEntry
     from .ledger import DeployLedger
-    from .manifest import AgentManifest
+    from ..core.manifest import AgentManifest
 
 # Placeholders the build plan carries until deploy fills them (must match build.py).
 _IMAGE_PLACEHOLDER = "<image-uri>"

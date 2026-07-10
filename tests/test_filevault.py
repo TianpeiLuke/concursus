@@ -11,17 +11,17 @@ import sqlite3
 
 import pytest
 
-from concursus.filevault import (
+from concursus.state.filevault import (
     FileVaultStateStore,
     _decode_blob,
     _encode_blob,
     _note_to_record,
     _record_to_note,
 )
-from concursus.rundb import build_run_db, load_records
-from concursus.rungraph import RunGraph
-from concursus.runindex import RunIndex
-from concursus.statestore import InProcessStateStore, Record
+from concursus.state.rundb import build_run_db, load_records
+from concursus.state.rungraph import RunGraph
+from concursus.state.runindex import RunIndex
+from concursus.state.statestore import InProcessStateStore, Record
 
 
 # -- round-trip exactness ---------------------------------------------------

@@ -13,8 +13,8 @@ import sys
 import pytest
 
 from concursus import AgentDAG, AgentManifest
-from concursus.assemble import OrchestrationAssembler
-from concursus.planner import PlanAuthorError, plan_from_goal
+from concursus.assemble.assemble import OrchestrationAssembler
+from concursus.assemble.planner import PlanAuthorError, plan_from_goal
 
 
 # -- fixtures ---------------------------------------------------------------

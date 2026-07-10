@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from concursus.inner_graph import (
+from concursus.reasoning.inner_graph import (
     InnerGraph,
     InnerGraphDigest,
     InnerGraphError,
@@ -28,7 +28,7 @@ from concursus.inner_graph import (
     dispatch_frontier,
     partition_frontier,
 )
-from concursus.trailstore import HypothesisTrail
+from concursus.reasoning.trailstore import HypothesisTrail
 
 
 def _trail_with_open_frontier(tmp_path, n=5):

@@ -42,8 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Union
 
-from .filevault import FileVaultStateStore
-from .statestore import _ADDR_SEP, content_hash
+from ..state.filevault import FileVaultStateStore
+from ..state.statestore import _ADDR_SEP, content_hash
 
 # The Phase-5 reasoning branch under a run dir (the ``.3`` sibling of the ``.1``/``.2`` tiers).
 _BRANCH = ".3"

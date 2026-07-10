@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Callable, List, Mapping, Optional, Sequence
 
-from .dag import AgentDAG, DAGError
+from ..core.dag import AgentDAG, DAGError
 
 #: The injected plan-author seam: ``(goal, precedents, operator_directives) -> plan spec``.
 #: A "plan spec" is a plain mapping the planner lowers into an :class:`~concursus.dag.AgentDAG`:

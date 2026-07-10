@@ -13,14 +13,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Set
 
-from . import resolve
-from .build import BuildPlanEntry, RuntimeBuilderFactory
-from .resolve import AgentRef
+from ..core import resolve
+from ..build.build import BuildPlanEntry, RuntimeBuilderFactory
+from ..core.resolve import AgentRef
 
 if TYPE_CHECKING:  # pragma: no cover - hints only; keeps the runtime import graph pure
-    from .dag import AgentDAG
-    from .manifest import AgentManifest
-    from .precedent import PrecedentRetriever
+    from ..core.dag import AgentDAG
+    from ..core.manifest import AgentManifest
+    from ..state.precedent import PrecedentRetriever
 
 #: Default ceiling on monotonic re-compiles (AI-20). The plan-generation feedback edge lives
 #: AROUND ``assemble`` (run -> distill -> precedent -> next compile); this cap makes that outer

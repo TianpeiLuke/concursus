@@ -16,8 +16,8 @@ import json
 import pytest
 
 from concursus import AgentDAG, AgentManifest
-from concursus.assemble import OrchestrationAssembler
-from concursus.filevault import (
+from concursus.assemble.assemble import OrchestrationAssembler
+from concursus.state.filevault import (
     FileVaultStateStore,
     _note_to_record,
     _record_to_note,
@@ -26,8 +26,8 @@ from concursus.filevault import (
     capture_run_output_note,
     capture_run_plan_note,
 )
-from concursus.rundb import build_run_db, load_records
-from concursus.statestore import Record, _DEDUP_RECORD_TYPE
+from concursus.state.rundb import build_run_db, load_records
+from concursus.state.statestore import Record, _DEDUP_RECORD_TYPE
 
 
 # -- fixtures ---------------------------------------------------------------

@@ -53,47 +53,47 @@ def _resolve_version() -> str:
 
 __version__ = _resolve_version()
 
-from .assemble import (
+from .assemble.assemble import (
     AssemblyError,
     MonotonicityError,
     OrchestrationAssembler,
     ProvisioningPlan,
 )
-from .build import BuildPlanEntry, RuntimeBuilderFactory
-from .dag import AgentDAG, DAGError
-from .filevault import (
+from .build.build import BuildPlanEntry, RuntimeBuilderFactory
+from .core.dag import AgentDAG, DAGError
+from .state.filevault import (
     FileVaultStateStore,
     capture_agent_log_note,
     capture_agent_response_note,
     capture_run_output_note,
     capture_run_plan_note,
 )
-from .manifest import AgentManifest, ManifestError
-from .ledger import DeployLedger, DeployRow
-from .provision import Clients, ProvisionError, provision_agent, provision_plan
-from .resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
-from .trust import GateDecision, TrustGrade, evaluate_deploy_gate
-from .distill import (
+from .core.manifest import AgentManifest, ManifestError
+from .build.ledger import DeployLedger, DeployRow
+from .build.provision import Clients, ProvisionError, provision_agent, provision_plan
+from .core.resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
+from .build.trust import GateDecision, TrustGrade, evaluate_deploy_gate
+from .state.distill import (
     build_precedent_payload,
     distill_run,
     distill_store,
     load_precedents,
     render_precedent_hub,
 )
-from .planner import PlanAuthorError, plan_from_goal
-from .precedent import PrecedentRetriever, RetrievedPrecedent
-from .rundb import build_precedent_db, build_run_db
-from .rungraph import RunGraph, RunGraphError
-from .runindex import PrecedentIndex, RunIndex
-from .statestore import (
+from .assemble.planner import PlanAuthorError, plan_from_goal
+from .state.precedent import PrecedentRetriever, RetrievedPrecedent
+from .state.rundb import build_precedent_db, build_run_db
+from .state.rungraph import RunGraph, RunGraphError
+from .state.runindex import PrecedentIndex, RunIndex
+from .state.statestore import (
     InProcessStateStore,
     MemoryStateStore,
     Record,
     StateStore,
     content_hash,
 )
-from .supervisor import SchemaError, Supervisor
-from .trailstore import (
+from .execute.supervisor import SchemaError, Supervisor
+from .reasoning.trailstore import (
     Hypothesis,
     HypothesisTrail,
     ThreadNotResolved,
@@ -101,7 +101,7 @@ from .trailstore import (
     drive_deliberation,
     require_resolved,
 )
-from .dks_engine import (
+from .reasoning.dks_engine import (
     BAND_ARGUE_COUNTER,
     BAND_AUTO_ACCEPT,
     BAND_ESCALATE,
@@ -113,7 +113,7 @@ from .dks_engine import (
     compute_ccs,
     route_by_confidence,
 )
-from .inner_graph import (
+from .reasoning.inner_graph import (
     InnerGraph,
     InnerGraphDigest,
     InnerGraphError,
@@ -122,7 +122,7 @@ from .inner_graph import (
     dispatch_frontier,
     partition_frontier,
 )
-from .deliberate import form_plan, lower_to_dag, seed
+from .reasoning.deliberate import form_plan, lower_to_dag, seed
 
 __all__ = [
     "AgentDAG",

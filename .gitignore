@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+# ...but keep the source subpackage src/concursus/build/ (shares the name of the build artifact dir).
+!/src/concursus/build/
 develop-eggs/
 dist/
 downloads/

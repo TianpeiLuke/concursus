@@ -2,7 +2,7 @@
 
 import json
 
-from concursus.ledger import DeployLedger, DeployRow
+from concursus.build.ledger import DeployLedger, DeployRow
 
 
 def test_record_round_trips_across_instances(tmp_path):

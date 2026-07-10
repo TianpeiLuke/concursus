@@ -10,7 +10,7 @@ from collections import namedtuple
 
 import pytest
 
-from concursus.rungraph import RunGraph, RunGraphError
+from concursus.state.rungraph import RunGraph, RunGraphError
 
 # A minimal StateStore-record stand-in so the test does not import statestore.
 Rec = namedtuple("Rec", "node consumes")

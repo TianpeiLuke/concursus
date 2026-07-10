@@ -3,7 +3,7 @@
 import pytest
 
 from concursus import AgentDAG, AgentManifest
-from concursus.resolve import (
+from concursus.core.resolve import (
     AgentRef,
     AlignmentError,
     check_alignment,

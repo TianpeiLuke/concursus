@@ -8,10 +8,10 @@ optional ``OrchestrationAssembler(..., precedent_retriever=...)`` hook attaches 
 plan as advisory context WITHOUT changing the frozen ``order`` / ``entries`` / ``wiring``.
 """
 
-from concursus.assemble import OrchestrationAssembler
-from concursus.distill import distill_run
-from concursus.precedent import PrecedentRetriever, RetrievedPrecedent
-from concursus.statestore import Record
+from concursus.assemble.assemble import OrchestrationAssembler
+from concursus.state.distill import distill_run
+from concursus.state.precedent import PrecedentRetriever, RetrievedPrecedent
+from concursus.state.statestore import Record
 
 from test_assemble import _chain
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-from .trust import TrustGrade
+from ..build.trust import TrustGrade
 
 
 class ManifestError(ValueError):

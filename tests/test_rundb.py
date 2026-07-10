@@ -11,8 +11,8 @@ from __future__ import annotations
 import os
 import sqlite3
 
-from concursus.filevault import FileVaultStateStore
-from concursus.rundb import _fts5_available, build_run_db
+from concursus.state.filevault import FileVaultStateStore
+from concursus.state.rundb import _fts5_available, build_run_db
 
 
 def _run(vault, session, *, slipbox_form=False):

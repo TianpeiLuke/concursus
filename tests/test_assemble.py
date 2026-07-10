@@ -5,14 +5,14 @@ import json
 import pytest
 
 from concursus import AgentDAG, AgentManifest
-from concursus.assemble import (
+from concursus.assemble.assemble import (
     AssemblyError,
     MonotonicityError,
     OrchestrationAssembler,
     ProvisioningPlan,
 )
-from concursus.build import BuildPlanEntry
-from concursus.resolve import AgentRef, AlignmentError
+from concursus.build.build import BuildPlanEntry
+from concursus.core.resolve import AgentRef, AlignmentError
 
 
 # -- fixtures ---------------------------------------------------------------

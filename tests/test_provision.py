@@ -5,9 +5,9 @@ import os
 
 import pytest
 
-from concursus.build import BuildPlanEntry, RuntimeBuilderFactory
-from concursus.manifest import AgentManifest
-from concursus.provision import (
+from concursus.build.build import BuildPlanEntry, RuntimeBuilderFactory
+from concursus.core.manifest import AgentManifest
+from concursus.build.provision import (
     Clients,
     ProvisionError,
     ensure_ecr_repo,
@@ -326,8 +326,8 @@ def test_provision_agent_defaults_to_created_without_known_fingerprints(tmp_path
 
 # -- provision_plan ---------------------------------------------------------
 def test_provision_plan_runs_every_node_in_order(tmp_path):
-    from concursus.assemble import OrchestrationAssembler
-    from concursus.dag import AgentDAG
+    from concursus.assemble.assemble import OrchestrationAssembler
+    from concursus.core.dag import AgentDAG
 
     manifests = {
         "ingest": AgentManifest.from_dict(
@@ -371,8 +371,8 @@ def test_provision_plan_runs_every_node_in_order(tmp_path):
 # -- AI-12: decision-style partial results (halt_on_error) ------------------
 def _linear_plan(names):
     """A linear DAG (n0 -> n1 -> ... ) of container agents; returns the assembled plan."""
-    from concursus.assemble import OrchestrationAssembler
-    from concursus.dag import AgentDAG
+    from concursus.assemble.assemble import OrchestrationAssembler
+    from concursus.core.dag import AgentDAG
 
     manifests = {}
     dag = AgentDAG()
@@ -443,7 +443,7 @@ def test_provision_plan_halt_on_error_false_continues(tmp_path):
 
 # -- AI-13: create-time trust gate ------------------------------------------
 def _side_effecting_entry(trust_seed, side_effecting=True):
-    from concursus.manifest import AgentManifest as _AM
+    from concursus.core.manifest import AgentManifest as _AM
 
     m = _AM.from_dict(
         {
@@ -462,7 +462,7 @@ def _side_effecting_entry(trust_seed, side_effecting=True):
 
 
 def test_provision_agent_escalates_below_min_autonomy(tmp_path):
-    from concursus.trust import TrustGrade
+    from concursus.build.trust import TrustGrade
 
     m, entry = _side_effecting_entry(TrustGrade.L0_SHADOW)
     clients, run = _fakes()
@@ -481,7 +481,7 @@ def test_provision_agent_escalates_below_min_autonomy(tmp_path):
 
 
 def test_provision_agent_require_approval_holds_side_effecting(tmp_path):
-    from concursus.trust import TrustGrade
+    from concursus.build.trust import TrustGrade
 
     m, entry = _side_effecting_entry(TrustGrade.L3_AUTONOMOUS)
     clients, run = _fakes()
@@ -495,7 +495,7 @@ def test_provision_agent_require_approval_holds_side_effecting(tmp_path):
 
 def test_provision_agent_cleared_grade_deploys_shadow(tmp_path):
     # Cleared (meets the floor) but only L0 ⇒ deploy to a NON-DEFAULT shadow qualifier.
-    from concursus.trust import TrustGrade
+    from concursus.build.trust import TrustGrade
 
     m, entry = _side_effecting_entry(TrustGrade.L0_SHADOW)
     clients, run = _fakes()
@@ -513,7 +513,7 @@ def test_provision_agent_cleared_grade_deploys_shadow(tmp_path):
 
 
 def test_provision_agent_high_grade_deploys_live(tmp_path):
-    from concursus.trust import TrustGrade
+    from concursus.build.trust import TrustGrade
 
     m, entry = _side_effecting_entry(TrustGrade.L3_AUTONOMOUS)
     clients, run = _fakes()
@@ -530,7 +530,7 @@ def test_provision_agent_high_grade_deploys_live(tmp_path):
 
 
 def test_provision_agent_non_side_effecting_never_gated(tmp_path):
-    from concursus.trust import TrustGrade
+    from concursus.build.trust import TrustGrade
 
     m, entry = _side_effecting_entry(TrustGrade.L0_SHADOW, side_effecting=False)
     clients, run = _fakes()
@@ -557,7 +557,7 @@ def test_provision_agent_gate_noop_without_manifest_or_policy(tmp_path):
 
 # -- AI-14: persisted deploy ledger integration -----------------------------
 def test_provision_agent_ledger_reuses_across_instances(tmp_path):
-    from concursus.ledger import DeployLedger
+    from concursus.build.ledger import DeployLedger
 
     path = tmp_path / "ledger.json"
     entry = _container_entry()

@@ -12,9 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`FileVaultStateStore`** — a persistent, on-disk `StateStore` backend (no AWS), closing the
   gap that the in-memory `InProcessStateStore` (state lost on exit) and the opaque-Blob
   `MemoryStateStore` left open. Each record is written as a **round-trip-exact markdown note**
-  under `<vault>/runs/<session>/`: the authoritative payload is an embedded base64 JSON blob
-  (arbitrary outputs — newlines, quotes, `---`, link syntax, numeric-looking strings — survive
-  exactly), while the frontmatter + a JSON body are greppable display copies never re-ingested.
+  under `<vault>/runs/<session>/`: two authoritative embedded base64 JSON blobs (`meta` + the
+  output `payload`) are the source of truth (arbitrary outputs — newlines, quotes, `---`, link
+  syntax, numeric-looking strings — survive exactly), while everything else is a greppable display
+  copy never re-ingested. **Notes conform to the Abuse SlipBox format** by default
+  (`slipbox_form=True`) — P.A.R.A. `tags` / `keywords` / `topics` / a **derived** `building_block`
+  (validated→`empirical_observation`, failed→`counter_argument`, dedup→`navigation`) / valid
+  `status` / `folgezettel` + `lineage` (a per-run Folgezettel trail rooted at `1`, records as
+  write-order children `1a`, `1b`, …) / `access_control_group`, a typed H1, and a `## Related
+  Notes` section (run entry + `consumes` producers) — so they validate under `check_note_format.py`
+  and read as a genuine, indexer-ingestible slipbox trail (a `_run.md` entry point roots the trail
+  so no note is an orphan). Pass `slipbox_form=False` for the lean machine schema.
   It **reuses the existing marshalling seam** (`_build_metadata` / `_event_to_record` /
   `content_hash` / `_index_records`), so it shares `MemoryStateStore`'s Record↔dict contract and
   differs only in transport. Writes are atomic (temp + `os.replace`); a reentrant lock plus a

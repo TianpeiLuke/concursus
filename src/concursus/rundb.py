@@ -83,6 +83,8 @@ def load_records(run_dir) -> List[Record]:
     """Read every note file under ``run_dir`` into a timestamp-ordered list of records."""
     records: List[Record] = []
     for note in sorted(Path(run_dir).glob("*.md")):
+        if note.name == "_run.md":
+            continue  # the entry-point navigation note, not a record
         try:
             records.append(_note_to_record(note.read_text(encoding="utf-8")))
         except Exception:

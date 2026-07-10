@@ -287,10 +287,14 @@ def _make_run_supervisor(
     supervisor = Supervisor(plan, manifests)  # mint the stable per-run session id
 
     if vault:
+        import datetime
+
         from .filevault import FileVaultStateStore
 
         store = FileVaultStateStore.from_config(
-            vault_path=vault, session_id=supervisor.session_id
+            vault_path=vault,
+            session_id=supervisor.session_id,
+            date=datetime.date.today().isoformat(),
         )
     else:
         from .statestore import MemoryStateStore

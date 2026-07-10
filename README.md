@@ -149,9 +149,13 @@ derived-DB discipline). Three backends share one Protocol:
   crashes — the supervisor skips any node already `completed()`. boto3 is imported lazily (the
   `[agentcore]` extra); pass `run --memory-id <id> [--actor-id <id>] --execute`.
 - **`FileVaultStateStore`** — opt-in, **persistent on-disk** (no AWS). Each record is written as a
-  **round-trip-exact markdown note** under `<vault>/runs/<session>/` (an authoritative base64 JSON
-  blob is the source of truth; the frontmatter + body are greppable display copies), so a run is
-  durable and inspectable offline and **resumes by reloading** the notes. `concursus.build_run_db`
+  **round-trip-exact markdown note** under `<vault>/runs/<session>/` (two authoritative base64 JSON
+  blobs — `meta` + `payload` — are the source of truth; everything else is a greppable display
+  copy), so a run is durable and inspectable offline and **resumes by reloading** the notes. Notes
+  are **Abuse-SlipBox-conformant** by default (P.A.R.A. tags, a derived `building_block`,
+  `folgezettel`/`lineage` forming a per-run trail, a typed H1, a `## Related Notes` section) — they
+  validate under `check_note_format.py` and read as a genuine slipbox trail; `slipbox_form=False`
+  gives a lean machine schema. `concursus.build_run_db`
   materializes a **derived, gitignored SQLite** graph/index over the notes (metadata postings,
   `consumes` edges, the execution-address tree, a latest-validated projection view) — the notes
   stay canonical, the DB is disposable. Pure stdlib; pass `run --vault <dir> --execute`.

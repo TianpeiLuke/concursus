@@ -103,13 +103,15 @@ def test_notes_written_to_disk(tmp_path):
     fv = FileVaultStateStore(run)
     fv.put("a", {"x": 1})
     fv.put("b", {"y": 2})
-    notes = sorted(run.glob("*.md"))
-    assert len(notes) == 2
-    # every note is readable markdown with an authoritative payload blob
-    for n in notes:
+    record_notes = sorted(p for p in run.glob("*.md") if p.name != "_run.md")
+    assert len(record_notes) == 2
+    assert (run / "_run.md").exists()  # SlipBox-form writes a Folgezettel entry point
+    # every record note is readable markdown carrying both authoritative blobs
+    for n in record_notes:
         text = n.read_text()
         assert text.startswith("---")
         assert "\npayload: b64:" in text
+        assert "\nmeta: b64:" in text
 
 
 def test_resume_by_reload_from_fresh_store(tmp_path):
@@ -165,6 +167,48 @@ def test_run_db_mirrors_records_and_edges(tmp_path):
         assert {"ingest", "summarize"} <= addrs
     finally:
         con.close()
+
+
+def test_slipbox_form_frontmatter_is_conformant(tmp_path):
+    fv = FileVaultStateStore.from_config(
+        vault_path=tmp_path, session_id="concursus-" + "a" * 40, date="2026-07-10"
+    )
+    fv.put("summarize", {"summary": "s"},
+           meta={"producer": "summarize", "consumes": ["ingest:$.document"], "schema": "sum"})
+    import glob
+    run = glob.glob(str(tmp_path / "runs" / "*"))[0]
+    text = open(glob.glob(run + "/summarize*a1.md")[0]).read()
+    # SlipBox-required fields present with valid values (aligns with check_note_format.py)
+    assert '\ntags:\n  - "resource"' in text            # valid P.A.R.A. first tag
+    assert "\nkeywords:\n" in text and "\ntopics:\n" in text
+    assert '\nstatus: "active"' in text                  # valid status (not raw 'validated')
+    assert '\nbuilding_block: "empirical_observation"' in text  # DERIVED, not hardcoded
+    assert '\nfolgezettel: "1' in text and "\nlineage:\n" in text
+    assert '\naccess_control_group:\n  - "general"' in text
+    assert "\n# Run State: summarize" in text            # typed H1
+    assert "\n## Related Notes\n" in text                # not an orphan
+
+
+def test_building_block_is_derived_from_record_kind(tmp_path):
+    import glob
+    fv = FileVaultStateStore.from_config(
+        vault_path=tmp_path, session_id="concursus-" + "b" * 40, date="2026-07-10"
+    )
+    fv.put("ok", {"x": 1})                                   # validated -> empirical_observation
+    fv.put("bad", {"e": "boom"}, meta={"status": "failed"})  # failed -> counter_argument
+    fv.put("ok", {"x": 1})                                   # identical re-put -> dedup -> navigation
+    run = glob.glob(str(tmp_path / "runs" / "*"))[0]
+    bb = {}
+    for f in glob.glob(run + "/*.md"):
+        if f.endswith("_run.md"):
+            continue
+        t = open(f).read()
+        node = json.loads(t.split('\nnode: ')[1].split('\n')[0])
+        m = t.split('\nbuilding_block: ')[1].split('\n')[0]
+        bb.setdefault(node, set()).add(json.loads(m))
+    assert "empirical_observation" in bb["ok"]
+    assert "navigation" in bb["ok"]          # the dedup re-put
+    assert bb["bad"] == {"counter_argument"}
 
 
 def test_run_db_parity_with_runindex(tmp_path):

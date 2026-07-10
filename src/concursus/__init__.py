@@ -56,9 +56,11 @@ __version__ = _resolve_version()
 from .assemble import OrchestrationAssembler, ProvisioningPlan
 from .build import BuildPlanEntry, RuntimeBuilderFactory
 from .dag import AgentDAG, DAGError
+from .filevault import FileVaultStateStore
 from .manifest import AgentManifest, ManifestError
 from .provision import Clients, ProvisionError, provision_plan
 from .resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
+from .rundb import build_run_db
 from .rungraph import RunGraph, RunGraphError
 from .runindex import RunIndex
 from .statestore import (
@@ -88,11 +90,13 @@ __all__ = [
     "StateStore",
     "InProcessStateStore",
     "MemoryStateStore",
+    "FileVaultStateStore",
     "Record",
     "content_hash",
     "RunGraph",
     "RunGraphError",
     "RunIndex",
+    "build_run_db",
     "provision_plan",
     "Clients",
     "ProvisionError",

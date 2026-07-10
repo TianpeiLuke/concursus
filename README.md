@@ -141,13 +141,20 @@ The supervisor dispatches agents in topological order, invokes each with `Invoke
 
 The supervisor threads every output through a **`StateStore`** — an append-only log of validated
 outputs plus a derived `{node: output}` projection (the slipbox's single-source-of-truth /
-derived-DB discipline). Two backends share one Protocol:
+derived-DB discipline). Three backends share one Protocol:
 
 - **`InProcessStateStore`** — the zero-dependency, offline default. Nothing new to install.
 - **`MemoryStateStore`** — opt-in, AgentCore **Memory**-backed. Each validated output is one Blob
   event; a run **resumes by replaying** its event log, so it survives micro-VM teardown / mid-run
   crashes — the supervisor skips any node already `completed()`. boto3 is imported lazily (the
   `[agentcore]` extra); pass `run --memory-id <id> [--actor-id <id>] --execute`.
+- **`FileVaultStateStore`** — opt-in, **persistent on-disk** (no AWS). Each record is written as a
+  **round-trip-exact markdown note** under `<vault>/runs/<session>/` (an authoritative base64 JSON
+  blob is the source of truth; the frontmatter + body are greppable display copies), so a run is
+  durable and inspectable offline and **resumes by reloading** the notes. `concursus.build_run_db`
+  materializes a **derived, gitignored SQLite** graph/index over the notes (metadata postings,
+  `consumes` edges, the execution-address tree, a latest-validated projection view) — the notes
+  stay canonical, the DB is disposable. Pure stdlib; pass `run --vault <dir> --execute`.
 
 Each record also persists its resolved `AgentRef` edges (`consumes`), turning the log into a
 **queryable run graph** (`RunGraph`: `upstream`/`downstream`, a structural `validate`, bounded

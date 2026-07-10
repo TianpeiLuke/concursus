@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -267,27 +268,38 @@ def _print_run_dryrun(plan: "object", manifests: Dict[str, "object"], inputs: di
 def _make_run_supervisor(
     args: argparse.Namespace, plan: "object", manifests: Dict[str, "object"]
 ) -> "object":
-    """A Supervisor for ``run --execute``, optionally backed by a durable MemoryStateStore.
+    """A Supervisor for ``run --execute``, optionally backed by a durable StateStore.
 
-    With ``--memory-id`` the run threads through an AgentCore ``MemoryStateStore`` (opt-in,
-    resumable) sharing the supervisor's ``runtimeSessionId``; ``--actor-id`` scopes the event
-    stream (default ``"run"``). Without it the supervisor keeps its offline in-process default.
-    boto3 is imported lazily (only the Memory backend needs it, and only on the first put).
+    With ``--vault DIR`` the run persists as round-trip-exact markdown notes under
+    ``DIR/runs/<session>/`` (offline, resumable, no AWS) — the durable on-disk slipbox tier.
+    With ``--memory-id`` it threads through an AgentCore ``MemoryStateStore`` (opt-in, resumable)
+    sharing the supervisor's ``runtimeSessionId``; ``--actor-id`` scopes the event stream
+    (default ``"run"``). With neither, the supervisor keeps its offline in-process default. boto3
+    is imported lazily (only the Memory backend needs it, and only on the first put).
     """
     from .supervisor import Supervisor
 
+    vault = getattr(args, "vault", None)
     memory_id = getattr(args, "memory_id", None)
-    if not memory_id:
+    if not vault and not memory_id:
         return Supervisor(plan, manifests)
 
-    from .statestore import MemoryStateStore
-
     supervisor = Supervisor(plan, manifests)  # mint the stable per-run session id
-    store = MemoryStateStore(
-        memory_id=memory_id,
-        session_id=supervisor.session_id,
-        actor_id=getattr(args, "actor_id", None) or "run",
-    )
+
+    if vault:
+        from .filevault import FileVaultStateStore
+
+        store = FileVaultStateStore.from_config(
+            vault_path=vault, session_id=supervisor.session_id
+        )
+    else:
+        from .statestore import MemoryStateStore
+
+        store = MemoryStateStore(
+            memory_id=memory_id,
+            session_id=supervisor.session_id,
+            actor_id=getattr(args, "actor_id", None) or "run",
+        )
     return Supervisor(plan, manifests, session_id=supervisor.session_id, state_store=store)
 
 
@@ -302,11 +314,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _print_run_dryrun(plan, manifests, inputs)
         return 0
     try:
-        outputs = _make_run_supervisor(args, plan, manifests).run(inputs)
+        supervisor = _make_run_supervisor(args, plan, manifests)
+        outputs = supervisor.run(inputs)
     except Exception as exc:  # surface AWS/runtime/schema failures as a clean CLI error
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
     print(json.dumps(outputs, indent=2))
+    vault = getattr(args, "vault", None)
+    if vault:
+        from .filevault import _slug
+        from .rundb import build_run_db
+
+        run_dir = os.path.join(vault, "runs", _slug(supervisor.session_id))
+        db = build_run_db(run_dir)
+        print(f"\nPersisted run to {run_dir}\nDerived run DB: {db}", file=sys.stderr)
     return 0
 
 
@@ -375,6 +396,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="Actually invoke the live runtimes via boto3 (otherwise a dry-run).",
+    )
+    rn.add_argument(
+        "--vault",
+        metavar="DIR",
+        help="Persist the run as durable markdown notes under DIR/runs/<session>/ (offline, "
+        "resumable, no AWS) and build a derived SQLite run DB. Omit for the in-process store.",
     )
     rn.add_argument(
         "--memory-id",

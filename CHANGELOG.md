@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`FileVaultStateStore`** — a persistent, on-disk `StateStore` backend (no AWS), closing the
+  gap that the in-memory `InProcessStateStore` (state lost on exit) and the opaque-Blob
+  `MemoryStateStore` left open. Each record is written as a **round-trip-exact markdown note**
+  under `<vault>/runs/<session>/`: the authoritative payload is an embedded base64 JSON blob
+  (arbitrary outputs — newlines, quotes, `---`, link syntax, numeric-looking strings — survive
+  exactly), while the frontmatter + a JSON body are greppable display copies never re-ingested.
+  It **reuses the existing marshalling seam** (`_build_metadata` / `_event_to_record` /
+  `content_hash` / `_index_records`), so it shares `MemoryStateStore`'s Record↔dict contract and
+  differs only in transport. Writes are atomic (temp + `os.replace`); a reentrant lock plus a
+  generation-token OCC over `.lock` / `.gen` sidecars serialize concurrent writers over one vault.
+  **Resume = reload**: a fresh store over an existing vault reconstructs `completed()` / `get()`.
+  `FileVaultStateStore.from_config(vault_path=, session_id=)` is the persistence-by-default
+  constructor; the bare `InProcessStateStore` remains the ephemeral default.
+- **`rundb.build_run_db`** — a **derived, rebuildable SQLite** graph/index over a persisted run's
+  notes, mirroring the slipbox's `build_unified_db` discipline: a `records` metadata-postings
+  table (indexed on node/status/record_type/schema/producer), a `consumes_edges` data-dependency
+  table (the `AgentRef` graph at rest), a `run_addresses` execution-tree table, and a
+  `projection` VIEW (latest validated per node). Reads **only** the notes (the single source of
+  truth); the DB is gitignored and disposable — deleting it loses nothing.
+- **CLI** — `concursus run --vault <dir> --execute` persists the run to the on-disk vault and
+  builds its derived run DB; exposes `FileVaultStateStore` and `build_run_db` from the package
+  root.
+
+### Notes
+
+- The on-disk notes stay the single source of truth; `RunGraph` / `RunIndex` remain the fast
+  in-process derived structures, and the SQLite DB is the queryable-at-rest mirror. This is the
+  offline / air-gapped / CI / debuggable durability tier (FZ 35e1b1); for AgentCore-hosted runs a
+  BYO EFS/S3 Files mount or the managed Memory log remain the aligned choices (FZ 35e1b2).
+
 ## [0.4.0] - 2026-07-07
 
 ### Added

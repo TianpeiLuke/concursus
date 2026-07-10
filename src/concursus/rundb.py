@@ -72,17 +72,24 @@ CREATE TABLE run_addresses (
 );
 
 -- Latest validated record per node — the read-model projection, NEVER a source-of-truth table.
+-- Implemented without window functions (ROW_NUMBER OVER ...) so it runs on the older SQLite that
+-- ships with some Python builds (window functions need SQLite >= 3.25): a row is "latest" when no
+-- other validated row for the same node has a strictly greater (attempt, timestamp) key.
 CREATE VIEW projection AS
-SELECT node, output_json, attempt, timestamp
-FROM (
-    SELECT node, output_json, attempt, timestamp,
-           ROW_NUMBER() OVER (
-               PARTITION BY node ORDER BY attempt DESC, timestamp DESC
-           ) AS rn
-    FROM records
-    WHERE status = 'validated'
-)
-WHERE rn = 1;
+SELECT r.node, r.output_json, r.attempt, r.timestamp
+FROM records r
+WHERE r.status = 'validated'
+  AND NOT EXISTS (
+      SELECT 1 FROM records r2
+      WHERE r2.node = r.node
+        AND r2.status = 'validated'
+        AND ( r2.attempt > r.attempt
+              OR ( r2.attempt = r.attempt
+                   AND COALESCE(r2.timestamp, 0) > COALESCE(r.timestamp, 0) )
+              OR ( r2.attempt = r.attempt
+                   AND COALESCE(r2.timestamp, 0) = COALESCE(r.timestamp, 0)
+                   AND r2.event_key > r.event_key ) )
+  );
 """
 
 # Optional full-text index over the run outputs (FTS5). Created only when the SQLite build

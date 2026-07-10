@@ -13,7 +13,12 @@ import pytest
 from concursus import AgentDAG, AgentManifest
 from concursus.resolve import resolve_edges
 from concursus.statestore import InProcessStateStore
-from concursus.supervisor import SchemaError, Supervisor, validate_output
+from concursus.supervisor import (
+    _ARN_PLACEHOLDER,
+    SchemaError,
+    Supervisor,
+    validate_output,
+)
 
 
 # -- fixtures ---------------------------------------------------------------
@@ -417,6 +422,147 @@ def test_arn_falls_back_to_manifest_registry():
     )
     sup.run({"uri": "s3://doc"})
     assert fake.payload_for("arn:from-manifest") == {"uri": "s3://doc"}
+
+
+# -- AI-10: dispatch-time ARN binding-integrity assertion -------------------
+def test_arn_resolver_default_none_leaves_happy_path_unchanged():
+    # (i) With no arn_resolver (default), the run behaves byte-for-byte as before.
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+
+    outputs = sup.run({"uri": "s3://doc"})
+
+    assert set(outputs) == {"ingest", "summarize", "critique"}
+    assert outputs["critique"] == {"critique": "OK"}
+    assert len(fake.calls) == 3  # every node invoked, no extra integrity gating
+
+
+def test_arn_resolver_default_none_fail_fast_regression_still_raises():
+    # (i) The default fail-fast contract is untouched when no arn_resolver is passed.
+    dag, manifests = _chain()
+    broken = _fake_outputs()
+    broken["arn:summarize"] = {"not_summary": "oops"}
+    fake = FakeInvoker(broken)
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+    with pytest.raises(SchemaError, match="summary"):
+        sup.run({"uri": "s3://doc"})
+
+
+def test_placeholder_arn_records_failure_and_does_not_invoke():
+    # (ii) A node whose compiled ARN is the unprovisioned placeholder is NOT invoked; under
+    # on_error='record' a failed record is written and independent upstreams still complete.
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    store = InProcessStateStore()
+    # Supply arns only for ingest + summarize; 'critique' falls back to the placeholder.
+    sup = Supervisor(
+        _plan(dag, manifests),
+        manifests,
+        invoke_fn=fake,
+        arns={"ingest": "arn:ingest", "summarize": "arn:summarize"},
+        state_store=store,
+        on_error="record",
+    )
+
+    outputs = sup.run({"uri": "s3://doc"})
+
+    # critique never invoked (its arn is the placeholder); ingest + summarize completed.
+    assert set(outputs) == {"ingest", "summarize"}
+    assert "arn:critique" not in {arn for arn, _q, _s, _p in fake.calls}
+    assert _ARN_PLACEHOLDER not in {arn for arn, _q, _s, _p in fake.calls}
+
+    failed = [r for r in store.records() if r.node == "critique" and r.status == "failed"]
+    assert len(failed) == 1
+    assert "no provisioned runtime ARN" in failed[0].output["error"]
+
+
+def test_placeholder_arn_default_raises_clear_error():
+    # (ii) On the default fail-fast path, an unprovisioned ARN raises a clear binding error.
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    sup = Supervisor(
+        _plan(dag, manifests),
+        manifests,
+        invoke_fn=fake,
+        arns={"summarize": "arn:summarize", "critique": "arn:critique"},  # ingest -> placeholder
+    )
+    with pytest.raises(RuntimeError, match="no provisioned runtime ARN"):
+        sup.run({"uri": "s3://doc"})
+    assert fake.calls == []  # ingest (source) failed the integrity gate before any invoke
+
+
+def test_arn_resolver_mismatch_records_failure_and_does_not_invoke_refetched_arn():
+    # (iii) A resolver returning a DIFFERENT arn fails the integrity assertion; the run must NOT
+    # invoke the re-fetched arn (no in-run rebind of the frozen binding).
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    store = InProcessStateStore()
+
+    def resolver(node, manifest):
+        if node == "summarize":
+            return "arn:summarize-REBOUND"  # authoritative differs from the compiled arn
+        return _ARNS[node]
+
+    sup = Supervisor(
+        _plan(dag, manifests),
+        manifests,
+        invoke_fn=fake,
+        arns=_ARNS,
+        state_store=store,
+        on_error="record",
+        arn_resolver=resolver,
+    )
+
+    outputs = sup.run({"uri": "s3://doc"})
+
+    # summarize failed (stale binding); critique blocked on it; only ingest returns.
+    assert set(outputs) == {"ingest"}
+    invoked = {arn for arn, _q, _s, _p in fake.calls}
+    assert "arn:summarize" not in invoked  # the compiled arn was not invoked
+    assert "arn:summarize-REBOUND" not in invoked  # and CRITICALLY the re-fetched arn was not
+
+    failed = [r for r in store.records() if r.node == "summarize" and r.status == "failed"]
+    assert len(failed) == 1
+    assert "stale" in failed[0].output["error"]
+
+
+def test_arn_resolver_mismatch_default_raises_re_compile_error():
+    # (iii) On the default fail-fast path, a stale compiled ARN raises rather than rebinding.
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+
+    def resolver(node, manifest):
+        return "arn:ingest-REBOUND" if node == "ingest" else _ARNS[node]
+
+    sup = Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS, arn_resolver=resolver
+    )
+    with pytest.raises(RuntimeError, match="stale; re-compile"):
+        sup.run({"uri": "s3://doc"})
+    assert fake.calls == []  # failed integrity gate before any invoke
+
+
+def test_arn_resolver_confirming_compiled_arn_invokes_normally():
+    # (iv) A resolver that CONFIRMS the compiled arn lets every node invoke as usual.
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    seen = []
+
+    def resolver(node, manifest):
+        seen.append(node)
+        return _ARNS[node]  # authoritative == compiled for every node
+
+    sup = Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS, arn_resolver=resolver
+    )
+
+    outputs = sup.run({"uri": "s3://doc"})
+
+    assert set(outputs) == {"ingest", "summarize", "critique"}
+    assert outputs["critique"] == {"critique": "OK"}
+    assert sorted(seen) == ["critique", "ingest", "summarize"]  # resolver consulted per node
+    assert len(fake.calls) == 3
 
 
 # -- state store seam: diamond DAG + graph-aware context + resume -----------

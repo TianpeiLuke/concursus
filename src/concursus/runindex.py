@@ -28,6 +28,12 @@ from .statestore import Record, _ADDR_SEP, _is_newer
 INDEXED_FIELDS = ("node", "status", "record_type", "schema", "producer")
 
 
+class RunIndexError(ValueError):
+    """Raised by :meth:`RunIndex.validate` when the materialized-path addresses violate
+    concursus's honest-tree invariants (an orphaned sub-address, an unknown root segment, or —
+    when requested — a non-contiguous attempt sequence)."""
+
+
 def address_of(record: Record) -> str:
     """The record's Folgezettel address — its explicit ``address`` or, by default, its ``node``."""
     return record.address or record.node
@@ -103,6 +109,59 @@ class RunIndex:
     def nodes(self) -> Set[str]:
         """Every node id present in the log."""
         return set(self._by_field["node"].keys())
+
+    # -- structural layout guard --------------------------------------------
+    def validate(self, *, check_attempts: bool = False) -> "RunIndex":
+        """Assert concursus's honest-tree invariants over the materialized-path addresses.
+
+        Two invariants always hold on a well-formed run:
+
+        1. **No orphaned sub-address.** Every NON-root record address's parent-prefix (strip the
+           last ``"/"`` segment) must correspond to a REAL record's address — not a bare prefix
+           :meth:`__init__` synthesized for a retry/fan-out sub-address whose parent never
+           executed. (``_addresses`` back-fills ancestor prefixes for traversal; a prefix with no
+           record in ``_by_address`` means the tree was addressed dishonestly.)
+        2. **Known root.** Every root segment (the first path segment of every address) must name
+           a known node — a materialized path may only be rooted at an executed DAG node.
+
+        With ``check_attempts=True`` it additionally asserts each node's attempts form a
+        contiguous ``1..N`` sequence (no gap / no missing retry).
+
+        Returns ``self`` for chaining (mirrors ``AgentDAG.validate`` / ``AgentManifest.validate``);
+        raises :class:`RunIndexError` on the first violation. This is a static binding-INTEGRITY
+        assertion over an ALREADY-materialized run — it reads addresses and fails; it never
+        repairs, re-addresses, or mutates the index, and it deliberately carries NONE of
+        HiveFleet's reserved-branch (``.1``/``.2``/``.3``) permission semantics (meaningless for
+        concursus's single writer).
+        """
+        known_nodes = self.nodes()
+        real = set(self._by_address)  # addresses carrying at least one real record
+
+        for addr in sorted(real):
+            root = addr.split(self.SEP, 1)[0]
+            if root not in known_nodes:
+                raise RunIndexError(
+                    f"address {addr!r} is rooted at {root!r}, which is not a known node "
+                    f"(known: {sorted(known_nodes)})"
+                )
+            if self.SEP in addr:
+                parent = addr.rsplit(self.SEP, 1)[0]
+                if parent not in real:
+                    raise RunIndexError(
+                        f"orphaned address {addr!r}: its parent {parent!r} has no record "
+                        f"(a synthesized sub-address whose parent never executed)"
+                    )
+
+        if check_attempts:
+            for node, recs in self._by_field["node"].items():
+                attempts = sorted({r.attempt for r in recs})
+                expected = list(range(1, len(attempts) + 1))
+                if attempts != expected:
+                    raise RunIndexError(
+                        f"node {node!r} has non-contiguous attempts {attempts} "
+                        f"(expected {expected})"
+                    )
+        return self
 
     # -- Folgezettel tree ---------------------------------------------------
     def addresses(self) -> List[str]:

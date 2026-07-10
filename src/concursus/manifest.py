@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from .trust import TrustGrade
+
 
 class ManifestError(ValueError):
     """Raised on an invalid agent manifest."""
@@ -35,12 +37,23 @@ class AgentManifest:
             ``agent_runtime_arn`` to reuse an already-deployed runtime.
         contract: ``{"inputs": {...}, "outputs": {<json-schema>}}``.
         spec: Optional ``{"depends_on": [{"from": "producer.field", "to": "input"}]}``.
+        trust_seed: The author-declared create-time autonomy of this node (see
+            :class:`~concursus.trust.TrustGrade`); consulted ONCE at provision time by the
+            deploy gate, never per-invocation. Defaults to ``L0_SHADOW``.
+        side_effecting: Whether this agent takes real-world side effects (writes, sends, calls
+            external systems). Only side-effecting agents are gated at deploy time; the default
+            ``False`` keeps a read-only agent's deploy ungated.
+        escalate_boundary: An opaque author-declared label naming who/what a held deploy should
+            escalate to (informational; the compiler stores but does not act on it).
     """
 
     name: str
     registry: Dict[str, Any] = field(default_factory=dict)
     contract: Dict[str, Any] = field(default_factory=dict)
     spec: Dict[str, Any] = field(default_factory=dict)
+    trust_seed: TrustGrade = TrustGrade.L0_SHADOW
+    side_effecting: bool = False
+    escalate_boundary: str = ""
 
     # -- accessors ----------------------------------------------------------
     @property
@@ -89,11 +102,24 @@ class AgentManifest:
     # -- construction -------------------------------------------------------
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AgentManifest":
+        raw_seed = data.get("trust_seed")
+        try:
+            trust_seed = (
+                TrustGrade.L0_SHADOW if raw_seed is None else TrustGrade.parse(raw_seed)
+            )
+        except ValueError as exc:
+            raise ManifestError(
+                f"{data.get('name', '')}: invalid trust_seed {raw_seed!r} — expected a "
+                "TrustGrade (0-3, or a name like 'L0_SHADOW')"
+            ) from exc
         return cls(
             name=data.get("name", ""),
             registry=dict(data.get("registry", {})),
             contract=dict(data.get("contract", {})),
             spec=dict(data.get("spec", {})),
+            trust_seed=trust_seed,
+            side_effecting=bool(data.get("side_effecting", False)),
+            escalate_boundary=str(data.get("escalate_boundary", "") or ""),
         )
 
     @classmethod

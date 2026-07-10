@@ -192,14 +192,32 @@ def _parse_source_dirs(specs: Optional[List[str]]) -> Tuple[str, Dict[str, str]]
     return default_dir, per_node
 
 
+_DEPLOY_VERBS = {
+    "reused": "REUSE   ",
+    "created": "CREATED ",
+    "updated": "UPDATED ",
+    "escalated": "ESCALATE",
+    "failed": "FAILED  ",
+}
+
+
 def _execute_deploy(
     plan: "object",
     region: Optional[str],
     default_source_dir: str,
     source_dirs: Dict[str, str],
     tag: str,
+    manifests: Optional[Dict[str, "object"]] = None,
+    min_autonomy: Optional["object"] = None,
+    require_approval: bool = False,
 ) -> int:
-    """Provision the plan for real: ensure IAM roles, build+push images, ``CreateAgentRuntime``."""
+    """Provision the plan for real: ensure IAM roles, build+push images, ``CreateAgentRuntime``.
+
+    ``min_autonomy``/``require_approval`` feed the create-time trust gate (a side-effecting node
+    below the floor is *escalated*, not created — reported, never deployed). Provisioning is
+    partial-result safe: a node that fails is reported ``FAILED`` and, since the CLI opts out of
+    fail-fast, the remaining nodes are still attempted; a non-zero exit reflects any failure.
+    """
     from .provision import provision_plan
 
     try:
@@ -209,25 +227,51 @@ def _execute_deploy(
             source_dirs=source_dirs,
             default_source_dir=default_source_dir,
             tag=tag,
+            manifests=manifests,
+            min_autonomy=min_autonomy,
+            require_approval=require_approval,
+            halt_on_error=False,
         )
     except Exception as exc:  # surface boto3/Docker/provision failures as a clean CLI error
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
+    rc = 0
     for r in results:
-        verb = "REUSE  " if r.get("action") == "reused" else "CREATED"
+        action = r.get("action")
+        verb = _DEPLOY_VERBS.get(action, "CREATED ")
+        if action == "escalated":
+            print(f"{verb} {r['node']}  HELD: {r.get('reason', 'trust gate')}", file=sys.stderr)
+            rc = 1
+            continue
+        if action == "failed":
+            print(f"{verb} {r['node']}  -> {r.get('error')}", file=sys.stderr)
+            rc = 1
+            continue
         extra = ""
+        if r.get("qualifier") and r.get("qualifier") != "DEFAULT":
+            extra += f"  qualifier={r['qualifier']}(shadow)"
         if r.get("image_uri"):
             extra += f"  image={r['image_uri']}"
         if r.get("role_arn"):
             extra += f"  role={r['role_arn']}"
         print(f"{verb} {r['node']}  -> {r.get('arn')}{extra}")
-    return 0
+    return rc
+
+
+def _parse_min_autonomy(value: Optional[str]) -> Optional["object"]:
+    """Parse ``--min-autonomy`` (a TrustGrade name or 0-3) into a ``TrustGrade`` (``None`` off)."""
+    if value is None:
+        return None
+    from .trust import TrustGrade
+
+    return TrustGrade.parse(value)
 
 
 def _cmd_deploy(args: argparse.Namespace) -> int:
     try:
-        _manifests, plan = _assemble(args)
+        manifests, plan = _assemble(args)
         default_source_dir, source_dirs = _parse_source_dirs(getattr(args, "source_dir", None))
+        min_autonomy = _parse_min_autonomy(getattr(args, "min_autonomy", None))
     except (ValueError, OSError) as exc:
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
@@ -240,6 +284,9 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         default_source_dir,
         source_dirs,
         getattr(args, "tag", None) or "latest",
+        manifests=manifests,
+        min_autonomy=min_autonomy,
+        require_approval=bool(getattr(args, "require_approval", False)),
     )
 
 
@@ -393,6 +440,19 @@ def build_parser() -> argparse.ArgumentParser:
         "NODE=DIR overrides one agent.",
     )
     dp.add_argument("--tag", help="Container image tag to build/push (default 'latest').")
+    dp.add_argument(
+        "--min-autonomy",
+        metavar="GRADE",
+        help="Create-time trust floor (a TrustGrade name like L2_GUARDED, or 0-3). A "
+        "side-effecting agent whose declared trust_seed is below this is ESCALATED (held, not "
+        "deployed); a cleared-but-L0 grade deploys to a shadow endpoint. Omit to disable the gate.",
+    )
+    dp.add_argument(
+        "--require-approval",
+        action="store_true",
+        help="Hold every side-effecting agent for explicit approval (ESCALATE, no create), "
+        "regardless of trust_seed. Off by default.",
+    )
     dp.set_defaults(func=_cmd_deploy)
 
     rn = sub.add_parser(

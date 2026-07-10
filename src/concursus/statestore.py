@@ -108,7 +108,13 @@ class Record:
         consumes: The resolved ``AgentRef`` edges as ``"producer:$.jsonpath"`` strings.
         supersedes: The prior attempt's ``event_id`` (deterministic replay ordering).
         content_hash: :func:`content_hash` of ``output``.
-        timestamp: The event timestamp (monotonic in-process; AgentCore ts when backed).
+        timestamp: The event timestamp (monotonic in-process; AgentCore ``eventTimestamp`` when
+            backed — display only, NOT the ordering key for a Memory-backed store).
+        seq: A local strict-monotonic sequence assigned by the store on ``put`` (and by
+            :meth:`MemoryStateStore.replay` in log order). This — not ``timestamp`` — is the
+            deterministic tie-breaker in :func:`_is_newer`, so concurrent branch/retry writes
+            that share an AgentCore ``eventTimestamp`` still resolve identically on every replay.
+            ``None`` for a record not sourced from a store (e.g. a hand-built one).
         event_id: The backing Memory event id (``None`` for the in-process store).
         address: The Folgezettel execution address — a materialized path (default the ``node``
             name; a retry / fan-out / branch appends a ``"/"`` segment, e.g. ``"map/0"``). Its
@@ -127,6 +133,7 @@ class Record:
     supersedes: Optional[str] = None
     content_hash: Optional[str] = None
     timestamp: Optional[int] = None
+    seq: Optional[int] = None
     event_id: Optional[str] = None
     address: Optional[str] = None
     blocked_on: Optional[str] = None
@@ -180,15 +187,23 @@ def _apply_meta(record: Record, meta: Optional[dict]) -> None:
 
 # -- record indexing --------------------------------------------------------
 def _is_newer(candidate: Record, current: Optional[Record]) -> bool:
-    """Whether ``candidate`` supersedes ``current``: higher attempt, then newer timestamp.
+    """Whether ``candidate`` supersedes ``current``: higher attempt, then higher local ``seq``,
+    then newer ``timestamp``.
 
-    Ties (equal attempt + timestamp) resolve to ``candidate`` — records are iterated in
-    append / chronological order, so the last-seen wins (last-write-wins).
+    The tie-breaker is the store-assigned strict-monotonic ``seq`` (put / replay order), NOT the
+    raw ``timestamp``: an AgentCore ``eventTimestamp`` can tie for concurrent branch/retry writes,
+    so ordering on it alone would resolve NON-DETERMINISTICALLY on replay. ``seq`` gives every
+    store the same total order the :class:`InProcessStateStore`'s monotonic clock already did.
+    ``timestamp`` remains the fallback for records with no ``seq`` (hand-built, or the file-vault
+    store whose monotonic clock is its ``timestamp``). Remaining ties (equal attempt + seq +
+    timestamp) resolve to ``candidate`` — records are iterated in append order, so last-seen wins.
     """
     if current is None:
         return True
     if candidate.attempt != current.attempt:
         return candidate.attempt > current.attempt
+    if candidate.seq is not None and current.seq is not None and candidate.seq != current.seq:
+        return candidate.seq > current.seq
     ct = candidate.timestamp if candidate.timestamp is not None else 0
     pt = current.timestamp if current.timestamp is not None else 0
     if ct != pt:
@@ -280,6 +295,7 @@ class InProcessStateStore:
                 attempt=attempt,
                 content_hash=chash,
                 timestamp=self._clock,
+                seq=self._clock,
             )
             _apply_meta(record, meta)
             if dedup and record.record_type == "agent_output":
@@ -339,6 +355,10 @@ class MemoryStateStore:
         self._attempts: Dict[str, int] = {}
         self._last_event_id: Dict[str, str] = {}
         self._event_id_by_address: Dict[str, str] = {}  # FZ address -> event id (branch roots)
+        # Local strict-monotonic sequence (mirrors InProcessStateStore._clock): assigned per
+        # put and per replayed event, it — not the AgentCore eventTimestamp — is the ordering
+        # tie-breaker, so concurrent branch/retry writes resolve DETERMINISTICALLY on replay.
+        self._clock: int = 0
         self._loaded = False
         # Reentrant: guards the read-then-write bodies (attempt++ / append / projection /
         # replay) so a future concurrent-dispatch supervisor cannot lose-update the cached
@@ -350,6 +370,7 @@ class MemoryStateStore:
     def put(self, node: str, output: dict, *, meta: Optional[dict] = None) -> None:
         meta = meta or {}
         with self._lock:
+            self._clock += 1
             attempt = self._attempts.get(node, 0) + 1
             self._attempts[node] = attempt
 
@@ -358,6 +379,7 @@ class MemoryStateStore:
                 output=dict(output),
                 attempt=attempt,
                 content_hash=content_hash(output),
+                seq=self._clock,
             )
             _apply_meta(record, meta)
             record.supersedes = meta.get("supersedes") or self._last_event_id.get(node)
@@ -414,14 +436,22 @@ class MemoryStateStore:
         with self._lock:
             records: List[Record] = []
             token: Optional[str] = None
+            seq = 0
             while True:
                 response = self._list_events(includePayloads=True, nextToken=token)
                 for event in response.get("events", []):
-                    records.append(_event_to_record(event))
+                    seq += 1
+                    record = _event_to_record(event)
+                    # Assign the local strict-monotonic seq in log (pagination) order, so a
+                    # resumed store tie-breaks EXACTLY as the original run's put order did —
+                    # never on the ambiguous AgentCore eventTimestamp.
+                    record.seq = seq
+                    records.append(record)
                 token = response.get("nextToken")
                 if not token:
                     break
 
+            self._clock = seq
             latest_overall, latest_validated, attempts = _index_records(records)
             self._records = records
             self._projection = {node: r.output for node, r in latest_validated.items()}

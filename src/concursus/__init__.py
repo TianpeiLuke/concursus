@@ -58,8 +58,10 @@ from .build import BuildPlanEntry, RuntimeBuilderFactory
 from .dag import AgentDAG, DAGError
 from .filevault import FileVaultStateStore
 from .manifest import AgentManifest, ManifestError
-from .provision import Clients, ProvisionError, provision_plan
+from .ledger import DeployLedger, DeployRow
+from .provision import Clients, ProvisionError, provision_agent, provision_plan
 from .resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
+from .trust import GateDecision, TrustGrade, evaluate_deploy_gate
 from .distill import (
     build_precedent_payload,
     distill_run,
@@ -112,7 +114,13 @@ __all__ = [
     "render_precedent_hub",
     "load_precedents",
     "provision_plan",
+    "provision_agent",
     "Clients",
     "ProvisionError",
+    "TrustGrade",
+    "GateDecision",
+    "evaluate_deploy_gate",
+    "DeployLedger",
+    "DeployRow",
     "__version__",
 ]

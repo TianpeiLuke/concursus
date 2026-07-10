@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Deterministic `MemoryStateStore` ordering** — a store-local strict-monotonic sequence
+  (`Record.seq`, mirroring `InProcessStateStore._clock`) is now the primary tie-break in
+  `_is_newer`, replacing reliance on the ambiguous AgentCore `eventTimestamp` (kept for display).
+  Concurrent branch/retry writes resolve deterministically on replay.
+- **`RunIndex.validate()`** — an opt-in structural layout guard (`RunIndexError`) asserting the
+  honest-tree invariants over the materialized-path addresses (every non-root address's
+  parent-prefix is a real record; every root segment names a known node; optional contiguous
+  attempts). Never mutates or re-addresses.
+- **Incremental run DB + optional FTS** — `build_run_db(run_dir, incremental=True)` (default) now
+  re-ingests only notes whose `st_mtime` changed (mtime/`content_hash`-keyed, mirroring the
+  vault's `build_unified_db` discipline), drops rows for vanished notes, and rebuilds only the
+  derived read-models — byte-for-byte identical to a full rebuild (`incremental=False`). An
+  optional `records_fts` FTS5 table indexes run outputs for full-text search, degrading gracefully
+  when the SQLite build lacks FTS5. Still a derived, gitignored, disposable projection.
+- **ARN binding-integrity assertion (opt-in)** — `Supervisor(arn_resolver=…)` verifies, just
+  before invoke, that a node's compiled ARN is provisioned (not the `<agent-runtime-arn>`
+  placeholder) and — when a resolver is supplied — matches the authoritative ARN; a mismatch
+  fails/records ("re-compile") rather than **silently rebinding** a frozen binding. It is an
+  integrity *assertion*, never a runtime rebind and never a dispatch-time agent chooser.
+- **Deploy governance (opt-in)** — `provision_plan(halt_on_error=…)` always returns partial
+  results with a `failed` verb so one bad node no longer discards an in-progress deploy; a new
+  `trust.py` (`TrustGrade`, pure `evaluate_deploy_gate`) + three declarative `AgentManifest` fields
+  (`trust_seed` / `side_effecting` / `escalate_boundary`) add a **create-time** live|shadow|hold
+  gate that fires once per deploy (never per-invocation, never earns/updates trust, never selects
+  among agents); and a new `ledger.py` (`DeployLedger`) is a persistence-only, fingerprint-keyed,
+  atomically-written deploy history enabling reuse-by-content across CLI invocations. New
+  `deploy --min-autonomy/--require-approval` CLI flags. All defaults preserve today's deploy path.
 - **Failure-tolerant `Supervisor` (opt-in)** — `Supervisor(on_error='record', max_attempts=N)`
   turns the static topo executor into a *fault-tolerant* one **without making it dynamic**: a
   failed node is recorded (`status='failed'`) and the run continues, transitively-blocked

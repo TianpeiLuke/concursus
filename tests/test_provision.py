@@ -366,3 +366,237 @@ def test_provision_plan_runs_every_node_in_order(tmp_path):
     assert [r["node"] for r in results] == ["ingest", "summarize"]
     assert all(r["action"] == "created" for r in results)
     assert len(clients.control.calls) == 2
+
+
+# -- AI-12: decision-style partial results (halt_on_error) ------------------
+def _linear_plan(names):
+    """A linear DAG (n0 -> n1 -> ... ) of container agents; returns the assembled plan."""
+    from concursus.assemble import OrchestrationAssembler
+    from concursus.dag import AgentDAG
+
+    manifests = {}
+    dag = AgentDAG()
+    for i, name in enumerate(names):
+        reg = {"container_uri": "x", "protocol": "HTTP", "entry": f"a.{name}:h"}
+        contract = {"outputs": {"out": {"type": "string", "required": True}}}
+        manifests[name] = AgentManifest.from_dict(
+            {"name": name, "registry": reg, "contract": contract}
+        )
+        dag.add_node(name)
+        if i:
+            dag.add_edge(names[i - 1], name)
+    plan = OrchestrationAssembler(account="111", region="us-east-1").assemble(dag, manifests)
+    return plan
+
+
+class FailingControl(FakeControl):
+    """A control plane that raises ProvisionError when a chosen node is created."""
+
+    def __init__(self, fail_node):
+        super().__init__()
+        self.fail_node = fail_node
+
+    def create_agent_runtime(self, **kw):
+        if kw["agentRuntimeName"] == self.fail_node:
+            raise ProvisionError(f"{self.fail_node}: simulated CreateAgentRuntime failure")
+        return super().create_agent_runtime(**kw)
+
+
+def test_provision_plan_halt_on_error_true_stops_but_returns_partial(tmp_path):
+    # 5-node deploy whose 3rd node fails: the 2 already done are reported, the 3rd is 'failed',
+    # and (default fail-fast) nodes 4 + 5 are never attempted.
+    plan = _linear_plan(["n0", "n1", "n2", "n3", "n4"])
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=FailingControl("n2"))
+    run = FakeRun()
+    results = provision_plan(
+        plan, default_source_dir=str(tmp_path), clients=clients, run=run  # halt_on_error default
+    )
+    assert [r["node"] for r in results] == ["n0", "n1", "n2"]
+    assert [r["action"] for r in results] == ["created", "created", "failed"]
+    assert results[0]["arn"] and results[1]["arn"]  # the 2 done carry their ARNs
+    assert "simulated" in results[2]["error"]
+    assert len(clients.control.calls) == 2  # only n0, n1 succeeded; n4/n5 never attempted
+
+
+def test_provision_plan_halt_on_error_false_continues(tmp_path):
+    # With halt_on_error=False the failed node is recorded but the walk continues to the rest.
+    plan = _linear_plan(["n0", "n1", "n2", "n3", "n4"])
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=FailingControl("n2"))
+    run = FakeRun()
+    results = provision_plan(
+        plan,
+        default_source_dir=str(tmp_path),
+        clients=clients,
+        run=run,
+        halt_on_error=False,
+    )
+    assert [r["node"] for r in results] == ["n0", "n1", "n2", "n3", "n4"]
+    assert [r["action"] for r in results] == [
+        "created",
+        "created",
+        "failed",
+        "created",
+        "created",
+    ]
+    assert len(clients.control.calls) == 4  # every node except the failed n2 was created
+
+
+# -- AI-13: create-time trust gate ------------------------------------------
+def _side_effecting_entry(trust_seed, side_effecting=True):
+    from concursus.manifest import AgentManifest as _AM
+
+    m = _AM.from_dict(
+        {
+            "name": "writer",
+            "registry": {
+                "container_uri": "x",
+                "protocol": "HTTP",
+                "entry": "agents.writer:handler",
+            },
+            "contract": {"outputs": {"out": {"type": "string", "required": True}}},
+            "trust_seed": trust_seed,
+            "side_effecting": side_effecting,
+        }
+    )
+    return m, RuntimeBuilderFactory.synthesize(m, account="111", region="us-east-1")
+
+
+def test_provision_agent_escalates_below_min_autonomy(tmp_path):
+    from concursus.trust import TrustGrade
+
+    m, entry = _side_effecting_entry(TrustGrade.L0_SHADOW)
+    clients, run = _fakes()
+    res = provision_agent(
+        entry,
+        clients=clients,
+        source_dir=str(tmp_path),
+        run=run,
+        manifest=m,
+        min_autonomy=TrustGrade.L2_GUARDED,
+    )
+    assert res["action"] == "escalated"
+    assert "min_autonomy" in res["reason"]
+    assert clients.control.calls == []  # nothing created
+    assert run.cmds == []  # nothing built
+
+
+def test_provision_agent_require_approval_holds_side_effecting(tmp_path):
+    from concursus.trust import TrustGrade
+
+    m, entry = _side_effecting_entry(TrustGrade.L3_AUTONOMOUS)
+    clients, run = _fakes()
+    res = provision_agent(
+        entry, clients=clients, source_dir=str(tmp_path), run=run, manifest=m,
+        require_approval=True,
+    )
+    assert res["action"] == "escalated"  # held even at L3 when approval is required
+    assert clients.control.calls == []
+
+
+def test_provision_agent_cleared_grade_deploys_shadow(tmp_path):
+    # Cleared (meets the floor) but only L0 ⇒ deploy to a NON-DEFAULT shadow qualifier.
+    from concursus.trust import TrustGrade
+
+    m, entry = _side_effecting_entry(TrustGrade.L0_SHADOW)
+    clients, run = _fakes()
+    res = provision_agent(
+        entry,
+        clients=clients,
+        source_dir=str(tmp_path),
+        run=run,
+        manifest=m,
+        min_autonomy=TrustGrade.L0_SHADOW,
+    )
+    assert res["action"] == "created"
+    assert res["qualifier"] == "SHADOW" and res["qualifier"] != "DEFAULT"
+    assert len(clients.control.calls) == 1  # it IS created, just on the shadow endpoint
+
+
+def test_provision_agent_high_grade_deploys_live(tmp_path):
+    from concursus.trust import TrustGrade
+
+    m, entry = _side_effecting_entry(TrustGrade.L3_AUTONOMOUS)
+    clients, run = _fakes()
+    res = provision_agent(
+        entry,
+        clients=clients,
+        source_dir=str(tmp_path),
+        run=run,
+        manifest=m,
+        min_autonomy=TrustGrade.L1_CANARY,
+    )
+    assert res["action"] == "created"
+    assert res.get("qualifier", "DEFAULT") == "DEFAULT"  # live, not shadow
+
+
+def test_provision_agent_non_side_effecting_never_gated(tmp_path):
+    from concursus.trust import TrustGrade
+
+    m, entry = _side_effecting_entry(TrustGrade.L0_SHADOW, side_effecting=False)
+    clients, run = _fakes()
+    res = provision_agent(
+        entry,
+        clients=clients,
+        source_dir=str(tmp_path),
+        run=run,
+        manifest=m,
+        min_autonomy=TrustGrade.L3_AUTONOMOUS,  # a hard floor, but the agent is read-only
+    )
+    assert res["action"] == "created"
+    assert res.get("qualifier", "DEFAULT") == "DEFAULT"
+
+
+def test_provision_agent_gate_noop_without_manifest_or_policy(tmp_path):
+    # Default path byte-for-byte unchanged: no manifest ⇒ no gate, plain 'created', no qualifier.
+    clients, run = _fakes()
+    entry = _container_entry()
+    res = provision_agent(entry, clients=clients, source_dir=str(tmp_path), run=run)
+    assert res["action"] == "created"
+    assert "qualifier" not in res and "reason" not in res
+
+
+# -- AI-14: persisted deploy ledger integration -----------------------------
+def test_provision_agent_ledger_reuses_across_instances(tmp_path):
+    from concursus.ledger import DeployLedger
+
+    path = tmp_path / "ledger.json"
+    entry = _container_entry()
+
+    # First invocation: fresh ledger, real create + a recorded row.
+    clients1, run1 = _fakes()
+    led1 = DeployLedger(path)
+    res1 = provision_agent(
+        entry,
+        clients=clients1,
+        source_dir=str(tmp_path),
+        run=run1,
+        ledger=led1,
+        now="2026-07-10T00:00:00Z",
+    )
+    assert res1["action"] == "created"
+    assert len(clients1.control.calls) == 1
+
+    # Second invocation: a *separate* ledger instance over the same file ⇒ reuse, no create.
+    clients2, run2 = _fakes()
+    led2 = DeployLedger(path)
+    res2 = provision_agent(
+        entry,
+        clients=clients2,
+        source_dir=str(tmp_path),
+        run=run2,
+        ledger=led2,
+        now="2026-07-10T00:01:00Z",
+    )
+    assert res2["action"] == "reused"
+    assert res2["arn"] == res1["arn"]  # the recorded ARN is echoed back
+    assert clients2.control.calls == []  # nothing re-created
+    assert run2.cmds == []  # nothing rebuilt
+
+
+def test_provision_agent_ledger_defaults_off(tmp_path):
+    # No ledger ⇒ today's behavior, and no file is written.
+    clients, run = _fakes()
+    entry = _container_entry()
+    res = provision_agent(entry, clients=clients, source_dir=str(tmp_path), run=run)
+    assert res["action"] == "created"
+    assert not (tmp_path / "ledger.json").exists()

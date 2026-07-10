@@ -121,6 +121,7 @@ class Supervisor:
         state_store: Optional[StateStore] = None,
         on_error: str = "raise",
         max_attempts: int = 1,
+        arn_resolver: Optional[Callable[[str, "AgentManifest"], str]] = None,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
@@ -135,6 +136,10 @@ class Supervisor:
         # DEFAULTS ('raise', 1) preserve today's byte-for-byte fail-fast single forward pass.
         self._on_error = on_error
         self._max_attempts = max_attempts
+        # AI-10: OPT-IN dispatch-time ARN integrity assertion. None (default) preserves today's
+        # behavior byte-for-byte. When supplied, it fetches the AUTHORITATIVE ARN so we can ASSERT
+        # the compiled binding is still current — it NEVER re-binds the invoke to a re-fetched ARN.
+        self._arn_resolver = arn_resolver
 
         supplied = dict(arns or {})
         self._arns: Dict[str, str] = {}
@@ -238,6 +243,27 @@ class Supervisor:
         consumes = [f"{r.producer}:{r.path}" for r in wiring]
         schema = manifest.name if manifest else None
 
+        # AI-10: dispatch-time ARN binding-INTEGRITY assertion, evaluated ONCE just before invoke.
+        # This verifies the SINGLE compiled ARN is real and current; it is NEVER a runtime rebind
+        # (a mismatch fails/records — it does not silently swap in the re-fetched value) and NEVER
+        # a match-by-trust selection among candidate agents.
+        integrity_error = self._check_arn_integrity(node, arn, manifest)
+        if integrity_error is not None:
+            if self._on_error != "record":
+                raise integrity_error  # fail-fast: default path raises a clear binding error
+            self._store.put(
+                node,
+                {"error": str(integrity_error), "error_type": type(integrity_error).__name__},
+                meta={
+                    "status": "failed",
+                    "producer": node,
+                    "consumes": consumes,
+                    "schema": schema,
+                    "address": node,
+                },
+            )
+            return
+
         # Local attempt counter: Record.attempt only auto-increments INSIDE store.put(), which
         # runs after a successful invoke — so we track retries ourselves rather than reading it.
         attempt = 0
@@ -270,6 +296,35 @@ class Supervisor:
                 meta={"producer": node, "consumes": consumes, "schema": schema},
             )
             return
+
+    def _check_arn_integrity(
+        self, node: str, arn: str, manifest: Optional["AgentManifest"]
+    ) -> Optional[Exception]:
+        """Return an ``Exception`` if ``node``'s compiled ARN fails the AI-10 integrity check.
+
+        Two independent checks, both purely a verification of the SINGLE compiled binding:
+
+        (a) *unprovisioned* — the compiled ARN is still :data:`_ARN_PLACEHOLDER`, so there is no
+            live runtime to invoke; the plan must be re-compiled after the runtime is deployed.
+        (b) *stale* — if an ``arn_resolver`` was supplied, fetch the AUTHORITATIVE ARN and ASSERT
+            it equals the compiled ``self._arns[node]``. On mismatch this returns an error rather
+            than SILENTLY substituting the re-fetched value: a frozen binding is never rebound
+            in-run; a change forces a re-compile.
+
+        Returns ``None`` when the binding is intact (invoke proceeds normally).
+        """
+        if arn == _ARN_PLACEHOLDER:
+            return RuntimeError(
+                f"node {node} has no provisioned runtime ARN — deploy first"
+            )
+        if self._arn_resolver is not None:
+            authoritative = self._arn_resolver(node, manifest)
+            if authoritative != arn:
+                return RuntimeError(
+                    f"compiled ARN for {node} is stale; re-compile "
+                    f"(compiled {arn!r} != authoritative {authoritative!r})"
+                )
+        return None
 
     # -- graph-aware context (v2) -------------------------------------------
     def context(self, node: str) -> Dict[str, dict]:

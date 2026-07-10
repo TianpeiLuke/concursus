@@ -1,6 +1,8 @@
 """Tests for the RunIndex — metadata query + Folgezettel-tree traversal over the log."""
 
-from concursus.runindex import RunIndex, address_of
+import pytest
+
+from concursus.runindex import RunIndex, RunIndexError, address_of
 from concursus.statestore import InProcessStateStore, Record
 
 
@@ -119,3 +121,43 @@ def test_traverse_neighbourhood_and_record_at():
     assert t["descendants"] == ["a/r2/r3"]
     assert idx.record_at("a/r2").attempt == 2
     assert idx.record_at("map").node == "map"
+
+
+# -- structural layout guard (AI-7) -----------------------------------------
+def test_validate_passes_on_well_formed_run():
+    # every non-root address's parent is a real record; every root names a known node.
+    idx = _tree_index()
+    assert idx.validate() is idx  # returns self for chaining
+    # attempts per node are contiguous 1..N here, so the optional check also passes.
+    idx2 = RunIndex.from_records(
+        [_rec("a", address="a"), _rec("a", address="a/r2", attempt=2)]
+    )
+    assert idx2.validate(check_attempts=True) is idx2
+
+
+def test_validate_raises_on_synthesized_orphan_address():
+    # 'map/0' is a fan-out sub-address, but 'map' itself never executed (no record at 'map') —
+    # __init__ back-fills the bare 'map' prefix for traversal, so this is an orphan.
+    idx = RunIndex.from_records([_rec("map", address="map/0")])
+    with pytest.raises(RunIndexError, match="orphaned address 'map/0'"):
+        idx.validate()
+
+
+def test_validate_raises_on_unknown_root_segment():
+    # a record addressed under a root that is not a known node id.
+    rec = _rec("realnode", address="realnode")
+    ghost = _rec("realnode", address="ghostroot/child")  # rooted at unknown 'ghostroot'
+    idx = RunIndex.from_records([rec, ghost])
+    with pytest.raises(RunIndexError, match="not a known node"):
+        idx.validate()
+
+
+def test_validate_check_attempts_flags_non_contiguous_attempts():
+    # node 'a' jumps 1 -> 3, skipping attempt 2 (a missing retry record).
+    idx = RunIndex.from_records(
+        [_rec("a", address="a", attempt=1), _rec("a", address="a/r3", attempt=3)]
+    )
+    # default validate() passes (the tree is honest); only check_attempts flags the gap.
+    idx.validate()
+    with pytest.raises(RunIndexError, match="non-contiguous attempts"):
+        idx.validate(check_attempts=True)

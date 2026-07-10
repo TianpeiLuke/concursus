@@ -22,11 +22,15 @@ import os
 import shutil
 import tempfile
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+
+from .trust import HOLD, SHADOW, TrustGrade, evaluate_deploy_gate
 
 if TYPE_CHECKING:  # pragma: no cover - hints only
     from .assemble import ProvisioningPlan
     from .build import BuildPlanEntry
+    from .ledger import DeployLedger
+    from .manifest import AgentManifest
 
 # Placeholders the build plan carries until deploy fills them (must match build.py).
 _IMAGE_PLACEHOLDER = "<image-uri>"
@@ -191,6 +195,11 @@ def provision_agent(
     tag: str = "latest",
     run: Optional[RunFn] = None,
     known_fingerprints: Optional[Dict[str, str]] = None,
+    manifest: Optional["AgentManifest"] = None,
+    min_autonomy: Optional[TrustGrade] = None,
+    require_approval: bool = False,
+    ledger: Optional["DeployLedger"] = None,
+    now: Optional[Union[str, int, float]] = None,
 ) -> Dict[str, Any]:
     """Provision one agent; return ``{"node", "arn", "action", "role_arn", "image_uri"}``.
 
@@ -205,6 +214,21 @@ def provision_agent(
     re-created); a node whose fingerprint changed is re-provisioned and reported
     ``action="updated"``. The fingerprint covers only *hosting* identity (see
     :func:`concursus.build.fingerprint`); it is dedup metadata, never a dispatch-time selector.
+
+    Persisted reuse-by-content (opt-in, AI-14): pass a :class:`~concursus.ledger.DeployLedger`.
+    A row already recorded for this ``(name, fingerprint)`` is a no-op ``action="reused"`` (build
+    + create are skipped) **across separate CLI invocations**; a fresh create is appended to the
+    ledger afterward. ``now`` supplies the recorded ``deployed_at`` (caller-injected; falls back
+    to a call-time UTC timestamp — never a module-import clock read).
+
+    Create-time trust gate (opt-in, AI-13): pass the node's ``manifest`` plus a caller policy
+    (``min_autonomy`` and/or ``require_approval``). The gate fires **exactly once**, right before
+    ``CreateAgentRuntime``, for the author-declared node: a *side-effecting* manifest whose
+    ``trust_seed`` is below ``min_autonomy`` (or when ``require_approval`` is set) is **held** —
+    returned as ``action="escalated"`` with a ``reason`` and **no** create; a cleared-but-not-live
+    grade is deployed to a **non-default (shadow) qualifier** instead of ``DEFAULT``. It is never a
+    per-invocation check, never re-earns trust from an outcome, and never picks among agents.
+    With no manifest/policy the gate is a no-op and today's deploy is byte-for-byte unchanged.
     """
     run = run or _default_run
     req = copy.deepcopy(entry.create_agent_runtime)
@@ -214,12 +238,40 @@ def provision_agent(
         result.update(arn=req["agentRuntimeArn"], action="reused")
         return result
 
-    # 0) Reuse-by-content (opt-in) — a matching recorded fingerprint is a no-op.
+    # 0a) Persisted reuse-by-content (opt-in) — a ledger row for this exact content is a no-op.
+    if ledger is not None and entry.fingerprint:
+        prior = ledger.lookup(entry.name, entry.fingerprint)
+        if prior is not None:
+            result.update(
+                arn=prior.arn,
+                action="reused",
+                role_arn=prior.role_arn,
+                image_uri=prior.image_uri,
+            )
+            return result
+
+    # 0b) In-memory reuse-by-content (opt-in) — a matching recorded fingerprint is a no-op.
     prior_fp = (known_fingerprints or {}).get(entry.name)
     if prior_fp is not None and entry.fingerprint and prior_fp == entry.fingerprint:
         result.update(arn=None, action="reused")
         return result
     changed = prior_fp is not None and entry.fingerprint and prior_fp != entry.fingerprint
+
+    # 0c) Create-time trust gate (opt-in) — decide live | shadow | hold ONCE for this node.
+    qualifier = "DEFAULT"
+    if manifest is not None:
+        decision = evaluate_deploy_gate(
+            side_effecting=getattr(manifest, "side_effecting", False),
+            trust_seed=getattr(manifest, "trust_seed", TrustGrade.L0_SHADOW),
+            min_autonomy=min_autonomy,
+            require_approval=require_approval,
+        )
+        if decision.mode == HOLD:  # held for approval — nothing is created
+            result.update(arn=None, action="escalated", reason=decision.reason)
+            return result
+        if decision.mode == SHADOW:  # cleared but not live — deploy to the shadow endpoint
+            qualifier = decision.qualifier or "SHADOW"
+            result.update(qualifier=qualifier, reason=decision.reason)
 
     # 1) IAM execution role — the plan carries a role doc only when no role_arn was supplied.
     if entry.execution_role is not None:
@@ -243,13 +295,38 @@ def provision_agent(
             req["agentRuntimeArtifact"]["containerConfiguration"]["containerUri"] = image_uri
             result["image_uri"] = image_uri
 
-    # 3) Register the runtime.
+    # 3) Register the runtime. (A SHADOW decision surfaces its non-DEFAULT qualifier in the
+    #    result; the create request itself stays a clean CreateAgentRuntime — the shadow
+    #    endpoint is a separate, downstream concern, not an unknown param smuggled into boto3.)
     created = clients.control.create_agent_runtime(**req)
     result.update(
         arn=created.get("agentRuntimeArn"),
         action="updated" if changed else "created",
     )
+
+    # 4) Persisted reuse-by-content (opt-in) — append this outcome to the ledger for audit +
+    #    cross-invocation dedup. ``deployed_at`` is caller-injected (``now``), never a clock read
+    #    at import; fall back to a call-time UTC timestamp only if the caller supplied none.
+    if ledger is not None and entry.fingerprint:
+        stamp = now if now is not None else _utc_now_iso()
+        ledger.record(
+            name=entry.name,
+            fingerprint=entry.fingerprint,
+            deployed_at=stamp,
+            arn=result.get("arn"),
+            image_uri=result.get("image_uri"),
+            role_arn=result.get("role_arn"),
+            action=result.get("action"),
+        )
     return result
+
+
+def _utc_now_iso() -> str:
+    """A call-time UTC ISO-8601 timestamp (invoked only when a ledger write needs one — never
+    at import, so the module has no import-time clock dependency)."""
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def provision_plan(
@@ -262,6 +339,12 @@ def provision_plan(
     clients: Optional[Clients] = None,
     run: Optional[RunFn] = None,
     known_fingerprints: Optional[Dict[str, str]] = None,
+    halt_on_error: bool = True,
+    manifests: Optional[Dict[str, "AgentManifest"]] = None,
+    min_autonomy: Optional[TrustGrade] = None,
+    require_approval: bool = False,
+    ledger: Optional["DeployLedger"] = None,
+    now: Optional[Union[str, int, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Provision every agent in ``plan.order``; return one result dict per node (in order).
 
@@ -270,21 +353,44 @@ def provision_plan(
     back to ``default_source_dir``). ``known_fingerprints`` (opt-in) maps a node to the hosting
     fingerprint already deployed for it — enabling reuse-by-content (see :func:`provision_agent`);
     omit it to keep today's unconditional ``created`` behavior.
+
+    Decision-style partial results (AI-12): each :func:`provision_agent` call is guarded. On a
+    :class:`ProvisionError` a ``{"node", "action": "failed", "error"}`` result is recorded and —
+    when ``halt_on_error`` is ``True`` (the default, preserving today's fail-fast deploy) — the
+    walk stops. With ``halt_on_error=False`` the walk continues to the remaining nodes. **Either
+    way the accumulated results are returned**, so a 5-node deploy whose 3rd node fails still
+    reports the 2 already-provisioned nodes (with their ARNs) plus the 1 failed node.
+
+    ``manifests`` (opt-in, AI-13) supplies each node's :class:`~concursus.manifest.AgentManifest`
+    so the create-time trust gate can fire; ``min_autonomy``/``require_approval`` are the caller
+    policy. ``ledger`` (opt-in, AI-14) enables persisted reuse-by-content across invocations, and
+    ``now`` injects its ``deployed_at`` timestamp. All default to no-ops.
     """
     clients = clients or Clients.default(region)
     run = run or _default_run
     source_dirs = source_dirs or {}
+    manifests = manifests or {}
     results: List[Dict[str, Any]] = []
     for node in plan.order:
         entry = plan.entries[node]
-        results.append(
-            provision_agent(
-                entry,
-                clients=clients,
-                source_dir=source_dirs.get(node, default_source_dir),
-                tag=tag,
-                run=run,
-                known_fingerprints=known_fingerprints,
+        try:
+            results.append(
+                provision_agent(
+                    entry,
+                    clients=clients,
+                    source_dir=source_dirs.get(node, default_source_dir),
+                    tag=tag,
+                    run=run,
+                    known_fingerprints=known_fingerprints,
+                    manifest=manifests.get(node),
+                    min_autonomy=min_autonomy,
+                    require_approval=require_approval,
+                    ledger=ledger,
+                    now=now,
+                )
             )
-        )
+        except ProvisionError as exc:
+            results.append({"node": node, "action": "failed", "error": str(exc)})
+            if halt_on_error:
+                break
     return results

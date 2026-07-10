@@ -320,6 +320,59 @@ def test_memory_latest_validated_selection_across_attempts():
     assert store.completed() == {"summarize"}
 
 
+def test_memory_replay_ordering_is_deterministic_and_matches_inprocess():
+    """AI-6: after AI-1-style concurrent-attempt writes, MemoryStateStore replay resolves the
+    latest record by the store-local strict-monotonic ``seq`` (log order), NOT the ambiguous
+    AgentCore eventTimestamp — so it is deterministic across replays and last-write-wins like
+    the InProcessStateStore.
+
+    The two seeded events tie on node+attempt (competing fan-out/branch writes) but their
+    eventTimestamps are INVERTED relative to log order: the last-logged event carries the
+    SMALLER timestamp. Timestamp-only ordering would pick the first-logged event (and could flip
+    if the backend's wall-clock ordering ever disagreed with log order); seq pins it to the
+    last-logged event on every replay.
+    """
+    prior = [
+        _seed_event("map", {"r": "A"}, 1, ts=100),  # logged first, LATER wall-clock
+        _seed_event("map", {"r": "B"}, 1, ts=50),  # logged last, EARLIER wall-clock
+    ]
+
+    # Two independent fresh stores replaying the SAME log agree (determinism).
+    r1 = _store(FakeMemoryClient(events=list(prior)))
+    r1.replay()
+    r2 = _store(FakeMemoryClient(events=list(prior)))
+    r2.replay()
+    assert r1.get("map") == r2.get("map")
+
+    # The winner is the LAST-logged event (seq order), not the higher-timestamp one.
+    assert r1.get("map") == {"r": "B"}
+
+    # replay assigns a strict-monotonic seq in log order.
+    assert [r.seq for r in r1.records()] == [1, 2]
+
+    # ... and this matches InProcessStateStore's last-write-wins (its monotonic clock == seq).
+    ip = InProcessStateStore()
+    ip.put("map", {"r": "A"})
+    ip.put("map", {"r": "B"})
+    assert ip.get("map") == r1.get("map") == {"r": "B"}
+    assert ip.completed() == r1.completed() == {"map"}
+
+
+def test_memory_put_assigns_strict_monotonic_seq_independent_of_event_timestamp():
+    """put assigns a local seq (mirrors InProcessStateStore._clock) used for tie-breaking; the
+    eventTimestamp stays for display only."""
+    client = FakeMemoryClient()
+    store = _store(client)
+    store.put("a", {"v": 1})
+    store.put("a", {"v": 2}, meta={"status": "failed"})
+    store.put("b", {"v": 3})
+    seqs = [r.seq for r in store.records()]
+    assert seqs == [1, 2, 3]  # strictly monotonic across nodes, in put order
+    # a failed latest is not complete; get returns the last validated (attempt-based).
+    assert "a" not in store.completed()
+    assert store.get("a") == {"v": 1}
+
+
 def test_memory_replay_paginates_next_token():
     """replay() follows nextToken across pages."""
 

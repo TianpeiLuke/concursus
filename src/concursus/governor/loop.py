@@ -53,6 +53,7 @@ from concursus.assemble.assemble import (
     ProvisioningPlan,
 )
 from concursus.assemble.planner import PlanModelFn, plan_from_goal
+from concursus.core.dag import AgentDAG
 from concursus.core.manifest import AgentManifest
 from concursus.execute.supervisor import InvokeFn, Supervisor
 from concursus.governor.state import GovernorState
@@ -681,7 +682,46 @@ class GovernorLoop:
             kwargs["depth_cap"] = self._deliberate_depth_cap
         if self._deliberate_confidence_floor is not None:
             kwargs["confidence_floor"] = self._deliberate_confidence_floor
-        return form_plan(trail, self._goal, **kwargs)
+        return self._reconcile_dag_with_manifests(form_plan(trail, self._goal, **kwargs))
+
+    def _reconcile_dag_with_manifests(self, dag):
+        """Ensure the authored DAG carries the manifests' ground-truth agent topology (INV-safe).
+
+        The deliberation tier (``form_plan``) decides the *approach* and, with the default no-LLM
+        stub, converges to a GOAL-shaped DAG (one advisory ``approach_*`` node) that does NOT name
+        the registered agents or their ``depends_on`` edges. The manifests are the ground truth:
+        :meth:`~concursus.assemble.OrchestrationAssembler.assemble` type-gates every manifest edge
+        via :func:`~concursus.core.resolve.check_alignment`, which REQUIRES the DAG to carry each
+        declared ``producer -> consumer`` edge — so an un-reconciled deliberated DAG raises
+        ``AlignmentError`` the moment any manifest declares a dependency.
+
+        This fold makes the deliberated plan assemblable WITHOUT weakening the freeze contract, and
+        WITHOUT leaving un-provisionable nodes: :meth:`~concursus.assemble.OrchestrationAssembler.assemble`
+        also requires EVERY DAG node to have a manifest (``AssemblyError`` otherwise), so a
+        deliberation-only advisory node (e.g. the default stub's ``approach_*`` root) cannot remain.
+        The manifests are authoritative: this rebuilds the DAG as EXACTLY the manifest topology —
+        every manifest node + its ``depends_on`` edges — and DROPS any deliberated node that maps to
+        no manifest (it was advisory approach context, never an executable agent). When the
+        deliberated DAG already decomposed into the real agents (an LLM investigator), the manifest
+        nodes/edges are identical, so this reproduces that same topology.
+
+        Rationale: the deliberation decides the APPROACH (and, once its outputs are captured as
+        precedent, informs later planning), while the manifest set is the ground-truth agent
+        topology the compiler provisions. This runs at the compiler FRONT, strictly before
+        ``assemble`` (INV-2), returns a frozen ``AgentDAG`` (INV-3/INV-4), and never touches
+        ``Supervisor.run`` (INV-1). With no manifests it returns the deliberated DAG unchanged.
+        """
+        if not self._manifests:
+            return dag
+        reconciled = AgentDAG()
+        for node in self._manifests:
+            reconciled.add_node(node)
+        for node, manifest in self._manifests.items():
+            for edge in getattr(manifest, "depends_on", []) or []:
+                producer = str(edge.get("from", "")).partition(".")[0]
+                if producer and producer in self._manifests:
+                    reconciled.add_edge(producer, node)
+        return reconciled.validate()
 
     # ================================================= node functions
     def _planner(self, ctx: dict) -> dict:

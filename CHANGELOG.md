@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`deliberate.seed()` now REUSES a strong retrieved precedent instead of appending it
+  (prune-and-replace).** When the retriever returns a precedent scoring at/above `reuse_threshold`
+  that carries a decomposition, the goal root is seeded **pre-decomposed** — the prior's steps
+  become confident children that `open_frontier` immediately excludes — so warm plan-formation is
+  **cheaper than cold** (the flywheel actually compounds). Previously `seed()` *appended* the
+  precedent as an extra sibling root, which made a warm start cost *more* than a cold one. The
+  cold / weak-precedent / no-retriever path is byte-for-byte unchanged (a single `Approach:` root
+  at confidence 0.0). Measured over the OPC flywheel eval (5 families × 6 marketplaces): warm-reuse
+  drops from cold's 7.0 investigator calls to **0.0** once a same-family precedent exists (was
+  **+1 vs cold** before the fix) — with the *same* plain investigator, because reuse is now
+  structural at seed time rather than contingent on an exploiting investigator. Closes the one open
+  loop of the OPC gap review (FZ 35e8 / 35e8a).
+
 ### Added
 
 - **Reasoning-substrate tier (Phase 5, opt-in, LLM/LangGraph-free by default)** — the plan is

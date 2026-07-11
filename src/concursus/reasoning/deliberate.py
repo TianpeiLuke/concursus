@@ -59,56 +59,88 @@ _DEFAULT_CONFIDENCE_FLOOR = 0.6
 
 
 # --------------------------------------------------------------------------- AI-28: SEED
+_DEFAULT_REUSE_THRESHOLD = 0.6  # a retrieved precedent at/above this score is reused, not re-derived
+
+
 def seed(
     trail: HypothesisTrail,
     goal: str,
     *,
     retriever: Optional[object] = None,
     limit: int = 3,
+    reuse_threshold: float = _DEFAULT_REUSE_THRESHOLD,
+    confidence_floor: float = _DEFAULT_CONFIDENCE_FLOOR,
 ) -> List[str]:
-    """Seed root hypotheses under ``.3`` from a goal, optionally primed by retrieved precedents.
+    """Seed the ``.3`` root for a goal, REUSING a strong retrieved precedent instead of appending it.
 
-    A NEW plan-formation episode: combines the ``goal`` with candidate approaches drawn from prior
-    resolved runs (via an AI-17 :class:`~concursus.precedent.PrecedentRetriever`, or any object with
-    a compatible ``retrieve`` method; ``None`` => goal only) and calls
-    :meth:`~concursus.trailstore.HypothesisTrail.fanout_root_hypotheses`. Returns the seeded root ids.
+    A NEW plan-formation episode. Two modes, decided by the best retrieved precedent:
 
-    IDENTITY: SEED is triggered by a goal/ticket, NEVER by a user retrieval query — retrieval is
-    only a PRIMING read here (it surfaces candidate decompositions), it does not itself start the
-    write cycle. A caller wanting to *look up* a precedent should call the retriever directly, not
-    ``seed``.
+    * **Reuse (prune-not-append):** when the retriever returns a precedent scoring at/above
+      ``reuse_threshold`` that carries a decomposition (its ``nodes``/``results``), the goal root is
+      seeded **pre-decomposed** — the prior's steps are fanned out as children already **confident**
+      (``confidence_floor``), so :meth:`~concursus.trailstore.HypothesisTrail.open_frontier`
+      immediately excludes them. The debate reuses the prior structure rather than re-deriving it,
+      so warm plan-formation is **cheaper** than a cold one — the compounding the flywheel promises.
+    * **Cold / weak-precedent:** with no retriever, or no precedent clearing the bar, a single
+      ``Approach: <goal>`` root is seeded at confidence ``0.0`` for the investigator to decompose —
+      **byte-for-byte the pre-existing behavior** (a cold start is unchanged).
+
+    This replaces the earlier *append-a-sibling-precedent-root* wiring, which made a warm start cost
+    MORE than a cold one (an extra root to adjudicate, nothing pruned). Returns the seeded root ids.
+
+    IDENTITY: SEED is triggered by a goal/ticket, NEVER by a user retrieval query — the retriever is
+    a PRIMING read only; it does not itself start the write cycle. A caller wanting to *look up* a
+    precedent should call the retriever directly, not ``seed``.
     """
     if not goal or not str(goal).strip():
         raise ValueError("seed requires a non-empty goal (a plan-formation episode needs a target)")
 
-    candidates: List[Candidate] = [{"text": f"Approach: {goal}", "confidence": 0.0}]
-    if retriever is not None:
-        for rp in _retrieve_candidates(retriever, goal, limit=limit):
-            candidates.append(rp)
-    return trail.fanout_root_hypotheses(goal, candidates)
+    reuse = _best_reusable_precedent(retriever, goal, limit=limit, reuse_threshold=reuse_threshold)
+    if reuse is None:
+        # Cold / weak-precedent: the pre-existing single-approach-root behavior, unchanged.
+        return trail.fanout_root_hypotheses(goal, [{"text": f"Approach: {goal}", "confidence": 0.0}])
+
+    trail_id, steps = reuse
+    # Seed one goal root, then REUSE the prior decomposition as already-confident children so the
+    # frontier is empty for them (no re-investigation) — the prune-and-replace that makes warm<cold.
+    roots = trail.fanout_root_hypotheses(
+        goal, [{"text": f"Reuse precedent {trail_id} for: {goal}", "confidence": 0.0}]
+    )
+    root = roots[0]
+    reuse_conf = max(confidence_floor, _DEFAULT_CONFIDENCE_FLOOR)
+    trail.fanout_hypotheses(
+        root,
+        [{"text": f"Reuse step: {step}", "confidence": reuse_conf} for step in steps],
+    )
+    return roots
 
 
-def _retrieve_candidates(retriever: object, goal: str, *, limit: int) -> List[Candidate]:
-    """Turn retrieved precedents into seed candidates (best-effort; a bad retriever yields none)."""
+def _best_reusable_precedent(
+    retriever: object, goal: str, *, limit: int, reuse_threshold: float
+):
+    """The highest-scoring retrieved precedent that clears ``reuse_threshold`` AND carries a
+    decomposition, as ``(trail_id, [step, ...])`` — or ``None`` (cold start). Best-effort: a missing
+    retriever, a bad ``retrieve``, or a payload without steps all yield ``None``."""
+    if retriever is None:
+        return None
     retrieve = getattr(retriever, "retrieve", None)
     if not callable(retrieve):
-        return []
+        return None
     try:
         hits = retrieve(goal, limit=limit)
     except TypeError:
         hits = retrieve(goal)
-    out: List[Candidate] = []
-    for h in hits or []:
+    for h in hits or []:  # retriever returns hits ranked best-first
+        score = getattr(h, "score", None)
+        if score is not None and score < reuse_threshold:
+            continue
         payload = getattr(h, "payload", None) or {}
+        steps = payload.get("nodes") or list((payload.get("results") or {}).keys())
+        if not steps:
+            continue
         trail_id = getattr(h, "trail_id", None) or payload.get("trail_id") or "precedent"
-        out.append(
-            {
-                "text": f"Precedent {trail_id}: reuse/adapt the prior decomposition",
-                "confidence": 0.0,
-                "precedent": trail_id,
-            }
-        )
-    return out
+        return str(trail_id), [str(s) for s in steps]
+    return None
 
 
 # --------------------------------------------------------------------------- AI-30: LOWER

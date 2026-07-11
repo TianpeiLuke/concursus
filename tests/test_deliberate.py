@@ -37,20 +37,51 @@ def test_seed_requires_a_goal(tmp_path):
         seed(trail, "")
 
 
-def test_seed_with_stub_retriever_adds_precedent_roots(tmp_path):
+class _ReuseRetriever:
+    """A stub retriever whose top hit is a strong precedent carrying a 3-step decomposition."""
+
+    def retrieve(self, text, *, limit=3):
+        class _RP:
+            trail_id = "prior_run_x"
+            score = 1.0
+            payload = {"trail_id": "prior_run_x", "nodes": ["step_a", "step_b", "step_c"]}
+        return [_RP()]
+
+
+class _WeakRetriever:
+    """A stub retriever whose only hit is BELOW the reuse threshold (must be ignored → cold start)."""
+
+    def retrieve(self, text, *, limit=3):
+        class _RP:
+            trail_id = "weak"
+            score = 0.1
+            payload = {"trail_id": "weak", "nodes": ["x"]}
+        return [_RP()]
+
+
+def test_seed_reuses_strong_precedent_decomposition_leaving_frontier_empty(tmp_path):
+    # A strong precedent is REUSED, not appended: one goal root pre-decomposed into confident
+    # children, so the open frontier is empty — no re-investigation (the prune-and-replace fix).
     trail = _trail(tmp_path)
+    roots = seed(trail, "goal", retriever=_ReuseRetriever())
+    assert len(roots) == 1  # ONE goal root (not goal + an extra sibling precedent root)
+    model = trail.hypotheses(roots[0])
+    # the 3 prior steps were fanned out as confident children (>= confidence_floor)
+    children = [h for hid, h in model.items() if h.parent == roots[0]]
+    assert len(children) == 3
+    assert all(c.confidence >= 0.6 for c in children)
+    # reused steps are confident → excluded from the frontier → nothing to re-investigate
+    assert trail.open_frontier(roots[0]) == []
 
-    class _StubRetriever:
-        def retrieve(self, text, *, limit=3):
-            class _RP:
-                trail_id = "prior_run_x"
-                payload = {"trail_id": "prior_run_x"}
-            return [_RP()]
 
-    roots_plain = seed(HypothesisTrail(tmp_path / "a"), "goal")
-    roots_primed = seed(trail, "goal", retriever=_StubRetriever())
-    # priming surfaces an extra candidate root beyond the goal-only seeding.
-    assert len(roots_primed) > len(roots_plain)
+def test_seed_weak_precedent_falls_back_to_cold_start(tmp_path):
+    # A precedent below the reuse threshold is ignored → the byte-for-byte cold-start behavior.
+    trail = _trail(tmp_path)
+    roots_cold = seed(HypothesisTrail(tmp_path / "cold"), "goal")
+    roots_weak = seed(trail, "goal", retriever=_WeakRetriever())
+    assert len(roots_weak) == len(roots_cold) == 1
+    # a cold start's single root is an open frontier of exactly one (the approach to decompose)
+    assert len(trail.open_frontier(roots_weak[0])) == 1
 
 
 # -- AI-30: LOWER -----------------------------------------------------------

@@ -10,21 +10,19 @@ harness spins it and measures it, honestly separating two claims:
     *same-family* prior for a new program-formation goal? This is a pure function of the shipped
     retriever over a growing store — zero assumptions.
 
-  LAYER B (MODELLED, explicit investigator policy): given the retrieval result, does plan-formation
-    cost (investigator invocations, an LLM-call proxy) fall? This depends on the INJECTED
-    investigator's policy — which concursus does NOT itself provide (it is the LLM's job). We run
-    two explicit, self-contained policies to bound the answer:
-      * BLIND   — ignores precedents: every fresh goal is decomposed from scratch; a seeded
-                  precedent root is merely accepted. (Models an investigator that does not reuse.)
-      * EXPLOIT — reuses a *correct* (same-family) retrieved prior: accepts the goal directly from
-                  the prior decomposition instead of re-deriving it.
-    The realism of EXPLOIT is gated by LAYER A: a precedent only helps on goals where retrieval
-    actually surfaced a same-family one.
+  LAYER B (MEASURED, no LLM): given the retrieval result, does plan-formation cost (investigator
+    invocations, an LLM-call proxy) fall — with the SAME plain investigator cold and warm? After
+    the prune-and-replace ``deliberate.seed()`` fix, a strong retrieved precedent seeds the goal
+    root PRE-DECOMPOSED (its prior steps become confident children the frontier excludes), so the
+    investigator is simply never asked about the reused steps. The warm-vs-cold drop is therefore
+    STRUCTURAL (seed prunes the frontier), not a smarter investigator — so both arms run the same
+    ``blind_investigator`` and the difference is entirely the flywheel.
 
-The honest structural finding this makes visible: ``deliberate.seed()`` *appends* retrieved
-precedents as extra root hypotheses rather than pruning the search — so under the BLIND policy a
-warm start costs MORE than a cold one (extra roots, no work removed). Compounding is therefore
-CONTINGENT on an EXPLOIT-style investigator, not automatic from the wiring.
+History: the first run of this harness (see the git history / FZ 35e8a) found that the OLD
+``seed()`` *appended* retrieved precedents as extra root hypotheses rather than pruning the search,
+so a warm start cost MORE than a cold one (+1 call vs cold; only 38.5% cheaper than an ignoring
+investigator). That was the named gap. The fix made reuse STRUCTURAL at seed time; this harness now
+measures the resolved loop — warm should drop BELOW cold once a same-family precedent exists.
 
 Pure stdlib + concursus. Deterministic (no RNG). Writes results JSON next to this file and prints
 a summary table. Run: PYTHONPATH=src python3.11 experiments/opc_flywheel_eval.py
@@ -123,24 +121,6 @@ def blind_investigator(h):
     return {"verdict": "ACCEPT", "evidence": {"reason": "blind: accept leaf/precedent"}}
 
 
-def make_exploit_investigator(has_correct_precedent: bool):
-    """EXPLOIT: reuses a *correct* same-family prior. When retrieval surfaced a same-family
-    precedent (``has_correct_precedent``), the goal root is ACCEPTED directly (reuse the prior
-    decomposition, 1 call) instead of being re-derived; otherwise it falls back to BLIND
-    decomposition. A precedent root is accepted; leaves are accepted."""
-
-    def policy(h):
-        text = h.text or ""
-        if text.startswith("Approach:"):
-            if has_correct_precedent:
-                return {"verdict": "ACCEPT", "evidence": {"reason": "exploit: reuse prior decomposition"}}
-            fam = _family_of_goal(text)
-            return [{"text": s.replace("_", " "), "confidence": 0.0} for s in FAMILIES[fam]["steps"]]
-        return {"verdict": "ACCEPT", "evidence": {"reason": "exploit: accept leaf/precedent"}}
-
-    return policy
-
-
 def _family_of_goal(text: str) -> str:
     up = text.upper()
     for fam in FAMILIES:
@@ -150,12 +130,16 @@ def _family_of_goal(text: str) -> str:
 
 
 # --------------------------------------------------------------------------- one plan-formation
-def form_and_count(vault: Path, goal: str, *, retriever, policy_factory, has_precedent):
-    """Run form_plan for one goal with a counting investigator; return (calls, plan_node_count)."""
+def form_and_count(vault: Path, goal: str, *, retriever, policy_factory, has_precedent=False):
+    """Run form_plan for one goal with a counting investigator; return (calls, plan_node_count).
+
+    The SAME plain ``blind_investigator`` is used cold and warm: with the prune-and-replace seed()
+    fix, a strong retrieved precedent seeds the goal pre-decomposed (confident children excluded
+    from the frontier), so the investigator is simply never asked about the reused steps — the
+    warm-vs-cold drop is structural, not a smarter investigator."""
     run_dir = Path(tempfile.mkdtemp(prefix="fp_", dir=vault))
     trail = HypothesisTrail(run_dir)
-    policy = policy_factory(has_precedent) if policy_factory is make_exploit_investigator else policy_factory
-    inv, box = _counting(policy)
+    inv, box = _counting(policy_factory)
     dag = form_plan(trail, goal, retriever=retriever, investigator=inv, max_rounds=6, depth_cap=4)
     shutil.rmtree(run_dir, ignore_errors=True)
     return box["n"], len(dag.nodes)
@@ -181,14 +165,14 @@ def run():
             top3_same = family in top3_families
             corpus_size = len(hits) and _corpus_size(vault)
 
-            # -- LAYER B (modelled): plan-formation cost cold vs warm-blind vs warm-exploit --------
+            # -- LAYER B (measured): plan-formation cost, cold vs warm, SAME plain investigator ----
+            # After the prune-and-replace seed() fix, reuse is STRUCTURAL — a strong precedent seeds
+            # the goal pre-decomposed, so warm needs no special investigator. warm_reuse uses the
+            # SAME blind investigator as cold; the drop is entirely from seed() pruning the frontier.
             cold_calls, cold_nodes = form_and_count(
                 vault, goal, retriever=None, policy_factory=blind_investigator, has_precedent=False)
-            warm_blind_calls, wb_nodes = form_and_count(
+            warm_reuse_calls, wr_nodes = form_and_count(
                 vault, goal, retriever=retriever, policy_factory=blind_investigator, has_precedent=False)
-            warm_exploit_calls, we_nodes = form_and_count(
-                vault, goal, retriever=retriever, policy_factory=make_exploit_investigator,
-                has_precedent=top1_same)  # exploit only helps when retrieval was CORRECT
 
             per_goal.append({
                 "round": r, "family": family, "mkt": mkt,
@@ -197,9 +181,8 @@ def run():
                 "retrieval_top1_same_family": top1_same,
                 "retrieval_top3_same_family": top3_same,
                 "cold_calls": cold_calls,
-                "warm_blind_calls": warm_blind_calls,
-                "warm_exploit_calls": warm_exploit_calls,
-                "cold_nodes": cold_nodes, "exploit_nodes": we_nodes,
+                "warm_reuse_calls": warm_reuse_calls,
+                "cold_nodes": cold_nodes, "warm_nodes": wr_nodes,
             })
 
             # -- grow the corpus: distill THIS goal's finished run into the precedent store --------
@@ -240,24 +223,24 @@ def _summarize(rows):
             "retrieval_top1_hit_rate": round(sum(x["retrieval_top1_same_family"] for x in rs) / n, 3),
             "retrieval_top3_hit_rate": round(sum(x["retrieval_top3_same_family"] for x in rs) / n, 3),
             "mean_cold_calls": round(sum(x["cold_calls"] for x in rs) / n, 2),
-            "mean_warm_blind_calls": round(sum(x["warm_blind_calls"] for x in rs) / n, 2),
-            "mean_warm_exploit_calls": round(sum(x["warm_exploit_calls"] for x in rs) / n, 2),
+            "mean_warm_reuse_calls": round(sum(x["warm_reuse_calls"] for x in rs) / n, 2),
         })
     return out
 
 
 def _print(summary, dest):
-    print("\n=== OPC FLYWHEEL EVALUATION ===\n")
+    print("\n=== OPC FLYWHEEL EVALUATION (post prune-and-replace seed fix) ===\n")
     print("LAYER A (measured) — retrieval hit-rate vs corpus growth:")
     print(f"{'round':>5} {'priors':>7} {'top1_hit':>9} {'top3_hit':>9}")
     for s in summary:
         print(f"{s['round']:>5} {s['same_family_priors']:>7} "
               f"{s['retrieval_top1_hit_rate']:>9} {s['retrieval_top3_hit_rate']:>9}")
-    print("\nLAYER B (modelled) — plan-formation cost (investigator calls; LLM-call proxy):")
-    print(f"{'round':>5} {'cold':>6} {'warm_blind':>11} {'warm_exploit':>13}")
+    print("\nLAYER B (measured) — plan-formation cost, SAME plain investigator (LLM-call proxy):")
+    print(f"{'round':>5} {'cold':>6} {'warm_reuse':>11} {'delta':>8}")
     for s in summary:
+        delta = round(s['mean_warm_reuse_calls'] - s['mean_cold_calls'], 2)
         print(f"{s['round']:>5} {s['mean_cold_calls']:>6} "
-              f"{s['mean_warm_blind_calls']:>11} {s['mean_warm_exploit_calls']:>13}")
+              f"{s['mean_warm_reuse_calls']:>11} {delta:>+8}")
     print(f"\nresults -> {dest}\n")
 
 

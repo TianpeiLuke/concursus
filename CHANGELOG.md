@@ -96,6 +96,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     read-only projection over the per-run precedent notes loaded via `load_precedents`; it calls no
     `assemble()`/`recompile()`/`Supervisor.run()`/`StateStore.put()`, drives no dispatch, and
     regenerates byte-identically from the notes each call (INV-5).
+- **Phase-5 integration — the governor loop is now WIRED to the shipped governance machinery
+  (opt-in, default path byte-for-byte unchanged).** The previous bullet added `GovernorLoop`,
+  `TrustLadderScheduler`, `DirectorCockpit`, and `scope` as modules; this wires them into the fixed
+  `planner -> router -> run_episode -> collect` cycle behind opt-in seams, so the zero-config loop
+  (no `scheduler=`, `deliberate=False`) stays exactly today's behavior and all 357 pre-existing
+  tests are unchanged.
+  - **I-0 pre-freeze deliberation in `planner` (`deliberate=True`)** — round-1 DAG authoring can now
+    run the bounded `reasoning.deliberate.form_plan` SEED -> read-frontier -> dispatch -> digest ->
+    verdict -> re-read loop, which ADJUSTS the plan and only lowers to a frozen `AgentDAG` AFTER the
+    debate converges (SIGNOFF), then hands it to `assemble` exactly as before. Dynamic but STRICTLY
+    before `assemble` and terminating in a frozen DAG (INV-1..INV-4); later rounds still use
+    `recompile`. Default `deliberate=False` is byte-for-byte the single-shot `plan_from_goal` path.
+    Injected seams (`trail_factory` / `investigator` / `deliberate_retriever`) default to
+    deterministic stubs, so it runs with neither langgraph nor any LLM. Resume re-authors from a
+    FRESH empty `HypothesisTrail` so node ids reproduce round-1's exactly (no `MonotonicityError`).
+  - **I-1 `router` gates the frontier by EARNED trust (`scheduler=`)** — when a `TrustLadderScheduler`
+    is injected, `router` calls `propose_frontier(plan, completed=store.completed())` each round and
+    partitions the still-open frontier into cleared (`DISPATCH`) vs HELD (`ESCALATE` below-bar /
+    `UNMATCHED` no standing agent). Held nodes are handed to the Supervisor's new opt-in `held` skip
+    param — a pure NON-DISPATCH (never invoked, nothing written to the log, no failed record / no
+    spurious replan) — so the frozen `plan.order` is NEVER mutated (INV-3; holding by non-dispatch,
+    not by shrinking the plan, so `recompile` never raises `MonotonicityError`). Held nodes stay in
+    the open frontier for a later round once their trust is re-earned, and are surfaced on the new
+    `GovernorResult.escalated` / `unmatched` governance surfaces the cockpit exception queue can read.
+  - **I-2 `collect` re-earns trust GOV-side** — with a scheduler wired, every node that FIRST
+    completes a round re-earns its earned grade via `TrustLadderScheduler.update_trust`, keyed on the
+    episode outcome. This is the ONLY place earned trust moves across episodes; it lives in `collect`,
+    NEVER in the compiler, and never calls the create-time `evaluate_deploy_gate` per invocation
+    (INV-5). Re-earn is keyed by the matched AGENT NAME (resolved from the round's `FrontierProposal`
+    decisions), not the task label, and each node re-earns exactly ONCE — the round it finishes
+    (anchored on the prior round's completed set, so resume never re-earns a surviving prefix).
+  - **I-3 read-only live cockpit / scope over the running loop** — `GovernorLoop.cockpit()`,
+    `.programs_index(vault)`, and `.leverage_view(vault)` expose the shipped `DirectorCockpit` and
+    `scope` projections over the loop's OWN append-only log and final frozen plan VALUE. Pure read
+    surfaces (INV-5): they build a `Supervisor` only to call its shipped read models, never call
+    `run`, never assemble/recompile, never dispatch, and never `put` — rendering leaves the store
+    byte-identical.
 - **C-3 core seams (identity-preserving, wiring shipped machinery into the dispatch path)** —
   - **C-3a `Supervisor` pre-dispatch structural gate** — the constructor now projects the frozen
     plan (`plan.order` nodes + `plan.wiring` `AgentRef` edges) into a `RunGraph` and runs the

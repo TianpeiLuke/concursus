@@ -43,6 +43,7 @@ langgraph NOR any LLM installed.
 from __future__ import annotations
 
 import json
+import types
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
@@ -71,6 +72,17 @@ _END = "__end__"
 
 # The supervisor-construction seam: build a runnable episode supervisor over one frozen plan.
 SupervisorFactory = Callable[..., object]
+
+# The trail_id scope-address separator (mirrors ``concursus.governor.scope.SCOPE_SEP``); duplicated
+# as a literal so the read-only cockpit accessors need no module-top scope/filevault import.
+SCOPE_SEP = "."
+
+# An empty duck-typed plan for :meth:`GovernorLoop.cockpit` BEFORE the first run: a Supervisor needs
+# a plan exposing ``order`` + ``wiring`` for its one-time structural gate, and ``summary`` reads
+# ``order``. Never dispatched (the cockpit never calls ``run``), so an empty order is inert. Its
+# ``revision`` is unused because the cockpit is built with ``plan=self._last_plan`` (``None`` pre-run,
+# so DirectorCockpit reports ``revision=None``).
+_EMPTY_PLAN = types.SimpleNamespace(order=[], wiring={}, revision=None)
 
 
 class CheckpointStore(Protocol):
@@ -134,6 +146,13 @@ class GovernorResult:
         trace: The ordered node-visit trace.
         supervisor_runs: How many times a Supervisor was run (one per round; INV-1).
         backend: ``"langgraph"`` or ``"python"``.
+        escalated: Sorted list of node ids the OPT-IN Trust-Ladder scheduler HELD (escalated
+            below-bar) at any round instead of dispatching — a governance surface the cockpit
+            exception queue can read.  Always empty on the default (no-scheduler) path (INV: opt-in).
+        unmatched: Sorted list of node ids the scheduler HELD because NO standing agent matched them
+            (unmatched, distinct from below-bar escalation).  An unmatched node blocks the frontier
+            forever, so surfacing it separately lets the cockpit explain a no_progress stall that
+            ``escalated`` alone would not.  Always empty on the default (no-scheduler) path.
     """
 
     rounds: int
@@ -146,20 +165,41 @@ class GovernorResult:
     trace: List[str]
     supervisor_runs: int
     backend: str
+    escalated: List[str] = field(default_factory=list)
+    unmatched: List[str] = field(default_factory=list)
 
 
 def _default_supervisor_factory(
-    *, plan, manifests, store, invoke_fn, arns, session_id
+    *, plan, manifests, store, invoke_fn, arns, session_id, held=None
 ) -> Supervisor:
-    """Default seam: a real :class:`Supervisor` bound to the governor's store (offline-friendly)."""
-    return Supervisor(
-        plan,
-        manifests,
+    """Default seam: a real :class:`Supervisor` bound to the governor's store (offline-friendly).
+
+    ``held`` is the OPT-IN Trust-Ladder ROUTER's set of nodes escalated/unmatched THIS round (I-1) —
+    empty/``None`` on the default path, so today's byte-for-byte behavior is preserved (no ``held``
+    kwarg reaches the Supervisor when the set is empty). When a scheduler withholds a node, the
+    held-set is handed to the Supervisor's OPT-IN ``held`` skip param: :meth:`Supervisor.run` skips
+    that node like a resume skip — it is NEVER invoked and NOTHING is written to the log for it (INV-1;
+    a pure non-dispatch, not a failure). The frozen ``plan.order`` is NEVER mutated (INV-3) — the node
+    stays in the plan and in the still-open frontier for a later round once its trust is re-earned.
+    The held node is surfaced on :attr:`GovernorResult.escalated`.
+
+    Holding is NOT done by omitting the node's ARN: the Supervisor re-derives an ARN from the
+    manifest (``registry.agent_runtime_arn``) when the supplied ``arns`` dict lacks one, so stripping
+    ``arns`` would either be a no-op (the manifest-carried ARN dispatches the below-bar node anyway —
+    a silent governance bypass) or, when there is no manifest ARN, trip the placeholder ARN-integrity
+    gate and RAISE under the default ``on_error='raise'`` (crashing the whole episode). The explicit
+    skip param is the only correct non-dispatch that both leaves the plan unmutated and never invokes.
+    """
+    held_set = set(held or ())
+    kwargs: Dict[str, Any] = dict(
         invoke_fn=invoke_fn,
         arns=arns,
         state_store=store,
         session_id=session_id,
     )
+    if held_set:
+        kwargs["held"] = held_set
+    return Supervisor(plan, manifests, **kwargs)
 
 
 class GovernorLoop:
@@ -186,10 +226,18 @@ class GovernorLoop:
         store: Optional[StateStore] = None,
         checkpointer: Optional[CheckpointStore] = None,
         assembler: Optional[OrchestrationAssembler] = None,
+        scheduler: Optional["TrustLadderScheduler"] = None,
         supervisor_factory: Optional[SupervisorFactory] = None,
         invoke_fn: Optional[InvokeFn] = None,
         arns: Optional[Dict[str, str]] = None,
         plan_model_fn: Optional[PlanModelFn] = None,
+        deliberate: bool = False,
+        trail_factory: Optional[Callable[[], Any]] = None,
+        investigator: Optional[Callable[[Any], Any]] = None,
+        deliberate_retriever: Optional[Any] = None,
+        deliberate_max_rounds: Optional[int] = None,
+        deliberate_depth_cap: Optional[int] = None,
+        deliberate_confidence_floor: Optional[float] = None,
         session_id: Optional[str] = None,
         memory_id: Optional[str] = None,
         actor_id: Optional[str] = None,
@@ -223,15 +271,49 @@ class GovernorLoop:
         self._checkpointer = checkpointer
         self._run_id = str(run_id) if run_id else "governor"
         self._assembler = assembler or OrchestrationAssembler()
+        # -- OPT-IN Trust-Ladder ROUTER seam (I-1) --------------------------
+        # When None (default), _router stays BYTE-FOR-BYTE today's pass-through and NO node is ever
+        # held — all 357 existing tests are unchanged. When a scheduler IS provided, _router calls
+        # its propose_frontier each round to partition the still-open frontier into cleared
+        # (compile_next) vs HELD (escalated/unmatched) nodes; held nodes are kept OUT of the episode's
+        # dispatch WITHOUT being removed from the frozen plan (INV-3) — the supervisor is handed the
+        # held-set via its OPT-IN skip param so run() skips those nodes (a pure non-dispatch: never an
+        # invoke, never a log write), rather than by stripping ARNs (which the manifest-ARN fallback
+        # would silently defeat or the placeholder integrity gate would turn into a hard raise). The
+        # plan.order is NEVER mutated (recompile may only ADD, never drop — dropping a planned node
+        # would raise MonotonicityError), so holding is achieved by non-dispatch, not by shrinking the
+        # plan.
+        self._scheduler = scheduler
         self._supervisor_factory = supervisor_factory or _default_supervisor_factory
         self._invoke_fn = invoke_fn
         self._arns = arns
         self._plan_model_fn = plan_model_fn
+        # -- OPT-IN pre-freeze deliberation seam (I-0) ----------------------
+        # When False (default), first-round plan authoring is BYTE-FOR-BYTE today's single-shot
+        # plan_from_goal path (all existing tests unchanged). When True, round-1 authors the DAG via
+        # the bounded SEED -> deliberate/adjust -> converge(SIGNOFF) -> lower_to_dag path
+        # (reasoning.deliberate.form_plan) that only emits a frozen AgentDAG AFTER the debate
+        # converges, then hands it to assemble exactly as before. The adjustment loop is dynamic but
+        # STRICTLY BEFORE assemble and TERMINATES in a frozen DAG (INV-1/INV-2/INV-3/INV-4). Later
+        # rounds STILL use recompile, unchanged.
+        self._deliberate = bool(deliberate)
+        self._trail_factory = trail_factory
+        self._investigator = investigator
+        self._deliberate_retriever = deliberate_retriever
+        self._deliberate_max_rounds = deliberate_max_rounds
+        self._deliberate_depth_cap = deliberate_depth_cap
+        self._deliberate_confidence_floor = deliberate_confidence_floor
         self._max_rounds = max_rounds
         self._no_progress_n = no_progress_n
         self._max_revisions = max_revisions
         self._confidence_threshold = confidence_threshold
         self._backend = backend
+        # -- READ-ONLY cockpit/scope seam (I-3) -----------------------------
+        # The CURRENT run's final frozen plan VALUE, stashed by run() so a caller can build a
+        # DirectorCockpit / read the scope projections over the LIVE run WITHOUT re-assembling or
+        # dispatching anything. None until the first run() completes. This is a pointer to an
+        # already-frozen plan value — never a mutable snapshot (INV-3).
+        self._last_plan: Optional[ProvisioningPlan] = None
 
     # -- durable-store selection (C-2) --------------------------------------
     def _select_store(
@@ -312,6 +394,9 @@ class GovernorLoop:
         else:
             ctx = self._drive_python(ctx)
             backend = "python"
+        # Stash the run's final frozen plan VALUE for the read-only cockpit/scope accessors (I-3).
+        # A pointer to an already-frozen value — never re-assembled, never mutated (INV-3).
+        self._last_plan = ctx.get("plan")
         return GovernorResult(
             rounds=int(ctx["round"]),
             terminated_by=str(ctx["terminated_by"]),
@@ -323,7 +408,67 @@ class GovernorLoop:
             trace=list(ctx["trace"]),
             supervisor_runs=int(ctx["supervisor_runs"]),
             backend=backend,
+            escalated=sorted(ctx.get("escalated") or []),
+            unmatched=sorted(ctx.get("unmatched") or []),
         )
+
+    # -- READ-ONLY cockpit / scope over the LIVE run (I-3) ------------------
+    def cockpit(self, *, vault_path: Optional[str] = None) -> "DirectorCockpit":
+        """Return a read-only :class:`DirectorCockpit` over this loop's CURRENT run.
+
+        Builds a :class:`~concursus.execute.supervisor.Supervisor` bound to the loop's OWN append-only
+        :class:`StateStore` and the run's final frozen plan VALUE, then hands it to the cockpit. This
+        is a PURE read surface (INV-5): it constructs a Supervisor only so the cockpit can call its
+        shipped read models (``summary()`` / ``summary_line()`` / ``index()``) — it NEVER calls
+        :meth:`Supervisor.run`, never assembles or recompiles a plan, never dispatches a node, and
+        never ``put``s to the store. The Supervisor reads the SAME store the loop wrote, so its
+        ``summary().failed`` / completed set are the live run's, and rendering the cockpit leaves
+        ``store.records()`` byte-identical.
+
+        Call after :meth:`run` so the run's frozen plan is available; before the first run the plan is
+        ``None`` and the cockpit's ``revision`` reads ``None`` (still a valid read-only surface over an
+        empty log). ``vault_path`` is optional and, when given, lets the cockpit render the idempotent
+        precedent hub — a select-nothing/seed-nothing projection.
+        """
+        supervisor = Supervisor(
+            self._last_plan if self._last_plan is not None else _EMPTY_PLAN,
+            self._manifests,
+            invoke_fn=self._invoke_fn,
+            arns=self._arns,
+            state_store=self._store,
+            session_id=self._session_id,
+        )
+        # Imported here (not at module top) so importing loop.py never pulls the cockpit projection.
+        from concursus.governor.cockpit import DirectorCockpit
+
+        return DirectorCockpit(
+            supervisor=supervisor, vault_path=vault_path, plan=self._last_plan
+        )
+
+    def programs_index(self, vault_path: str, *, sep: str = SCOPE_SEP) -> Dict[str, dict]:
+        """Return the PROGRAM-grain projection over the live run's vault (read-only).
+
+        A thin pass-through to :func:`~concursus.governor.scope.build_programs_index`: it rolls the
+        per-run precedent notes under ``<vault>/precedents/`` up by ``program_key``. Pure read (INV-5)
+        — selects nothing, seeds nothing, drives no dispatch, and is regenerated from the notes each
+        call (same notes -> byte-identical output). ``vault_path`` is required because the offline
+        default store holds no vault directory; a run that distilled its precedents into a vault passes
+        that path here.
+        """
+        from concursus.governor.scope import build_programs_index
+
+        return build_programs_index(vault_path, sep=sep)
+
+    def leverage_view(self, vault_path: str, *, sep: str = SCOPE_SEP) -> Dict[str, object]:
+        """Return the 1:N director-leverage view over the live run's vault (read-only).
+
+        Pass-through to :func:`~concursus.governor.scope.director_leverage_view`: program count, total
+        hosted runs, per-program run counts, and a cross-program status rollup. Selects nothing, seeds
+        nothing, drives no dispatch (INV-5).
+        """
+        from concursus.governor.scope import director_leverage_view
+
+        return director_leverage_view(vault_path, sep=sep)
 
     # -- initial context ----------------------------------------------------
     def _initial_ctx(self, inputs: Optional[dict]) -> dict:
@@ -345,6 +490,9 @@ class GovernorLoop:
             "done": False,
             "terminated_by": "",
             "trace": [],
+            "held": set(),      # nodes the OPT-IN scheduler held THIS round (escalated/unmatched)
+            "escalated": [],    # accumulated escalated (below-bar, held) governance surface, all rounds
+            "unmatched": [],    # accumulated UNMATCHED (no standing agent, held) surface, all rounds
         }
 
     # ================================================= dual-altitude resume (OUTER checkpoint)
@@ -367,8 +515,16 @@ class GovernorLoop:
         ckpt = self._checkpointer.load(self._run_id)
         if not ckpt:
             return
-        # Re-author the deterministic DAG (reused across recompiles) and re-freeze revision 0.
-        dag = plan_from_goal(self._goal, plan_model_fn=self._plan_model_fn)
+        # Re-author the deterministic DAG (reused across recompiles) and re-freeze revision 0. The
+        # same authoring seam as round-1, but with ``resume=True`` so the DAG re-derivation is
+        # IDEMPOTENT: the single-shot path (deliberate=False) is stateless and reproduces round-1's
+        # DAG byte-for-byte; the deliberation path (deliberate=True) is re-run against a FRESH, empty
+        # HypothesisTrail — never the persistent ``trail_factory`` dir — because re-seeding a debate
+        # into an already-populated trail bumps its monotonic seq counter, shifting node names (h1 ->
+        # h4) and making the round-0 order DIFFER from the surviving log's committed nodes, which
+        # ``recompile`` would then reject with MonotonicityError. Round-1 authored from an empty
+        # trail, so a fresh empty trail on resume reproduces the same node names (INV-3/INV-4).
+        dag = self._author_first_dag(resume=True)
         plan = self._assembler.assemble(dag, self._manifests)
         state = GovernorState(current_frozen_plan=plan, store=self._store)
         # Replay the compiler front to re-fetch the plan at the checkpointed version. Each recompile
@@ -394,6 +550,15 @@ class GovernorLoop:
         ctx["no_progress"] = int(ckpt.get("no_progress", 0))
         ctx["prev_completed"] = int(ckpt.get("prev_completed", len(self._store.completed())))
         ctx["replan_reason"] = ckpt.get("replan_reason")
+        # Seed the PRIOR-round completed SET from the surviving log (not just its count). The OPT-IN
+        # Trust-Ladder re-earn in _collect anchors "newly completed this round" on ctx["completed"];
+        # left at its _initial_ctx default of [] the first post-resume collect would treat EVERY
+        # surviving-prefix node as freshly completed and re-earn its GOV-side trust a second time
+        # (a spurious promotion that could lift a below-bar side-effecting agent over its autonomy
+        # bar after a crash). Anchoring on the surviving prefix re-earns only nodes that finish in
+        # the resumed rounds — the "re-earn each node exactly ONCE, the round it finishes" contract.
+        # Harmless on the default (no-scheduler) path: ctx["completed"] gates only the re-earn loop.
+        ctx["completed"] = sorted(self._store.completed())
 
     def _save_checkpoint(self, ctx: dict) -> None:
         """Persist a plain-dict OUTER checkpoint: a version + log POINTER, never a plan snapshot.
@@ -444,6 +609,65 @@ class GovernorLoop:
             content_hashes[record.node] = chash
         return completed, content_hashes
 
+    # ================================================= first-round DAG authoring (I-0)
+    def _author_first_dag(self, *, resume: bool = False):
+        """Author the round-1 DAG at the compiler FRONT — single-shot by default, deliberated opt-in.
+
+        Default (``deliberate=False``): byte-for-byte today's path — a single
+        :func:`plan_from_goal` call that emits the DAG once, no pre-signoff adjustment. Stateless, so
+        it is trivially idempotent under ``resume``.
+
+        Opt-in (``deliberate=True``): the DYNAMIC pre-freeze path. Build a :class:`HypothesisTrail`
+        (via the injected ``trail_factory`` or a fresh temp run dir) and run
+        :func:`~concursus.reasoning.deliberate.form_plan`, whose bounded SEED -> read-frontier ->
+        dispatch -> digest -> verdict -> re-read loop ADJUSTS the plan and only lowers to an
+        immutable :class:`AgentDAG` AFTER the debate CONVERGES (SIGNOFF) — ``form_plan`` lowers via
+        ``lower_to_dag`` which RAISES :class:`ThreadNotResolved` on an open frontier, so a DAG is
+        returned only from a converged debate. The loop is dynamic but STRICTLY BEFORE ``assemble``
+        and TERMINATES in a frozen DAG (bounded by ``max_rounds``/``depth_cap``); it never touches
+        :meth:`Supervisor.run` (INV-1), adds no compiler while-loop (INV-2 — the cycle is the bounded
+        DKS deliberation), and the emitted DAG is frozen by ``assemble`` exactly as before
+        (INV-3/INV-4). The injected seams default to deterministic stubs, so it runs with NEITHER
+        langgraph NOR any LLM.
+
+        ``resume=True`` (called only from :meth:`_maybe_restore`) forces IDEMPOTENT re-authoring: the
+        deliberation is re-run against a FRESH, empty :class:`HypothesisTrail` (a throwaway temp dir),
+        NEVER the caller's ``trail_factory``. Re-seeding a debate into an already-populated persistent
+        trail advances its monotonic seq counter, so node ids (``__h1`` -> ``__h4``) — and thus the
+        round-0 plan order — would diverge from the surviving log's committed nodes and ``recompile``
+        would raise :class:`MonotonicityError`. Round-1 authored from an empty trail; a fresh empty
+        trail on resume reproduces the identical node names, so the executed prefix stays pinned.
+        """
+        if not self._deliberate:
+            return plan_from_goal(self._goal, plan_model_fn=self._plan_model_fn)
+        # Imported here (not at module top) so the default single-shot path never imports the
+        # reasoning tier — the deliberation is a strictly-opt-in front-end.
+        from concursus.reasoning.deliberate import form_plan
+        from concursus.reasoning.trailstore import HypothesisTrail
+
+        if self._trail_factory is not None and not resume:
+            trail = self._trail_factory()
+        else:
+            # No factory, OR a resume: author from a FRESH empty trail so the node ids reproduce
+            # round-1's exactly (a persistent trail_factory would otherwise bump its seq counter and
+            # break monotonicity on resume).
+            import tempfile
+
+            run_dir = tempfile.mkdtemp(prefix="concursus_deliberate_")
+            trail = HypothesisTrail(run_dir)
+        kwargs: Dict[str, Any] = {}
+        if self._deliberate_retriever is not None:
+            kwargs["retriever"] = self._deliberate_retriever
+        if self._investigator is not None:
+            kwargs["investigator"] = self._investigator
+        if self._deliberate_max_rounds is not None:
+            kwargs["max_rounds"] = self._deliberate_max_rounds
+        if self._deliberate_depth_cap is not None:
+            kwargs["depth_cap"] = self._deliberate_depth_cap
+        if self._deliberate_confidence_floor is not None:
+            kwargs["confidence_floor"] = self._deliberate_confidence_floor
+        return form_plan(trail, self._goal, **kwargs)
+
     # ================================================= node functions
     def _planner(self, ctx: dict) -> dict:
         """PLANNER: emit a NEW frozen plan at the compiler front (assemble first, recompile after).
@@ -456,7 +680,9 @@ class GovernorLoop:
         state: Optional[GovernorState] = ctx["state"]
         if state is None:
             # First round: author + freeze at the compiler front (no LLM needed by default).
-            dag = plan_from_goal(self._goal, plan_model_fn=self._plan_model_fn)
+            # The DAG is authored single-shot by default, or via the bounded pre-freeze deliberation
+            # when deliberate=True — both return a frozen AgentDAG ready for assemble (INV-3/INV-4).
+            dag = self._author_first_dag()
             plan = self._assembler.assemble(dag, self._manifests)
             state = GovernorState(current_frozen_plan=plan, store=self._store)
             ctx["dag"] = dag
@@ -489,7 +715,42 @@ class GovernorLoop:
         return ctx
 
     def _router(self, ctx: dict) -> dict:
-        """ROUTER: a pass-through for now (G-6 fills it) — it selects nothing and mutates no plan."""
+        """ROUTER: OPT-IN Trust-Ladder frontier gate; a pure pass-through when no scheduler is set.
+
+        Default path (``scheduler is None``): BYTE-FOR-BYTE today's pass-through — it selects
+        nothing, holds nothing, and mutates no plan, so all existing tests are unchanged.
+
+        Opt-in path (a :class:`~concursus.governor.scheduler.TrustLadderScheduler` was injected): call
+        ``propose_frontier(ctx["plan"], completed=store.completed())`` to partition the still-open
+        frontier into ``compile_next`` (cleared to dispatch this round) vs ``escalated``/``unmatched``
+        (HELD). The :class:`FrontierProposal` is stashed on ``ctx["proposal"]`` and the held-set on
+        ``ctx["held"]`` so :meth:`_run_episode` hands the held-set to the supervisor's OPT-IN skip
+        param — the node stays in the frozen ``plan.order`` (INV-3: never dropped, so ``recompile``
+        never raises MonotonicityError), it is simply skipped (never invoked) this round. Held/escalated nodes are
+        accumulated onto ``ctx["escalated"]`` (a governance surface the cockpit exception queue reads,
+        exposed on :attr:`GovernorResult.escalated`); this NEVER dispatches them. As the escalated
+        agents' trust is re-earned by ``update_trust`` between rounds, a later round's proposal clears
+        them and they dispatch — INV-safe INCREMENTAL GROWTH, never a plan mutation.
+        """
+        if self._scheduler is not None and ctx.get("plan") is not None:
+            proposal = self._scheduler.propose_frontier(
+                ctx["plan"], completed=self._store.completed()
+            )
+            held = set(proposal.escalated) | set(proposal.unmatched)
+            ctx["proposal"] = proposal
+            ctx["held"] = held
+            # Accumulate the escalated (held) governance surface across rounds, de-duplicated and
+            # sorted — the cockpit exception queue reads this off GovernorResult.escalated.
+            seen = set(ctx.get("escalated") or [])
+            seen.update(proposal.escalated)
+            ctx["escalated"] = sorted(seen)
+            # Also accumulate UNMATCHED held nodes (no standing agent) on a SEPARATE surface. An
+            # unmatched node is withheld forever and can stall the loop to no_progress; surfacing it
+            # distinctly lets the cockpit exception queue explain a stall that ``escalated`` alone
+            # (below-bar only) would leave invisible.
+            seen_unmatched = set(ctx.get("unmatched") or [])
+            seen_unmatched.update(proposal.unmatched)
+            ctx["unmatched"] = sorted(seen_unmatched)
         ctx["trace"].append("router")
         return ctx
 
@@ -501,7 +762,7 @@ class GovernorLoop:
         inside it, adds no back-edge, and mutates no plan.  A fresh episode is replayable in
         isolation (INV-4); its returned outputs are folded into the cross-episode log by COLLECT.
         """
-        supervisor = self._supervisor_factory(
+        factory_kwargs = dict(
             plan=ctx["plan"],
             manifests=self._manifests,
             store=self._store,
@@ -509,6 +770,14 @@ class GovernorLoop:
             arns=self._arns,
             session_id=self._session_id,
         )
+        # OPT-IN only: hand the ROUTER's held-set to the factory so held (escalated/unmatched) nodes
+        # are built without a live binding and are NOT dispatched this round (the plan is unmutated;
+        # INV-3). When no scheduler is configured the factory is called EXACTLY as today — no ``held``
+        # kwarg — so existing supervisor factories (which take no ``held``) are byte-for-byte
+        # unaffected.
+        if self._scheduler is not None:
+            factory_kwargs["held"] = set(ctx.get("held") or ())
+        supervisor = self._supervisor_factory(**factory_kwargs)
         outputs = supervisor.run(ctx["inputs"])
         ctx["outputs"] = dict(outputs or {})
         ctx["round"] = int(ctx["round"]) + 1
@@ -529,12 +798,48 @@ class GovernorLoop:
         append-only log with redundant dedup records O(rounds x nodes).  So COLLECT only persists a
         node whose output is NOT yet in ``store.completed()`` (i.e. a decoupled supervisor that did
         not write through to the shared store); already-completed nodes are left as the log has them.
+
+        OPT-IN Trust-Ladder re-earn (I-2): when a scheduler is wired, every node that FIRST completed
+        THIS round re-earns GOV-side trust via :meth:`TrustLadderScheduler.update_trust`, keyed on the
+        episode outcome for that node. This is the ONLY place earned trust moves across episodes — it
+        lives GOV-side, in this collect node, NEVER in the compiler, and NEVER calls the create-time
+        :func:`~concursus.build.trust.evaluate_deploy_gate` per-invocation (INV-5). "Newly completed
+        this round" is ``completed`` minus the PRIOR round's completed set (carried on
+        ``ctx["completed"]``, seeded ``[]`` for round 1) — NOT minus ``store.completed()`` sampled at
+        the top of this method, because a store-bound Supervisor has already written every node THROUGH
+        during ``run``, so that sample would already include this round's completions and re-earn
+        nothing. Anchoring on the prior round's set re-earns each node exactly ONCE, the round it
+        finishes, whether it was written through by the supervisor or folded in by ``put`` below. When
+        no scheduler is set, ``update_trust`` is never touched and collect is byte-for-byte unchanged.
         """
+        prev_completed_set = set(ctx.get("completed") or [])
         already = self._store.completed()
         for node, out in ctx["outputs"].items():
             if isinstance(out, dict) and node not in already:
                 self._store.put(node, out)
         completed = self._store.completed()
+        # -- OPT-IN Trust-Ladder re-earn (I-2) ------------------------------
+        # For each node that FIRST completed this round (in the new completed set but NOT in the prior
+        # round's completed set), move its earned trust from the episode outcome. GOV-side ONLY
+        # (INV-5): update_trust never calls the compiler / evaluate_deploy_gate per-invocation.
+        if self._scheduler is not None:
+            # Map each plan NODE (task label) to the AGENT NAME that served it. The scheduler keys
+            # its earned-trust ladder by AGENT NAME (decide/earned_grade read self._earned[agent]),
+            # NOT by the task label — a registered agent may serve a capability label that differs
+            # from its own name. Re-earning under the raw node id would write a junk key the next
+            # round's decide() never reads, so the earned grade would never move: an escalated
+            # below-bar agent could never clear the bar and a failing agent could never demote. We
+            # resolve node->agent from this round's FrontierProposal decisions (which carry both
+            # .node and .agent), falling back to a fresh decide()/match and finally to the node id.
+            node_to_agent = self._agent_name_for_node(ctx)
+            for node in completed:
+                if node in prev_completed_set:
+                    continue  # completed in an earlier round — do not re-earn every round
+                outcome = ctx["outputs"].get(node)
+                if not isinstance(outcome, dict):
+                    # Non-dict / absent episode output: read the node's log record as the outcome.
+                    outcome = self._store.get(node)
+                self._scheduler.update_trust(node_to_agent(node), outcome)
         order = list(ctx["plan"].order)
         ctx["completed"] = sorted(completed)
         ctx["frontier"] = [n for n in order if n not in completed]
@@ -553,6 +858,37 @@ class GovernorLoop:
         self._save_checkpoint(ctx)
         ctx["trace"].append("collect")
         return ctx
+
+    def _agent_name_for_node(self, ctx: dict) -> Callable[[str], str]:
+        """Build a node->agent-name resolver so trust re-earns land under the ladder's real key.
+
+        The scheduler keys earned trust by the matched AGENT NAME (``decide``/``earned_grade`` read
+        ``self._earned[agent]``); the plan carries task-label NODE ids, which may differ from the
+        serving agent's name. This resolves each node to its agent using, in order: (1) this round's
+        :class:`FrontierProposal` decisions stashed on ``ctx["proposal"]`` (each
+        :class:`ScheduleDecision` carries both ``.node`` and ``.agent``), (2) a fresh
+        ``scheduler.decide(node)`` when the proposal lacks the node, and (3) the node id itself as a
+        last-resort fallback (preserving today's behavior when node==agent-name). Read-only: it
+        selects nothing and mutates no plan.
+        """
+        by_node: Dict[str, str] = {}
+        proposal = ctx.get("proposal")
+        for decision in getattr(proposal, "decisions", ()) or ():
+            agent = getattr(decision, "agent", None)
+            if agent:
+                by_node[decision.node] = agent
+
+        def resolve(node: str) -> str:
+            agent = by_node.get(node)
+            if agent:
+                return agent
+            try:
+                decision = self._scheduler.decide(node)
+            except Exception:
+                return node
+            return getattr(decision, "agent", None) or node
+
+        return resolve
 
     # ================================================= replan-reason signal
     def _detect_replan_reason(self, ctx: dict, completed: "set[str]") -> Optional[str]:

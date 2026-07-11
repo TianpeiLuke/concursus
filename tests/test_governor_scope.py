@@ -145,3 +145,84 @@ def test_director_leverage_view_is_one_to_many(tmp_path):
     # cross-program status rollup sums the per-program tallies
     assert view["status_counts"]["completed"] == 1
     assert view["status_counts"]["partial"] == 2
+
+
+# --------------------------------------------------------------------------- live-run accessors (I-3)
+def test_programs_index_over_live_runs(tmp_path):
+    """I-3: GovernorLoop exposes the PROGRAM-grain projection over a live run's vault as a pure,
+    idempotent read — same notes -> byte-identical output, and it drives no dispatch (INV-5)."""
+    from concursus import AgentManifest, GovernorLoop
+    from concursus.state.statestore import InProcessStateStore
+
+    # Two runs distilled under one program + one under another (the live-run precedent notes the
+    # loop's programs index rolls up).
+    _distill(tmp_path, "acme.payments.fraud.run-1", completed=3, total=3)
+    _distill(tmp_path, "acme.payments.fraud.run-2", completed=1, total=3)
+    _distill(tmp_path, "acme.risk.velocity.run-1", completed=2, total=4)
+
+    def _m(name, *, inputs=None, depends_on=None):
+        return AgentManifest.from_dict({
+            "name": name,
+            "registry": {
+                "container_uri": "acct.dkr.ecr.us-east-1.amazonaws.com/agents:latest",
+                "protocol": "HTTP",
+                "entry": f"agents.{name}:run",
+                "role_arn": "arn:aws:iam::123456789012:role/agent",
+            },
+            "contract": {
+                "inputs": inputs or {},
+                "outputs": {"doc": {"type": "string", "required": True}},
+            },
+            "spec": {"depends_on": depends_on or []},
+        })
+
+    manifests = {
+        "ingest": _m("ingest"),
+        "summarize": _m(
+            "summarize",
+            inputs={"document": {"type": "string", "required": True}},
+            depends_on=[{"from": "ingest.doc", "to": "document"}],
+        ),
+    }
+
+    def _plan_model_fn(goal, precedents, directives):
+        return {"nodes": ["ingest", "summarize"], "edges": [["ingest", "summarize"]]}
+
+    class _StoreWritingSupervisor:
+        def __init__(self, *, plan, manifests, store, invoke_fn, arns, session_id):
+            self._plan = plan
+            self._store = store
+
+        def run(self, inputs):
+            already = set(self._store.completed())
+            for node in self._plan.order:
+                if node not in already:
+                    self._store.put(node, {"doc": f"{node}-out"})
+            return {n: self._store.get(n) for n in self._plan.order if n in self._store.completed()}
+
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        manifests,
+        store=store,
+        supervisor_factory=lambda **kw: _StoreWritingSupervisor(**kw),
+        plan_model_fn=_plan_model_fn,
+        backend="python",
+    )
+    loop.run({"uri": "s3://doc"})
+    records_before = [repr(r) for r in store.records()]
+
+    index = loop.programs_index(str(tmp_path))
+    assert set(index) == {"acme.payments.fraud", "acme.risk.velocity"}
+    assert index["acme.payments.fraud"]["run_count"] == 2
+    assert index["acme.risk.velocity"]["run_count"] == 1
+
+    # The leverage view rolls the same runs up 1:N.
+    view = loop.leverage_view(str(tmp_path))
+    assert view["program_count"] == 2
+    assert view["run_count"] == 3
+
+    # Idempotent: a second call over the same notes yields byte-identical output.
+    assert loop.programs_index(str(tmp_path)) == index
+    # Read-only: reading the scope projections drove no dispatch and touched no store record.
+    assert [repr(r) for r in store.records()] == records_before

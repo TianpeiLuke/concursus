@@ -227,6 +227,25 @@ The subpackage is layered strictly outside the compiler (identity invariants INV
   hub), and a 1:N `director_leverage_view` — all read-only projections over the per-run precedent
   notes.
 
+These modules are now **wired into the loop** behind opt-in seams (identity-preserving; the
+default `GovernorLoop(...)` with no `scheduler=` and `deliberate=False` is byte-for-byte today's
+behavior):
+
+- **`router` gates the frontier by earned trust** — pass `scheduler=TrustLadderScheduler(...)` and
+  each round `router` holds below-bar (`ESCALATE`) and no-agent (`UNMATCHED`) nodes out of the
+  episode via the `Supervisor`'s opt-in `held` skip param — a pure non-dispatch that never mutates
+  the frozen `plan.order` (the held node stays in the open frontier for a later round). Held nodes
+  surface on `GovernorResult.escalated` / `.unmatched`.
+- **`collect` re-earns trust GOV-side** — with a scheduler wired, each node re-earns its grade via
+  `update_trust` the round it first completes (keyed by matched agent name); the only place earned
+  trust moves across episodes, never in the compiler, never per-invocation.
+- **`planner` can deliberate before freezing** — pass `deliberate=True` to author round-1's DAG via
+  the bounded `form_plan` deliberation (adjust → converge → lower to a frozen `AgentDAG`) strictly
+  *before* `assemble`; later rounds still use `recompile`. Defaults to deterministic stubs — no LLM.
+- **live read-only cockpit / scope** — `loop.cockpit()`, `loop.programs_index(vault)`, and
+  `loop.leverage_view(vault)` render the `DirectorCockpit` / `scope` projections over the loop's own
+  log and final frozen plan — pure reads that dispatch nothing.
+
 Two shipped-but-idle core seams are now wired into the dispatch path (**C-3**, identity-preserving):
 the `Supervisor` constructor runs the shipped `RunGraph.validate()` **once** as a pre-dispatch
 structural gate (a dangling `AgentRef` or cycle is rejected before the first invoke; `run()` stays a

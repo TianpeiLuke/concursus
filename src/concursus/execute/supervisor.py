@@ -122,6 +122,7 @@ class Supervisor:
         on_error: str = "raise",
         max_attempts: int = 1,
         arn_resolver: Optional[Callable[[str, "AgentManifest"], str]] = None,
+        held: Optional[Set[str]] = None,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
@@ -136,6 +137,13 @@ class Supervisor:
         # DEFAULTS ('raise', 1) preserve today's byte-for-byte fail-fast single forward pass.
         self._on_error = on_error
         self._max_attempts = max_attempts
+        # OPT-IN governance HOLD set (governor I-1): node ids the outer Trust-Ladder router withheld
+        # THIS episode. None/empty (default) preserves today's byte-for-byte pass. A held node is
+        # NEVER invoked — run() skips it exactly like a resume/blocked skip, so the frozen plan.order
+        # is untouched (INV-3) and no ARN/integrity gate fires for it. It is a NON-DISPATCH, not a
+        # failure: nothing is written to the log for a held node, so it does not surface as a failed
+        # record (no spurious replan signal) and stays in the still-open frontier for a later round.
+        self._held: Set[str] = set(held or ())
         # AI-10: OPT-IN dispatch-time ARN integrity assertion. None (default) preserves today's
         # behavior byte-for-byte. When supplied, it fetches the AUTHORITATIVE ARN so we can ASSERT
         # the compiled binding is still current — it NEVER re-binds the invoke to a re-fetched ARN.
@@ -212,6 +220,13 @@ class Supervisor:
         for node in self._plan.order:
             if node in self._store.completed():
                 continue  # resume: this node already has a recorded validated output
+            if node in self._held:
+                # governance HOLD (governor I-1): the outer router withheld this node this episode.
+                # A pure NON-DISPATCH — never invoked, and NOTHING is written to the log (unlike a
+                # blocked/failed skip), so the held node leaves no failed record (no spurious replan
+                # signal) and simply stays in the still-open frontier for a later round once its
+                # trust is re-earned. The frozen plan.order is untouched (INV-3).
+                continue
             wiring: List["AgentRef"] = list(self._plan.wiring.get(node, []))
 
             # blocked-skip: a producer this node consumes never completed (e.g. it failed or was

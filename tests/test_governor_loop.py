@@ -649,6 +649,245 @@ def test_contradiction_signal_drives_replan_end_to_end():
     assert set(result.completed) == {"ingest", "summarize"}
 
 
+# == (I-0) OPT-IN pre-freeze deliberation planner ============================
+def _accepting_investigator(h):
+    """A deterministic stub investigator that ACCEPTs every hypothesis (no LLM/langgraph)."""
+    return {"verdict": "ACCEPT", "evidence": {"reason": "stub accept"}}
+
+
+def _manifests_for_dag(dag):
+    """Build a trivial single-output manifest per node of a (edge-free) deliberated DAG."""
+    return {name: _manifest(name) for name in dag.nodes}
+
+
+def test_deliberate_planner_adjusts_then_freezes(tmp_path):
+    """With deliberate=True the round-1 DAG comes from a CONVERGED form_plan deliberation: the debate
+    signs off (no ThreadNotResolved), the DAG is frozen/assembled, and the episode runs to
+    frontier-exhaustion — the dynamic adjustment happened STRICTLY BEFORE assemble."""
+    from concursus.reasoning.deliberate import form_plan
+    from concursus.reasoning.trailstore import HypothesisTrail
+
+    goal = "summarize the document"
+    # Reproduce the deterministic converged DAG the loop will author, to size the manifests to it.
+    expected_dag = form_plan(
+        HypothesisTrail(tmp_path / "probe"), goal, investigator=_accepting_investigator
+    )
+    assert expected_dag.nodes  # the debate converged and lowered a non-empty frozen DAG
+
+    fake = _fresh_fake()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        goal,
+        _manifests_for_dag(expected_dag),
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        deliberate=True,
+        trail_factory=lambda: HypothesisTrail(tmp_path / "gov_run"),
+        investigator=_accepting_investigator,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    # The deliberated DAG was frozen + assembled into a plan and one static episode ran over it.
+    assert result.done is True
+    assert result.terminated_by == "frontier_exhaust"
+    assert fake.run_count == result.rounds == result.supervisor_runs
+    # The frozen round-1 plan is a real ProvisioningPlan whose order equals the converged DAG nodes.
+    first_plan = result.state.plan_history[0]
+    assert first_plan.revision == 0
+    assert set(first_plan.order) == set(expected_dag.nodes)
+    assert set(result.completed) == set(expected_dag.nodes)
+
+
+def _decomposing_investigator(h):
+    """A deterministic stub that DECOMPOSES the seed approach into two sharper children, then ACCEPTs.
+
+    Unlike :func:`_accepting_investigator` (which closes the single seed hypothesis, yielding a
+    one-node edge-free DAG), this exercises real pre-freeze ADJUSTMENT: the seed ``Approach: <goal>``
+    root fans out into two child hypotheses, each accepted, so ``form_plan`` lowers a MULTI-node DAG
+    with parent->child edges — proving the deliberation actually restructured the plan before freeze.
+    """
+    text = (h.text or "")
+    if text.startswith("Approach:"):
+        return [
+            {"text": "extract text", "confidence": 0.9},
+            {"text": "rank sentences", "confidence": 0.9},
+        ]
+    return {"verdict": "ACCEPT", "evidence": {"reason": "stub accept"}}
+
+
+def test_deliberate_planner_multi_node_decomposition_flows_through_episode(tmp_path):
+    """A DECOMPOSING investigator makes the pre-freeze debate fan the seed into multiple children:
+    the frozen round-1 plan carries a multi-node order (with the parent->child sub-tree), and the
+    episode runs over that adjusted plan to frontier-exhaustion — the dynamic adjustment is real,
+    not a single-node passthrough."""
+    from concursus.reasoning.deliberate import form_plan
+    from concursus.reasoning.trailstore import HypothesisTrail
+
+    goal = "summarize the document"
+    expected_dag = form_plan(
+        HypothesisTrail(tmp_path / "probe"), goal, investigator=_decomposing_investigator
+    )
+    # The debate decomposed the seed: strictly more than one node, with real parent->child edges.
+    assert len(expected_dag.nodes) >= 3
+    assert expected_dag.edges
+
+    fake = _fresh_fake()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        goal,
+        _manifests_for_dag(expected_dag),
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        deliberate=True,
+        trail_factory=lambda: HypothesisTrail(tmp_path / "gov_run"),
+        investigator=_decomposing_investigator,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    assert result.done is True
+    assert result.terminated_by == "frontier_exhaust"
+    first_plan = result.state.plan_history[0]
+    assert first_plan.revision == 0
+    # The frozen plan reflects the DECOMPOSED sub-tree, not the single seed hypothesis.
+    assert set(first_plan.order) == set(expected_dag.nodes)
+    assert len(first_plan.order) >= 3
+    assert set(result.completed) == set(expected_dag.nodes)
+
+
+def test_deliberate_resume_persistent_trail_pins_prefix_no_monotonicity_error(tmp_path):
+    """G-4 resume UNDER deliberate=True with a PERSISTENT trail_factory: the re-authored round-0 DAG
+    must reproduce the SAME node ids the first process committed, so ``recompile`` pins the executed
+    prefix instead of raising MonotonicityError.
+
+    Regression for the non-idempotent re-author defect: re-running ``form_plan`` on the SAME durable
+    HypothesisTrail dir advances its monotonic seq counter (h1 -> h4), which would shift node names
+    and drop the already-committed node on resume. The fix re-authors from a FRESH empty trail on
+    resume, so the round-0 order matches the surviving log and growth stays monotonic."""
+    from concursus.governor.loop import InProcessCheckpointStore
+    from concursus.reasoning.deliberate import form_plan
+    from concursus.reasoning.trailstore import HypothesisTrail
+
+    goal = "summarize the document"
+    # A multi-node deliberated DAG so the resume actually replays recompile (iteration >= 1); a
+    # single-node DAG would exhaust in round 1 and never exercise the re-author-then-recompile path.
+    expected_dag = form_plan(
+        HypothesisTrail(tmp_path / "probe"), goal, investigator=_decomposing_investigator
+    )
+    assert len(expected_dag.nodes) >= 3
+    manifests = _manifests_for_dag(expected_dag)
+
+    # The DURABLE trail dir a production deliberation would reuse — the exact config that broke.
+    gov_trail_dir = tmp_path / "gov_run"
+
+    class _PartialSupervisor:
+        """Completes exactly ONE new node per round; INNER-replays committed nodes (never re-invokes)."""
+
+        invoked = []
+
+        def __init__(self, *, plan, manifests, store, invoke_fn, arns, session_id):
+            self._plan = plan
+            self._store = store
+
+        def run(self, inputs):
+            already = set(self._store.completed())
+            for node in self._plan.order:
+                if node in already:
+                    continue
+                type(self).invoked.append(node)
+                self._store.put(node, {"doc": f"{node}-out"})
+                break
+            return {n: self._store.get(n) for n in self._plan.order if n in self._store.completed()}
+
+    store = InProcessStateStore()          # the sole structural anchor, survives the crash
+    checkpointer = InProcessCheckpointStore()
+
+    # --- process 1: run two rounds then "crash" (round_cap) — one node completes per round.
+    _PartialSupervisor.invoked = []
+    loop1 = GovernorLoop(
+        goal,
+        manifests,
+        store=store,
+        checkpointer=checkpointer,
+        supervisor_factory=lambda **kw: _PartialSupervisor(**kw),
+        deliberate=True,
+        trail_factory=lambda: HypothesisTrail(gov_trail_dir),
+        investigator=_decomposing_investigator,
+        max_rounds=2,
+        no_progress_n=5,
+        run_id="delib-run",
+        backend="python",
+    )
+    r1 = loop1.run({"uri": "s3://doc"})
+    assert r1.terminated_by == "round_cap"
+    assert r1.done is False
+    committed_after_crash = set(store.completed())
+    assert len(committed_after_crash) == 2  # two nodes committed before the crash
+    ckpt = checkpointer.load("delib-run")
+    assert ckpt["iteration"] == 1  # one recompile survived — resume MUST replay it
+
+    # --- process 2: a BRAND-NEW loop over the SAME store + checkpointer + the SAME persistent trail
+    # dir resumes. Before the fix this raised MonotonicityError because the re-authored DAG's node
+    # ids had shifted (h1 -> h4) against the surviving log.
+    _PartialSupervisor.invoked = []
+    loop2 = GovernorLoop(
+        goal,
+        manifests,
+        store=store,
+        checkpointer=checkpointer,
+        supervisor_factory=lambda **kw: _PartialSupervisor(**kw),
+        deliberate=True,
+        trail_factory=lambda: HypothesisTrail(gov_trail_dir),
+        investigator=_decomposing_investigator,
+        max_rounds=8,
+        no_progress_n=5,
+        run_id="delib-run",
+        backend="python",
+    )
+    r2 = loop2.run({"uri": "s3://doc"})
+
+    # Resume completed the journey; the committed prefix was PINNED (never re-invoked, never dropped).
+    assert r2.done is True
+    assert r2.terminated_by == "frontier_exhaust"
+    assert set(r2.completed) == set(expected_dag.nodes)
+    # Only the still-open node did fresh work in the resumed process — committed nodes were skipped.
+    assert set(_PartialSupervisor.invoked) == set(expected_dag.nodes) - committed_after_crash
+    # Monotonic revision growth: 0 (assemble) -> 1 -> 2, prior order surviving as a subsequence.
+    assert [p.revision for p in r2.state.plan_history] == [0, 1, 2]
+
+
+def test_no_deliberate_planner_is_single_shot_default():
+    """With deliberate=False (the default) round-1 authoring is IDENTICAL to today's single-shot
+    plan_from_goal path — the frozen plan matches one assembled independently, byte for byte."""
+    fake = _fresh_fake()
+    store = InProcessStateStore()
+    manifests = _two_node_manifests()
+
+    # The single-shot DAG + plan the default path must reproduce exactly.
+    dag = plan_from_goal("summarize the document", plan_model_fn=_plan_model_fn)
+    expected_plan = OrchestrationAssembler().assemble(dag, manifests)
+
+    loop = GovernorLoop(
+        "summarize the document",
+        manifests,
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        backend="python",
+    )
+    assert loop._deliberate is False  # opt-in switch defaults OFF
+    result = loop.run({"uri": "s3://doc"})
+
+    first_plan = result.state.plan_history[0]
+    assert first_plan.to_dict() == expected_plan.to_dict()
+    assert set(result.completed) == {"ingest", "summarize"}
+
+
 # == (C-2) durable MemoryStateStore backend + G-4 dual-resume =================
 def test_loop_selects_memory_backend_keyed_by_session_id():
     """Passing ``memory_id``/``actor_id`` (no explicit ``store``) selects the SHIPPED
@@ -751,3 +990,491 @@ def test_loop_resumes_via_memory_backend():
     assert resumed.completed() == {"ingest", "summarize"}
     assert resumed.get("ingest") == {"doc": "ingest-out"}
     assert resumed.get("summarize") == {"doc": "summarize-out"}
+
+
+# == (I-1) OPT-IN Trust-Ladder ROUTER frontier gate ==========================
+def _sched_manifest(name, *, side_effecting=False, trust_seed=None):
+    """A manifest for the scheduler's process table (capabilities default to the agent name)."""
+    data = {
+        "name": name,
+        "registry": {"container_uri": "img", "protocol": "HTTP"},
+        "contract": {"inputs": {}, "outputs": {"doc": {"type": "string", "required": True}}},
+        "side_effecting": side_effecting,
+    }
+    if trust_seed is not None:
+        data["trust_seed"] = trust_seed
+    return AgentManifest.from_dict(data)
+
+
+class _HeldTrackingSupervisor:
+    """A store-bound fake that honors the ROUTER's ``held`` set: it invokes (and writes) every
+    still-open, NON-held plan node and NEVER touches a held node.
+
+    Records which nodes it actually invoked (class-level) so a test can assert a below-bar node's
+    agent was never invoked that round while a cleared node was.
+    """
+
+    invoked = []       # class-level ledger of nodes actually dispatched (across all rounds)
+    run_count = 0
+    seen_held = []     # the held-set the router handed the factory each round
+
+    def __init__(self, *, plan, manifests, store, invoke_fn, arns, session_id, held=None):
+        self._plan = plan
+        self._store = store
+        self._held = set(held or ())
+        type(self).seen_held.append(set(self._held))
+
+    def run(self, inputs):
+        type(self).run_count += 1
+        already = set(self._store.completed())
+        for node in self._plan.order:
+            if node in already or node in self._held:
+                continue  # skip completed AND held (escalated/unmatched) nodes — no invoke
+            type(self).invoked.append(node)
+            self._store.put(node, {"doc": f"{node}-out"})
+        return {n: self._store.get(n) for n in self._plan.order if n in self._store.completed()}
+
+
+def _fresh_held_tracking():
+    _HeldTrackingSupervisor.invoked = []
+    _HeldTrackingSupervisor.run_count = 0
+    _HeldTrackingSupervisor.seen_held = []
+    return _HeldTrackingSupervisor
+
+
+def _trust_scheduler(tmp_path):
+    """A TrustLadderScheduler over a populated registry: ``summarize`` is side-effecting at a
+    below-bar trust seed (→ ESCALATE), ``ingest`` is non-side-effecting (→ DISPATCH)."""
+    from concursus import DeployLedger, TrustGrade
+    from concursus.governor.registry import AgentRegistry
+    from concursus.governor.scheduler import TrustLadderScheduler
+
+    ledger = DeployLedger(tmp_path / "ledger.json")
+    ledger.record(name="ingest", fingerprint="fp1", arn="arn:ingest", deployed_at="2026-07-01")
+    ledger.record(name="summarize", fingerprint="fp2", arn="arn:summarize", deployed_at="2026-07-01")
+    m_ingest = _sched_manifest("ingest", side_effecting=False)
+    m_sum = _sched_manifest("summarize", side_effecting=True, trust_seed=TrustGrade.L1_CANARY)
+    registry = AgentRegistry(ledger)
+    registry.register_agent(m_ingest)
+    registry.register_agent(m_sum)
+    return TrustLadderScheduler(
+        registry,
+        manifests={"ingest": m_ingest, "summarize": m_sum},
+        min_autonomy=TrustGrade.L2_GUARDED,          # bar above summarize's earned L1
+        escalation_grade=TrustGrade.L3_AUTONOMOUS,
+    )
+
+
+def test_router_gates_frontier_by_trust(tmp_path):
+    """With an OPT-IN scheduler wired, the ROUTER holds a below-bar node: its agent is NOT invoked
+    that round (cleared nodes ARE invoked), the frozen plan is never mutated, the held node is
+    surfaced on ``GovernorResult.escalated``, and the loop terminates on a hard bound."""
+    fake = _fresh_held_tracking()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=_trust_scheduler(tmp_path),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    # The cleared node dispatched and completed; the below-bar node was HELD — never invoked.
+    assert "ingest" in fake.invoked
+    assert "summarize" not in fake.invoked
+    assert "ingest" in store.completed()
+    assert "summarize" not in store.completed()
+
+    # The router held 'summarize' every round (it was escalated, not dispatched).
+    assert all("summarize" in held for held in fake.seen_held)
+
+    # The escalation is surfaced for the cockpit exception queue.
+    assert result.escalated == ["summarize"]
+
+    # The frozen plan STILL carries the held node in its order (INV-3: never dropped — dropping it
+    # would raise MonotonicityError on recompile). Holding is by non-dispatch, not plan mutation.
+    first_plan = result.state.plan_history[0]
+    assert set(first_plan.order) == {"ingest", "summarize"}
+
+    # A held-forever node can never exhaust the frontier, so the loop terminates on the hard stall
+    # bound — bounded, never a runaway.
+    assert result.terminated_by == "no_progress"
+    assert result.done is False
+    assert result.rounds < loop._step_cap()
+
+
+def _arn_two_node_manifests():
+    """The two-node topology, but each manifest carries an embedded ``agent_runtime_arn`` — the
+    normal production shape (a deployed agent is dispatchable because its manifest pins its ARN).
+
+    This is the shape that DEFEATS an ARN-stripping hold: the real Supervisor re-derives the ARN
+    from ``registry.agent_runtime_arn`` when the supplied ``arns`` dict omits it, so dropping the
+    supplied dict would still dispatch a held node. The correct hold is the Supervisor's non-dispatch
+    skip param.
+    """
+    def _m(name, **kw):
+        m = _manifest(name, **kw)
+        m.registry["agent_runtime_arn"] = f"arn:aws:bedrock-agentcore:us-east-1:1:runtime/{name}"
+        return m
+
+    return {
+        "ingest": _m("ingest"),
+        "summarize": _m(
+            "summarize",
+            inputs={"document": {"type": "string", "required": True}},
+            depends_on=[{"from": "ingest.doc", "to": "document"}],
+        ),
+    }
+
+
+def test_router_holds_via_real_default_factory_no_invoke_no_raise(tmp_path):
+    """END-TO-END through the REAL ``_default_supervisor_factory`` (no cooperative fake), over
+    manifests carrying ``agent_runtime_arn``: a below-bar node is HELD via the Supervisor's
+    non-dispatch skip — its invoke_fn is NEVER called, the run does NOT raise (no placeholder
+    ARN-integrity crash), the cleared node dispatches, and the held node stays in ``plan.order``
+    yet never completes. Locks the real seam that the ARN-strip mechanism silently bypassed/crashed.
+    """
+    invoked = []
+
+    def _stub_invoke(arn, qualifier, session_id, payload):
+        invoked.append(arn)
+        return {"doc": "ok"}  # satisfies the manifest output schema
+
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _arn_two_node_manifests(),
+        store=store,
+        scheduler=_trust_scheduler(tmp_path),
+        invoke_fn=_stub_invoke,           # NO supervisor_factory override → real default factory
+        plan_model_fn=_plan_model_fn,
+        max_rounds=6,
+        no_progress_n=2,
+        backend="python",
+    )
+    result = loop.run({"uri": "s3://doc"})  # must NOT raise
+
+    # The cleared node dispatched through the real Supervisor + stub invoke; the held (below-bar,
+    # side-effecting) node was NEVER invoked — the trust gate held on the real seam.
+    ingest_arn = "arn:aws:bedrock-agentcore:us-east-1:1:runtime/ingest"
+    summarize_arn = "arn:aws:bedrock-agentcore:us-east-1:1:runtime/summarize"
+    assert ingest_arn in invoked
+    assert summarize_arn not in invoked
+    assert "ingest" in store.completed()
+    assert "summarize" not in store.completed()
+
+    # Held node stays in the frozen plan.order (INV-3) and is surfaced for the cockpit.
+    first_plan = result.state.plan_history[0]
+    assert set(first_plan.order) == {"ingest", "summarize"}
+    assert result.escalated == ["summarize"]
+    # No failed record was written for the held node — a pure non-dispatch, not a failure.
+    assert all(r.node != "summarize" for r in store.records())
+    # Held forever → bounded stall termination, never a runaway.
+    assert result.terminated_by == "no_progress"
+    assert result.done is False
+
+
+def test_router_surfaces_unmatched_held_node(tmp_path):
+    """An UNMATCHED held node (no standing agent) is surfaced on ``GovernorResult.unmatched``, so a
+    frontier stall it causes is observable to the cockpit exception queue rather than invisible."""
+    from concursus import DeployLedger, TrustGrade
+    from concursus.governor.registry import AgentRegistry
+    from concursus.governor.scheduler import TrustLadderScheduler
+
+    # Registry knows only 'ingest' → 'summarize' has NO standing agent (UNMATCHED, not escalated).
+    ledger = DeployLedger(tmp_path / "ledger.json")
+    ledger.record(name="ingest", fingerprint="fp1", arn="arn:ingest", deployed_at="2026-07-01")
+    m_ingest = _sched_manifest("ingest", side_effecting=False)
+    registry = AgentRegistry(ledger)
+    registry.register_agent(m_ingest)
+    scheduler = TrustLadderScheduler(
+        registry,
+        manifests={"ingest": m_ingest},
+        min_autonomy=TrustGrade.L1_CANARY,
+    )
+
+    fake = _fresh_held_tracking()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=scheduler,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    # 'summarize' had no standing agent → held as UNMATCHED, surfaced distinctly from escalated.
+    assert "summarize" not in fake.invoked
+    assert result.unmatched == ["summarize"]
+    assert "summarize" not in result.escalated
+    # The unmatched node stalls the frontier → bounded no_progress termination.
+    assert result.terminated_by == "no_progress"
+    assert result.done is False
+
+
+def test_no_scheduler_router_is_passthrough():
+    """With no scheduler (the default), the ROUTER is BYTE-FOR-BYTE today's pass-through: nothing is
+    held or escalated, and the loop behaves exactly as before — both nodes complete on the first
+    frontier-exhausting episode."""
+    fake = _fresh_fake()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    assert loop._scheduler is None  # opt-in switch defaults OFF
+
+    result = loop.run({"uri": "s3://doc"})
+
+    # Existing behavior unchanged: the frontier exhausts on the first episode, nothing was held.
+    assert result.terminated_by == "frontier_exhaust"
+    assert result.done is True
+    assert result.escalated == []
+    assert set(result.completed) == {"ingest", "summarize"}
+    assert fake.run_count == result.rounds == result.supervisor_runs
+
+
+def test_collect_reearns_trust_gov_side(tmp_path, monkeypatch):
+    """With an OPT-IN scheduler wired, COLLECT re-earns GOV-side trust for each node that completed
+    THIS round (I-2): after a clean episode the scheduler's earned_grade for a completed node is
+    promoted by update_trust. The re-earn lives GOV-side in collect and NEVER calls the create-time
+    ``evaluate_deploy_gate`` per-invocation — the gate is consulted only for the create-time seed (at
+    most once per agent), so its call count does NOT scale with the number of episodes."""
+    from concursus import TrustGrade
+    import concursus.governor.scheduler as sched_mod
+
+    # Spy on the create-time gate: it must be consulted only for seeding, never per-invocation.
+    calls = {"n": 0}
+    real_gate = sched_mod.evaluate_deploy_gate
+
+    def _spy_gate(*args, **kwargs):
+        calls["n"] += 1
+        return real_gate(*args, **kwargs)
+
+    monkeypatch.setattr(sched_mod, "evaluate_deploy_gate", _spy_gate)
+
+    scheduler = _trust_scheduler(tmp_path)
+    fake = _fresh_held_tracking()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=scheduler,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+
+    # Seed 'ingest' lazily (one create-time gate consult) so we can compare before/after.
+    before = scheduler.earned_grade("ingest")
+
+    result = loop.run({"uri": "s3://doc"})
+
+    after = scheduler.earned_grade("ingest")
+
+    # 'ingest' (non-side-effecting → dispatched) completed and re-earned trust GOV-side: the clean
+    # outcome promoted its earned grade one rung via update_trust.
+    assert "ingest" in store.completed()
+    assert int(after) > int(before)
+    assert after == TrustGrade.L1_CANARY
+
+    # 'summarize' (below-bar, side-effecting) was HELD → never completed → never re-earned.
+    assert "summarize" not in store.completed()
+
+    # The loop ran multiple episodes (summarize held forever → bounded no_progress), yet the
+    # create-time gate was consulted at most ONCE PER AGENT — update_trust in collect never calls it.
+    assert result.rounds >= 2
+    assert calls["n"] <= len(_two_node_manifests())
+
+
+def test_collect_reearns_trust_by_agent_name_not_task_label(tmp_path):
+    """COLLECT must re-earn trust keyed by the AGENT NAME that served a node, not the plan NODE/task
+    label. When an agent's capability label differs from its own name, keying on the raw node id
+    would write a junk ladder key the next round's decide() never reads, so the earned grade would
+    never move and an escalated below-bar agent could never clear the bar. Regression: the re-earn
+    must move ``earned_grade(agent_name)``."""
+    from concursus import DeployLedger, TrustGrade
+    from concursus.governor.registry import AgentRegistry
+    from concursus.governor.scheduler import TrustLadderScheduler
+
+    # The plan node/task label is 'ingest'; the standing agent that SERVES it is named 'worker'
+    # (a decoupled capability label != agent name — a fully supported registry configuration).
+    ledger = DeployLedger(tmp_path / "ledger.json")
+    ledger.record(name="worker", fingerprint="fp1", arn="arn:worker", deployed_at="2026-07-01")
+    ledger.record(name="scribe", fingerprint="fp2", arn="arn:scribe", deployed_at="2026-07-01")
+    m_worker = _sched_manifest("worker", side_effecting=False)
+    m_scribe = _sched_manifest("scribe", side_effecting=False)
+    registry = AgentRegistry(ledger)
+    # 'worker' serves task 'ingest'; 'scribe' serves task 'summarize' — labels differ from names.
+    registry.register_agent(m_worker, capabilities={"ingest"})
+    registry.register_agent(m_scribe, capabilities={"summarize"})
+    scheduler = TrustLadderScheduler(
+        registry,
+        manifests={"worker": m_worker, "scribe": m_scribe},
+        min_autonomy=TrustGrade.L1_CANARY,
+    )
+
+    fake = _fresh_held_tracking()  # accepts the ROUTER's held= kwarg (a scheduler is wired)
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=scheduler,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+
+    before_worker = scheduler.earned_grade("worker")   # seed the agent-name key
+    result = loop.run({"uri": "s3://doc"})
+    after_worker = scheduler.earned_grade("worker")
+
+    # The 'ingest' node completed and re-earned trust under the AGENT NAME 'worker' (not 'ingest').
+    assert "ingest" in store.completed()
+    assert int(after_worker) > int(before_worker)
+    # The task label is NOT a ladder key — the re-earn did not leak under the node id.
+    assert "ingest" not in scheduler._earned
+    # And 'scribe' likewise moved for the 'summarize' node it served.
+    assert int(scheduler.earned_grade("scribe")) > int(TrustGrade.L0_SHADOW)
+    assert "summarize" not in scheduler._earned
+
+
+def test_resume_does_not_reearn_surviving_prefix_trust(tmp_path):
+    """On checkpoint resume, the surviving executed prefix must NOT re-earn trust a second time.
+    _maybe_restore seeds ctx['completed'] from the surviving log so the first post-resume collect
+    treats the prefix as already-earned. Regression for the double-count that would spuriously
+    promote a node's earned grade across a crash."""
+    from concursus.governor.loop import InProcessCheckpointStore
+    from concursus import DeployLedger, TrustGrade
+    from concursus.governor.registry import AgentRegistry
+    from concursus.governor.scheduler import TrustLadderScheduler
+
+    def _make_scheduler():
+        ledger = DeployLedger(tmp_path / "ledger.json")
+        ledger.record(name="ingest", fingerprint="fp1", arn="arn:ingest", deployed_at="2026-07-01")
+        ledger.record(name="summarize", fingerprint="fp2", arn="arn:s", deployed_at="2026-07-01")
+        m_ingest = _sched_manifest("ingest", side_effecting=False)
+        m_sum = _sched_manifest("summarize", side_effecting=False)
+        registry = AgentRegistry(ledger)
+        registry.register_agent(m_ingest)
+        registry.register_agent(m_sum)
+        return TrustLadderScheduler(
+            registry,
+            manifests={"ingest": m_ingest, "summarize": m_sum},
+            min_autonomy=TrustGrade.L1_CANARY,
+        )
+
+    class _PartialHeldSupervisor:
+        """Completes exactly ONE new NON-held node per round (accepts the scheduler's held= kwarg)."""
+
+        def __init__(self, *, plan, manifests, store, invoke_fn, arns, session_id, held=None):
+            self._plan = plan
+            self._store = store
+            self._held = set(held or ())
+
+        def run(self, inputs):
+            already = set(self._store.completed())
+            for node in self._plan.order:
+                if node in already or node in self._held:
+                    continue
+                self._store.put(node, {"doc": f"{node}-out"})
+                break
+            return {n: self._store.get(n) for n in self._plan.order if n in self._store.completed()}
+
+    store = InProcessStateStore()          # the sole structural anchor, survives the crash
+    checkpointer = InProcessCheckpointStore()
+
+    # --- process 1: complete exactly ONE node (ingest) then "crash" on round_cap.
+    sched1 = _make_scheduler()
+    loop1 = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        checkpointer=checkpointer,
+        scheduler=sched1,
+        supervisor_factory=lambda **kw: _PartialHeldSupervisor(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=1,
+        no_progress_n=5,
+        run_id="resume-run",
+        backend="python",
+    )
+    r1 = loop1.run({"uri": "s3://doc"})
+    assert r1.terminated_by == "round_cap"
+    assert "ingest" in store.completed()
+
+    # --- process 2: a fresh loop + FRESH scheduler resumes over the SAME store + checkpointer.
+    sched2 = _make_scheduler()
+    grade_before_resume = sched2.earned_grade("ingest")  # freshly seeded, pre-resume
+    loop2 = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        checkpointer=checkpointer,
+        scheduler=sched2,
+        supervisor_factory=lambda **kw: _PartialHeldSupervisor(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=5,
+        run_id="resume-run",
+        backend="python",
+    )
+    r2 = loop2.run({"uri": "s3://doc"})
+
+    # 'ingest' survived from process 1; the resumed loop must NOT re-earn it — its earned grade is
+    # UNCHANGED across the resume (equal to the fresh seed), NOT a spurious extra promotion.
+    assert r2.done is True
+    assert sched2.earned_grade("ingest") == grade_before_resume
+    # 'summarize' finished in the resumed rounds → it DID re-earn (moved above its seed).
+    assert int(sched2.earned_grade("summarize")) > int(grade_before_resume)
+
+
+def test_no_scheduler_collect_unchanged():
+    """With no scheduler (the default), COLLECT is BYTE-FOR-BYTE today's path: update_trust is never
+    touched, nothing is escalated/unmatched, and both nodes complete on the first frontier-exhausting
+    episode exactly as before."""
+    fake = _fresh_fake()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    assert loop._scheduler is None  # opt-in switch defaults OFF
+
+    result = loop.run({"uri": "s3://doc"})
+
+    assert result.terminated_by == "frontier_exhaust"
+    assert result.done is True
+    assert set(result.completed) == {"ingest", "summarize"}
+    assert result.escalated == []
+    assert result.unmatched == []
+    # One write per node in the append-only log — no extra trust bookkeeping records.
+    assert {r.node for r in store.records()} == {"ingest", "summarize"}

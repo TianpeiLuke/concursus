@@ -251,6 +251,7 @@ class GovernorLoop:
         confidence_threshold: float = 0.5,
         backend: str = "auto",
         run_id: str = "governor",
+        checkpoint_every: int = 0,
     ) -> None:
         if backend not in ("auto", "python", "langgraph"):
             raise GovernorLoopError(
@@ -311,6 +312,18 @@ class GovernorLoop:
         self._max_revisions = max_revisions
         self._confidence_threshold = confidence_threshold
         self._backend = backend
+        # -- OPT-IN auto-checkpoint cadence (C-4 optimization) --------------
+        # 0 (default) => today's behavior byte-for-byte: no auto-checkpoint, every warm resume is a
+        # full log rebuild. When > 0 AND the store supports checkpoint-compaction (MemoryStateStore /
+        # FileVaultStateStore expose ``checkpoint()``), COLLECT calls store.checkpoint() once every N
+        # completed rounds so a long-running loop's append-only log stays bounded for warm resume
+        # (O(events-since-last-checkpoint), not O(whole log)) WITHOUT the caller having to remember to
+        # checkpoint. A checkpoint is a derived, append-only compaction of the same log (INV-5) — the
+        # raw events are never deleted, so this is a pure resume-cost optimization, never a semantic
+        # change. Stores without checkpoint() (the in-process default) silently no-op.
+        if int(checkpoint_every) < 0:
+            raise GovernorLoopError("checkpoint_every must be >= 0 (0 disables auto-checkpoint)")
+        self._checkpoint_every = int(checkpoint_every)
         # -- READ-ONLY cockpit/scope seam (I-3) -----------------------------
         # The CURRENT run's final frozen plan VALUE, stashed by run() so a caller can build a
         # DirectorCockpit / read the scope projections over the LIVE run WITHOUT re-assembling or
@@ -911,8 +924,35 @@ class GovernorLoop:
         # snapshot) so a crashed governor resumes at THIS round boundary (INV-3/INV-5). No-op absent
         # a checkpointer.
         self._save_checkpoint(ctx)
+        # STORE-altitude auto-checkpoint (C-4 cadence): every ``checkpoint_every`` completed rounds,
+        # compact the append-only StateStore log so a long-running loop's warm resume stays bounded
+        # (O(events-since-checkpoint)). A no-op unless opt-in AND the store supports compaction.
+        self._maybe_auto_checkpoint(int(ctx.get("round", 0)))
         ctx["trace"].append("collect")
         return ctx
+
+    def _maybe_auto_checkpoint(self, round_no: int) -> None:
+        """Compact the store's log every ``checkpoint_every`` rounds (C-4), when opt-in + supported.
+
+        Disabled by default (``checkpoint_every == 0``) so behavior is byte-for-byte unchanged.
+        When enabled, fires at each Nth completed round on a store that exposes ``checkpoint()``
+        (MemoryStateStore / FileVaultStateStore); the in-process default store has no such method
+        and is silently skipped. A checkpoint is a derived, append-only compaction of the same log
+        (INV-5) — never a mutation or deletion — so this only bounds warm-resume cost, never changes
+        the run's semantics. Any checkpoint error is swallowed: a failed compaction must never break
+        a live episode (the loop degrades to a full-log warm resume, which is always correct).
+        """
+        if self._checkpoint_every <= 0 or round_no <= 0:
+            return
+        if round_no % self._checkpoint_every != 0:
+            return
+        cp = getattr(self._store, "checkpoint", None)
+        if not callable(cp):
+            return
+        try:
+            cp()
+        except Exception:  # pragma: no cover - defensive: compaction is best-effort, never fatal
+            pass
 
     def _agent_name_for_node(self, ctx: dict) -> Callable[[str], str]:
         """Build a node->agent-name resolver so trust re-earns land under the ladder's real key.

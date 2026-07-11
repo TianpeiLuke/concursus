@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GovernorLoop(checkpoint_every=N)` — opt-in auto-checkpoint cadence.** Realizes the C-4
+  checkpoint-compaction win *automatically*: every `N` completed rounds the loop calls
+  `store.checkpoint()` so a long-running / standing loop's append-only log stays bounded for warm
+  resume (O(events-since-checkpoint), not O(whole log)) without the caller having to remember to
+  checkpoint. Default `0` disables it (behavior byte-for-byte unchanged); a store without a
+  `checkpoint()` method (the in-process default) silently no-ops; a checkpoint is a derived,
+  append-only compaction of the same log (never a mutation/deletion), and a failed compaction is
+  swallowed so it can never break a live episode (the loop degrades to a full-log warm resume,
+  which is always correct).
+
 - **`MemoryStateStore` checkpoint-compaction warm resume (opt-in).** A new `checkpoint()` writes one
   append-only `CHECKPOINT` event carrying the compacted latest-per-node snapshot of the current
   *epoch*, then rotates the epoch forward. A later `replay()` detects the latest checkpoint (via a

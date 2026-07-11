@@ -27,6 +27,7 @@ from concursus import AgentManifest, DeployLedger, TrustGrade
 from concursus.governor import (
     AgentRegistry,
     GovernorLoop,
+    GovernorLoopError,
     InProcessCheckpointStore,
     InProcessEventQueue,
     KTLODaemon,
@@ -257,3 +258,93 @@ def test_e2e_governed_ktlo_standing_crew_over_real_supervisor(tmp_path):
     assert all(p.revision == 0 for p in result.episode_plans)
     # summarize was NEVER invoked across the whole standing run (held every episode).
     assert invoke.calls == ["ingest", "ingest", "ingest"]
+
+
+# == C-4 auto-checkpoint cadence (optimization: realize the bounded warm resume automatically) ==
+class _SpyCheckpointMemory(MemoryStateStore):
+    """A MemoryStateStore that counts checkpoint() calls, to prove the loop's auto-cadence fires."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.checkpoint_calls = 0
+
+    def checkpoint(self):
+        self.checkpoint_calls += 1
+        return super().checkpoint()
+
+
+def test_e2e_auto_checkpoint_fires_at_cadence_over_memory_store():
+    """checkpoint_every=1 makes the loop auto-compact the Memory log each round — so a long-running
+    loop stays warm-resumable WITHOUT the caller remembering to checkpoint (the C-4 gap 35e9g flagged)."""
+    invoke = _RecordingInvoke()
+    client = FilteringFakeMemoryClient()
+    store = _SpyCheckpointMemory(memory_id="m", session_id="S" * 40, actor_id="team-1", client=client)
+    loop = GovernorLoop(
+        "summarize the document", _manifests(),
+        store=store, invoke_fn=invoke, arns=_ARNS, backend="python",
+        plan_model_fn=_plan_model_fn, checkpoint_every=1,
+    )
+    result = loop.run({"uri": "s3://doc"})
+    assert set(result.completed) == {"ingest", "summarize"}
+    # The auto-cadence fired at the round boundary and wrote a real checkpoint event to the log.
+    assert store.checkpoint_calls >= 1
+    checkpoint_events = [e for e in client._events if e["metadata"].get("record_type") == "checkpoint"]
+    assert len(checkpoint_events) >= 1
+    # And a warm resume still reconstructs the projection identically (compaction is INV-5-safe).
+    warm = MemoryStateStore(
+        memory_id="m", session_id="S" * 40, actor_id="team-1",
+        client=FilteringFakeMemoryClient(events=list(client._events)),
+    )
+    warm.replay()
+    assert warm.completed() == {"ingest", "summarize"}
+
+
+def test_e2e_auto_checkpoint_default_off_is_byte_for_byte_unchanged():
+    """checkpoint_every defaults to 0 => the loop NEVER auto-checkpoints (today's behavior)."""
+    invoke = _RecordingInvoke()
+    client = FilteringFakeMemoryClient()
+    store = _SpyCheckpointMemory(memory_id="m", session_id="S" * 40, actor_id="team-1", client=client)
+    GovernorLoop(
+        "summarize the document", _manifests(),
+        store=store, invoke_fn=invoke, arns=_ARNS, backend="python", plan_model_fn=_plan_model_fn,
+    ).run({"uri": "s3://doc"})
+    assert store.checkpoint_calls == 0
+    assert not [e for e in client._events if e["metadata"].get("record_type") == "checkpoint"]
+
+
+def test_e2e_auto_checkpoint_noop_on_store_without_checkpoint(tmp_path):
+    """A store with no checkpoint() (the in-process default) silently no-ops the cadence — the loop
+    still completes; nothing raises."""
+    from concursus.state.statestore import InProcessStateStore
+
+    invoke = _RecordingInvoke()
+    loop = GovernorLoop(
+        "summarize the document", _manifests(),
+        store=InProcessStateStore(), invoke_fn=invoke, arns=_ARNS, backend="python",
+        plan_model_fn=_plan_model_fn, checkpoint_every=1,
+    )
+    result = loop.run({"uri": "s3://doc"})  # must not raise on the missing checkpoint()
+    assert set(result.completed) == {"ingest", "summarize"}
+
+
+def test_e2e_negative_checkpoint_every_rejected():
+    """checkpoint_every must be >= 0."""
+    with pytest.raises(GovernorLoopError):
+        GovernorLoop("g", _manifests(), checkpoint_every=-1)
+
+
+# == resume + deliberate reconcile (close the coverage gap: the 35e9f fix on the resume path) ==
+def test_e2e_deliberate_resume_reconciles_and_completes(tmp_path):
+    """deliberate=True composed with the outer checkpointer/resume path still reconciles the
+    deliberated DAG to the manifest topology and runs to completion — the 35e9f fix holds on resume
+    (which re-authors the round-0 DAG via _author_first_dag(resume=True) -> _reconcile_dag_with_manifests)."""
+    invoke = _RecordingInvoke()
+    loop = GovernorLoop(
+        "summarize the document", _manifests(),
+        deliberate=True, invoke_fn=invoke, arns=_ARNS, backend="python",
+        checkpointer=InProcessCheckpointStore(), run_id="delib-resume",
+    )
+    result = loop.run({"uri": "s3://doc"})
+    # The deliberated DAG reconciled to the manifest topology (no AlignmentError/AssemblyError).
+    assert set(result.completed) == {"ingest", "summarize"}
+    assert result.state.current_frozen_plan.order == ["ingest", "summarize"]

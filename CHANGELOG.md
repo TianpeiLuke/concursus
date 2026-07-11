@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`MemoryStateStore` checkpoint-compaction warm resume (opt-in).** A new `checkpoint()` writes one
+  append-only `CHECKPOINT` event carrying the compacted latest-per-node snapshot of the current
+  *epoch*, then rotates the epoch forward. A later `replay()` detects the latest checkpoint (via a
+  bounded `record_type=checkpoint` `EQUALS_TO` query), re-hydrates from its snapshot, and folds only
+  the open-epoch tail (a bounded `epoch=<n>` `EQUALS_TO` query) — so warm resume reads
+  **O(events-since-the-last-checkpoint)** instead of the whole session log (it lets a standing
+  KTLO-style loop scale). The append-only log stays the single source of truth — a checkpoint is a
+  *derived* snapshot, never deletes raw events, and any missing/undecodable snapshot (or
+  `replay(force_full=True)`) transparently falls back to the original full cold rebuild, which is
+  provably identical. With no checkpoint ever written the resume path is byte-for-byte unchanged.
+  This is the wire-supported form of the previously-rejected O(new) "watermark" resume: AgentCore
+  `ListEvents` has no range filter (only `EQUALS_TO | EXISTS | NOT_EXISTS`) and `nextToken` is an
+  opaque pagination cursor, so bounding is expressed with a discrete `epoch` equality tag, not a
+  `> watermark` range.
+
 ### Changed
 
 - **`deliberate.seed()` now REUSES a strong retrieved precedent instead of appending it

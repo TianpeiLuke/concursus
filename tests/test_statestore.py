@@ -460,3 +460,158 @@ def test_warm_resume_picks_up_concurrent_writer_events_via_full_replay():
     assert [(r.node, r.seq) for r in store.records()] == [(r.node, r.seq) for r in full.records()]
     for node in full.completed():
         assert store.get(node) == full.get(node)
+
+
+# == (d) C-4: checkpoint-compaction warm resume ==============================
+class FilteringFakeMemoryClient(FakeMemoryClient):
+    """A :class:`FakeMemoryClient` that HONORS the ``ListEvents`` ``filter`` (eventMetadata
+    EQUALS_TO), so the bounded checkpoint/tail fetches are actually proven — not vacuous.
+
+    Records every ``filter`` it was queried with (``self.filters``) so a test can assert the warm
+    resume issued the two bounded EQUALS_TO queries rather than scanning the whole log.
+    """
+
+    def __init__(self, events=None):
+        super().__init__(events)
+        self.filters = []  # every filter kwarg list_events was called with (None = unfiltered)
+
+    def list_events(self, **kwargs):
+        flt = kwargs.get("filter")
+        self.filters.append(flt)
+        base = super().list_events(**kwargs)
+        if not flt:
+            return base
+        # Apply eventMetadata EQUALS_TO (AND across expressions) exactly like the real API.
+        exprs = flt.get("eventMetadata", [])
+        kept = []
+        for ev in base["events"]:
+            meta = ev.get("metadata", {})
+            if all(
+                meta.get(e["left"]["metadataKey"]) == e["right"]["metadataValue"]
+                for e in exprs
+            ):
+                kept.append(ev)
+        return {"events": kept}
+
+
+def _fstore(client):
+    return MemoryStateStore(
+        memory_id="mem-1", session_id="S" * 40, actor_id="team-1", client=client
+    )
+
+
+def test_checkpoint_compaction_bounds_warm_resume():
+    """A warm resume re-hydrates from the checkpoint + only the open-epoch tail (bounded), and its
+    projection is IDENTICAL to a full cold replay of the same durable log."""
+    client = FilteringFakeMemoryClient()
+    store = _fstore(client)
+    # Window 0: two nodes complete, then checkpoint (compacts + rotates to epoch 1).
+    store.put("ingest", {"document": "DOC"})
+    store.put("summarize", {"summary": "SUM"}, meta={"consumes": ["ingest:$.document"]})
+    cp_id = store.checkpoint()
+    assert cp_id is not None
+    # Window 1: more work after the checkpoint.
+    store.put("critique", {"critique": "OK"}, meta={"consumes": ["summarize:$.summary"]})
+
+    # Warm resume in a FRESH store over the same durable log.
+    warm = _fstore(FilteringFakeMemoryClient(events=list(client._events)))
+    warm.replay()
+
+    # Correctness gate: identical to a FULL cold replay of the same log.
+    full = _fstore(FakeMemoryClient(events=list(client._events)))
+    full.replay(force_full=True)
+    assert warm.completed() == full.completed() == {"ingest", "summarize", "critique"}
+    for node in full.completed():
+        assert warm.get(node) == full.get(node)
+
+    # Bounded: the warm resume issued the two EQUALS_TO queries (checkpoint lookup + epoch tail),
+    # and NEVER an unfiltered whole-log scan.
+    warm_filters = warm._client.filters
+    assert any(_is_eq_filter(f, record_type="checkpoint") for f in warm_filters)
+    assert any(_is_eq_filter(f, epoch="1") for f in warm_filters)
+    assert all(f is not None for f in warm_filters), "warm resume must not do an unfiltered scan"
+
+
+def _is_eq_filter(flt, **pairs):
+    if not flt:
+        return False
+    got = {e["left"]["metadataKey"]: e["right"]["metadataValue"] for e in flt.get("eventMetadata", [])}
+    return all(got.get(k) == v for k, v in pairs.items())
+
+
+def test_warm_resume_equals_full_replay_multi_node_multi_window():
+    """Across several checkpoints + retries, warm resume == full replay (completed + get + attempts)."""
+    client = FilteringFakeMemoryClient()
+    store = _fstore(client)
+    store.put("a", {"v": 1})
+    store.put("a", {"v": 2})              # retry supersedes within window 0
+    store.checkpoint()                    # -> epoch 1
+    store.put("b", {"v": 3})
+    store.checkpoint()                    # -> epoch 2 (checkpoint of a window that also compacts a)
+    store.put("c", {"v": 4})
+
+    warm = _fstore(FilteringFakeMemoryClient(events=list(client._events)))
+    warm.replay()
+    full = _fstore(FakeMemoryClient(events=list(client._events)))
+    full.replay(force_full=True)
+
+    assert warm.completed() == full.completed() == {"a", "b", "c"}
+    for node in full.completed():
+        assert warm.get(node) == full.get(node)
+    assert warm.get("a") == {"v": 2}      # latest attempt survived the compaction
+
+
+def test_no_checkpoint_degrades_to_full_rebuild():
+    """With NO checkpoint ever written, replay is the full cold rebuild — byte-for-byte today's path."""
+    client = FilteringFakeMemoryClient()
+    store = _fstore(client)
+    store.put("a", {"v": 1})
+    store.put("b", {"v": 2})
+
+    warm = _fstore(FilteringFakeMemoryClient(events=list(client._events)))
+    warm.replay()  # no checkpoint present -> full rebuild
+
+    full = _fstore(FakeMemoryClient(events=list(client._events)))
+    full.replay(force_full=True)
+    assert warm.completed() == full.completed() == {"a", "b"}
+    assert [(r.node, r.seq) for r in warm.records()] == [(r.node, r.seq) for r in full.records()]
+
+
+def test_checkpoint_malformed_snapshot_falls_back_to_full_rebuild():
+    """A checkpoint whose snapshot is unusable must NEVER yield a wrong projection — full rebuild."""
+    client = FilteringFakeMemoryClient()
+    store = _fstore(client)
+    store.put("a", {"v": 1})
+    store.checkpoint()
+    store.put("b", {"v": 2})
+    # Corrupt the checkpoint event's blob (simulate an undecodable/legacy snapshot).
+    for ev in client._events:
+        if ev["metadata"].get("record_type") == "checkpoint":
+            ev["payload"] = [{"blob": json.dumps({"__checkpoint__": {"epoch": 0}})}]  # no "records"
+    warm = _fstore(FilteringFakeMemoryClient(events=list(client._events)))
+    warm.replay()  # malformed snapshot -> graceful full rebuild
+    assert warm.completed() == {"a", "b"}
+    assert warm.get("a") == {"v": 1} and warm.get("b") == {"v": 2}
+
+
+def test_checkpoint_event_carries_epoch_and_rotates():
+    """checkpoint() writes a CHECKPOINT event at the current epoch and rotates the store forward."""
+    client = FilteringFakeMemoryClient()
+    store = _fstore(client)
+    store.put("a", {"v": 1})
+    assert store._epoch == 0
+    store.checkpoint()
+    assert store._epoch == 1  # rotated
+    cp = [e for e in client._events if e["metadata"].get("record_type") == "checkpoint"]
+    assert len(cp) == 1 and cp[0]["metadata"]["epoch"] == "0"
+    store.put("b", {"v": 2})
+    b = [e for e in client._events if e["metadata"].get("node") == "b"][0]
+    assert b["metadata"]["epoch"] == "1"  # subsequent puts carry the rotated epoch
+
+
+def test_checkpoint_noop_on_empty_store():
+    """checkpoint() on a store with nothing written yet is a no-op (returns None, no event)."""
+    client = FilteringFakeMemoryClient()
+    store = _fstore(client)
+    assert store.checkpoint() is None
+    assert client.created == []

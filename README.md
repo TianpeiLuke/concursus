@@ -147,7 +147,11 @@ derived-DB discipline). Three backends share one Protocol:
 - **`MemoryStateStore`** — opt-in, AgentCore **Memory**-backed. Each validated output is one Blob
   event; a run **resumes by replaying** its event log, so it survives micro-VM teardown / mid-run
   crashes — the supervisor skips any node already `completed()`. boto3 is imported lazily (the
-  `[agentcore]` extra); pass `run --memory-id <id> [--actor-id <id>] --execute`.
+  `[agentcore]` extra); pass `run --memory-id <id> [--actor-id <id>] --execute`. For long-lived /
+  standing loops, an optional **`checkpoint()`** compacts the log so a warm resume reads only
+  **O(events-since-the-last-checkpoint)** (a `CHECKPOINT` snapshot event + an `epoch` tag, resumed
+  via bounded `EQUALS_TO` filters) instead of the whole session; the log stays the source of truth
+  and resume falls back to the full rebuild when no checkpoint is present.
 - **`FileVaultStateStore`** — opt-in, **persistent on-disk** (no AWS). Each record is written as a
   **round-trip-exact markdown note** under `<vault>/runs/<session>/` (two authoritative base64 JSON
   blobs — `meta` + `payload` — are the source of truth; everything else is a greppable display

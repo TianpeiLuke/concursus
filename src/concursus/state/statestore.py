@@ -137,6 +137,11 @@ class Record:
     event_id: Optional[str] = None
     address: Optional[str] = None
     blocked_on: Optional[str] = None
+    #: Checkpoint-compaction epoch (C-4). The monotonic window id current when this event was
+    #: written; a ``CHECKPOINT`` event compacts everything written at its own ``epoch`` and rotates
+    #: the store to ``epoch + 1``, so a warm resume can bound its tail fetch with an EQUALS_TO
+    #: filter on ``epoch``. ``None`` for a hand-built record or a store that never checkpointed.
+    epoch: Optional[int] = None
 
     def __post_init__(self) -> None:
         """Self-validate the typed fields: coerce ``status``/``record_type`` through their enums.
@@ -163,6 +168,23 @@ _META_KEYS: Tuple[str, ...] = (
 
 # The ``record_type`` marking a content-hash no-op re-put (identical to the latest output).
 _DEDUP_RECORD_TYPE = "dedup"
+
+# C-4: the ``record_type`` of a checkpoint-compaction event (a derived snapshot of the log).
+_CHECKPOINT_RECORD_TYPE = "checkpoint"
+
+
+def _metadata_equals_filter(**pairs: str) -> dict:
+    """Build a ``ListEvents`` ``FilterInput`` that ANDs an ``EQUALS_TO`` per metadata key.
+
+    Only the API-supported ``EQUALS_TO`` operator is used (there is no range/``>`` operator), and
+    at most 5 expressions are allowed — C-4 uses one or two, well within the limit.
+    """
+    return {
+        "eventMetadata": [
+            {"left": {"metadataKey": k}, "operator": "EQUALS_TO", "right": {"metadataValue": v}}
+            for k, v in pairs.items()
+        ]
+    }
 
 # The Folgezettel address separator (a materialized path: parent = strip the last segment).
 _ADDR_SEP = "/"
@@ -359,6 +381,12 @@ class MemoryStateStore:
         # put and per replayed event, it — not the AgentCore eventTimestamp — is the ordering
         # tie-breaker, so concurrent branch/retry writes resolve DETERMINISTICALLY on replay.
         self._clock: int = 0
+        # C-4 checkpoint-compaction: the current epoch (window id) tagged onto every put. A
+        # :meth:`checkpoint` compacts the window at ``_epoch`` and rotates to ``_epoch + 1``, so a
+        # warm :meth:`replay` re-hydrates from the latest checkpoint and fetches only the events
+        # tagged with the checkpoint's epoch (a bounded EQUALS_TO filter). ``0`` until the first
+        # checkpoint; a store that never checkpoints stays epoch 0 and resumes by full rebuild.
+        self._epoch: int = 0
         self._loaded = False
         # Reentrant: guards the read-then-write bodies (attempt++ / append / projection /
         # replay) so a future concurrent-dispatch supervisor cannot lose-update the cached
@@ -380,6 +408,7 @@ class MemoryStateStore:
                 attempt=attempt,
                 content_hash=content_hash(output),
                 seq=self._clock,
+                epoch=self._epoch,  # C-4: stamp the current checkpoint window
             )
             _apply_meta(record, meta)
             record.supersedes = meta.get("supersedes") or self._last_event_id.get(node)
@@ -425,68 +454,178 @@ class MemoryStateStore:
             self._ensure_loaded()
             return list(self._records)
 
-    # -- replay / resume ----------------------------------------------------
-    def replay(self) -> None:
-        """Rebuild the projection from the event log: paginate ``list_events`` (with payloads),
-        parse each event into a :class:`Record`, and keep the latest validated per node.
+    # -- checkpoint-compaction (C-4) ----------------------------------------
+    def checkpoint(self) -> Optional[str]:
+        """Write a compaction CHECKPOINT for the current epoch and rotate to the next (C-4).
 
-        This is the resume path — a run survives micro-VM teardown / mid-run crashes because
-        the supervisor re-reads the durable log rather than remembering.
+        SINGLE-WRITER-PER-SESSION — this store's ordering already relies on one writer per
+        ``(memory_id, actor_id, session_id)`` (the local ``_clock`` seq, not the ambiguous
+        AgentCore ``eventTimestamp``, is the tie-breaker), so ``checkpoint`` is called synchronously
+        by that one writer. It appends ONE event with ``record_type=checkpoint`` whose Blob payload
+        carries the COMPACTED latest-per-node records as-of now (one :class:`Record` per node — the
+        latest-overall, so ``completed()``/``get()``/attempts reconstruct identically), tagged with
+        the CURRENT ``_epoch``; then it rotates ``_epoch += 1`` so every subsequent :meth:`put`
+        carries the new window. The raw events are NEVER deleted — the append-only log stays the
+        single source of truth (INV-5); the checkpoint is a derived snapshot that only makes a warm
+        :meth:`replay` cheaper. Returns the checkpoint event id (``None`` if there is nothing to
+        compact yet).
 
-        Every call is a **full cold rebuild** of the whole session log from scratch: ``list_events``
-        is paginated end-to-end via its opaque ``nextToken`` continuation, ``seq`` is re-assigned
-        1..N in log order, and the ``_records`` / ``_projection`` / ``_attempts`` caches are
-        REPLACED (never appended to). This is deliberate and required for correctness — an O(new)
-        "watermark" resume is **not expressible on the AgentCore Memory data plane**, verified
-        against the ``ListEvents`` API reference (2024-02-28):
-
-        - ``nextToken`` is an opaque *pagination* cursor, and the response returns it as ``null``
-          "when there are no more results" — so a drained full replay leaves NO position token to
-          feed back in later to ask for "only what arrived since".
-        - ``ListEvents`` takes a ``filter`` (``FilterInput``), but its ``eventMetadata`` filter
-          operators are exactly ``EQUALS_TO | EXISTS | NOT_EXISTS`` — there is **no range/``>``
-          operator** and no created-after/timestamp-after parameter, so "events with seq/timestamp
-          greater than my watermark" cannot be expressed on the wire at all.
-
-        Consequently an "incremental" replay would either (a) re-read the WHOLE log anyway and
-        duplicate the retained prefix, or (b) against a hypothetical watermark-honoring client
-        silently drop a concurrent-writer event ordered before a locally-appended tail event. A
-        full rebuild is the only path that stays IDENTICAL to the durable log on every call — and it
-        is exactly the INV-5 discipline the governor relies on: re-derive the executed prefix from
-        the append-only log each round, never from a mutably-cached suffix. The projection is
-        idempotent, so re-reading is safe; a warm resume that picks up a concurrent writer's new
-        events is just another full replay.
+        Bounded-resume payoff: because everything written at the checkpoint's epoch is captured in
+        the snapshot and nothing more is ever tagged with that epoch (the rotation guarantees it), a
+        later resume re-hydrates from the snapshot and re-reads ONLY that epoch's events via a single
+        ``EQUALS_TO`` filter — O(events-in-window), never the whole log.
         """
         with self._lock:
-            records: List[Record] = []
-            seq = 0
-            token: Optional[str] = None
-            while True:
-                response = self._list_events(includePayloads=True, nextToken=token)
-                for event in response.get("events", []):
-                    seq += 1
-                    record = _event_to_record(event)
-                    # Assign the local strict-monotonic seq in log (pagination) order, so a
-                    # resumed store tie-breaks EXACTLY as the original run's put order did —
-                    # never on the ambiguous AgentCore eventTimestamp.
-                    record.seq = seq
-                    records.append(record)
-                token = response.get("nextToken")
-                if not token:
-                    break
+            self._ensure_loaded()
+            if not self._records:
+                return None
+            latest_overall, _, attempts = _index_records(self._records)
+            epoch = self._epoch
+            snapshot = {
+                "epoch": epoch,
+                "attempts": dict(attempts),
+                "records": [_record_to_snapshot(r) for r in latest_overall.values()],
+            }
+            metadata = {
+                "node": "__checkpoint__",
+                "attempt": "1",
+                "status": "validated",
+                "record_type": _CHECKPOINT_RECORD_TYPE,
+                "content_hash": content_hash(snapshot),
+                "epoch": str(epoch),
+            }
+            payload = [{"blob": json.dumps({"__checkpoint__": snapshot})}]
+            response = self._create_event(metadata=metadata, payload=payload)
+            # Rotate the window so no future put reuses this (now-compacted) epoch.
+            self._epoch = epoch + 1
+            return response.get("eventId")
 
-            self._clock = seq
-            latest_overall, latest_validated, attempts = _index_records(records)
-            self._records = records
-            self._projection = {node: r.output for node, r in latest_validated.items()}
-            self._attempts = attempts
-            self._last_event_id = {
-                node: r.event_id for node, r in latest_overall.items() if r.event_id
-            }
-            self._event_id_by_address = {
-                (r.address or r.node): r.event_id for r in records if r.event_id
-            }
-            self._loaded = True
+    # -- replay / resume ----------------------------------------------------
+    def replay(self, *, force_full: bool = False) -> None:
+        """Rebuild the projection from the event log; return ``None``.
+
+        Two paths, both producing an IDENTICAL ``completed()``/``get()``/``_projection``/
+        ``_attempts`` for the same durable log:
+
+        * **Warm (checkpoint fast-path, C-4)** — when a ``checkpoint`` event exists and
+          ``force_full`` is false: fetch only the checkpoint events (a bounded
+          ``record_type=checkpoint`` ``EQUALS_TO`` query), pick the latest by epoch, re-hydrate the
+          compacted latest-per-node records from its snapshot, then fetch ONLY that epoch's tail (a
+          bounded ``epoch=<E>`` ``EQUALS_TO`` query) and fold it in. Reads O(events-in-the-open-
+          window), not the whole log. This is safe under the single-writer model (see
+          :meth:`checkpoint`): a rotated epoch is closed, so no event can later appear at a folded
+          epoch. As defense-in-depth, any anomaly (missing/undecodable snapshot) falls back to the
+          full rebuild — the fast-path can never return a projection that differs from a cold replay.
+        * **Cold (full rebuild)** — no checkpoint, or ``force_full=True`` (e.g. a caller that needs
+          the full retry/attempt HISTORY in ``records()`` rather than the compacted latest-per-node
+          view): paginate the whole session end-to-end and replace the caches. This is the original
+          resume path; an O(new) "watermark" resume remains impossible on the data plane
+          (``nextToken`` is an opaque pagination cursor; the metadata filter has only
+          ``EQUALS_TO | EXISTS | NOT_EXISTS``, no range) — the epoch tag is the discrete key that
+          makes a *bounded* (not incremental-suffix) warm resume expressible.
+
+        NOTE on ``records()`` after a warm resume: it returns the COMPACTED latest-per-node records
+        plus the open-window tail, NOT every historical attempt. ``completed()``/``get()`` are
+        unaffected (they only ever use latest-per-node). Force ``replay(force_full=True)`` if the
+        full attempt history is required.
+        """
+        with self._lock:
+            if not force_full:
+                checkpoint = self._latest_checkpoint()
+                if checkpoint is not None:
+                    self._replay_from_checkpoint(checkpoint)
+                    return
+            self._full_rebuild()
+
+    def _full_rebuild(self) -> None:
+        """The cold path: paginate the entire session and REPLACE every cache (see :meth:`replay`)."""
+        events = self._paginate_events()
+        records: List[Record] = []
+        seq = 0
+        for event in events:
+            record = _event_to_record(event)
+            # A checkpoint event is a derived snapshot, NOT a node output — it must never enter the
+            # projection (else it would show up as a spurious completed node). Skip it on rebuild;
+            # the raw node events it compacted are all still in the log.
+            if record.record_type == _CHECKPOINT_RECORD_TYPE:
+                continue
+            seq += 1
+            # Local strict-monotonic seq in log (pagination) order, so a resumed store tie-breaks
+            # EXACTLY as the original run's put order did — never on the ambiguous eventTimestamp.
+            record.seq = seq
+            records.append(record)
+        self._install(records, clock=seq)
+
+    def _latest_checkpoint(self) -> Optional[Record]:
+        """Return the highest-epoch ``checkpoint`` event as a :class:`Record`, or ``None``.
+
+        A bounded ``record_type=checkpoint`` ``EQUALS_TO`` query — reads only checkpoint events
+        (one per checkpoint call), not the whole log.
+        """
+        events = self._paginate_events(
+            filter=_metadata_equals_filter(record_type=_CHECKPOINT_RECORD_TYPE)
+        )
+        best: Optional[Record] = None
+        for event in events:
+            rec = _event_to_record(event)
+            if rec.record_type != _CHECKPOINT_RECORD_TYPE:
+                continue  # a filter-ignoring client returned everything — skip non-checkpoints
+            if best is None or (rec.epoch or 0) >= (best.epoch or 0):
+                best = rec
+        return best
+
+    def _replay_from_checkpoint(self, checkpoint: Record) -> None:
+        """Warm path: re-hydrate from ``checkpoint``'s snapshot + fold the open-window tail (C-4)."""
+        snapshot = checkpoint.output if isinstance(checkpoint.output, dict) else {}
+        snap_records = snapshot.get("records")
+        cp_epoch = checkpoint.epoch
+        if not isinstance(snap_records, list) or cp_epoch is None:
+            # Malformed/legacy snapshot — never risk a wrong projection; do a full rebuild.
+            self._full_rebuild()
+            return
+
+        records: List[Record] = []
+        seq = 0
+        for raw in snap_records:
+            seq += 1
+            rec = _snapshot_to_record(raw)
+            rec.seq = seq  # compacted records sort BEFORE the tail (all pre-checkpoint)
+            records.append(rec)
+
+        # The open-window tail = events written AFTER the checkpoint. `checkpoint` captures the
+        # whole `cp_epoch` window into the snapshot then rotates to `cp_epoch + 1`, and — because
+        # this is the LATEST checkpoint (no later rotation) under a single writer — every
+        # post-checkpoint put carries exactly `cp_epoch + 1`. So a single bounded EQUALS_TO on that
+        # open epoch fetches the entire tail; the `cp_epoch` window needs no fetch (it is fully in
+        # the snapshot). A rotated epoch is closed, so this window is final.
+        open_epoch = cp_epoch + 1
+        tail = self._paginate_events(filter=_metadata_equals_filter(epoch=str(open_epoch)))
+        for event in tail:
+            rec = _event_to_record(event)
+            if rec.record_type == _CHECKPOINT_RECORD_TYPE:
+                continue  # the checkpoint marker is not a node output
+            seq += 1
+            rec.seq = seq
+            records.append(rec)
+
+        # Resume the open window so new puts never reuse a folded (compacted) epoch.
+        self._epoch = open_epoch
+        self._install(records, clock=seq)
+
+    def _install(self, records: List[Record], *, clock: int) -> None:
+        """Replace the caches from ``records`` (shared by the warm + cold paths)."""
+        self._clock = clock
+        latest_overall, latest_validated, attempts = _index_records(records)
+        self._records = records
+        self._projection = {node: r.output for node, r in latest_validated.items()}
+        self._attempts = attempts
+        self._last_event_id = {
+            node: r.event_id for node, r in latest_overall.items() if r.event_id
+        }
+        self._event_id_by_address = {
+            (r.address or r.node): r.event_id for r in records if r.event_id
+        }
+        self._loaded = True
 
     def _ensure_loaded(self) -> None:
         """Lazily :meth:`replay` the log exactly once before the first read."""
@@ -519,8 +658,16 @@ class MemoryStateStore:
         includePayloads: bool,
         maxResults: int = 100,
         nextToken: Optional[str] = None,
+        filter: Optional[dict] = None,
     ) -> dict:
-        """List this session's events (one page); returns ``{"events": [...], "nextToken"?}``."""
+        """List this session's events (one page); returns ``{"events": [...], "nextToken"?}``.
+
+        ``filter`` (C-4) is the documented ``ListEvents`` ``FilterInput`` — a
+        ``{"eventMetadata": [ {"left": {"metadataKey": k}, "operator": "EQUALS_TO",
+        "right": {"metadataValue": v}} ]}`` shape whose operators are exactly
+        ``EQUALS_TO | EXISTS | NOT_EXISTS`` (no range). Used to fetch ONLY checkpoint events or
+        ONLY a given epoch's tail, so a warm resume reads O(events-since-checkpoint), not the log.
+        """
         kwargs: Dict[str, Any] = {
             "memoryId": self._memory_id,
             "actorId": self._actor_id,
@@ -530,7 +677,21 @@ class MemoryStateStore:
         }
         if nextToken is not None:
             kwargs["nextToken"] = nextToken
+        if filter is not None:
+            kwargs["filter"] = filter
         return self._ensure_client().list_events(**kwargs)
+
+    def _paginate_events(self, *, filter: Optional[dict] = None) -> List[dict]:
+        """Fetch EVERY event matching ``filter`` (all pages, with payloads), in log order."""
+        events: List[dict] = []
+        token: Optional[str] = None
+        while True:
+            response = self._list_events(includePayloads=True, nextToken=token, filter=filter)
+            events.extend(response.get("events", []))
+            token = response.get("nextToken")
+            if not token:
+                break
+        return events
 
     def _ensure_client(self) -> Any:
         """Return the injected client, or lazily construct the boto3 data-plane default."""
@@ -566,7 +727,34 @@ def _build_metadata(record: Record) -> Dict[str, str]:
         metadata["supersedes"] = record.supersedes
     if record.address is not None:
         metadata["address"] = record.address
+    if record.epoch is not None:
+        metadata["epoch"] = str(record.epoch)  # C-4: the checkpoint window id (EQUALS_TO filterable)
     return metadata
+
+
+# C-4: the per-record fields a checkpoint snapshot round-trips (a compacted latest-per-node view).
+_SNAPSHOT_FIELDS: Tuple[str, ...] = (
+    "node", "output", "attempt", "status", "record_type", "schema", "producer",
+    "consumes", "supersedes", "content_hash", "event_id", "address", "epoch",
+)
+
+
+def _record_to_snapshot(record: Record) -> dict:
+    """Project a :class:`Record` to a JSON-safe dict for a checkpoint snapshot blob."""
+    return {f: getattr(record, f) for f in _SNAPSHOT_FIELDS}
+
+
+def _snapshot_to_record(raw: dict) -> Record:
+    """Rebuild a :class:`Record` from a checkpoint snapshot entry (see :func:`_record_to_snapshot`).
+
+    Consumes is normalized to a list; ``seq``/``timestamp`` are reassigned by the caller in resume
+    order, so they are intentionally omitted here.
+    """
+    data = {f: raw.get(f) for f in _SNAPSHOT_FIELDS}
+    consumes = data.get("consumes")
+    data["consumes"] = list(consumes) if isinstance(consumes, list) else []
+    data["output"] = data.get("output") or {}
+    return Record(**data)
 
 
 def _event_to_record(event: dict) -> Record:
@@ -593,6 +781,12 @@ def _event_to_record(event: dict) -> Record:
     except (TypeError, ValueError):
         attempt = 1
 
+    epoch_raw = meta.get("epoch")
+    try:
+        epoch = int(epoch_raw) if epoch_raw is not None and epoch_raw != "" else None
+    except (TypeError, ValueError):
+        epoch = None
+
     return Record(
         node=node,
         output=output,
@@ -607,4 +801,5 @@ def _event_to_record(event: dict) -> Record:
         timestamp=event.get("eventTimestamp"),
         event_id=event.get("eventId"),
         address=meta.get("address"),
+        epoch=epoch,
     )

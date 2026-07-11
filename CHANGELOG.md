@@ -24,6 +24,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`governor/` — the dynamic OUTER control loop that drives the shipped freeze compiler as
+  bounded episodes (opt-in, LangGraph-free by default).** concursus proper stays a COMPILER:
+  `assemble()`/`recompile()` turn a DAG + manifests into a frozen `ProvisioningPlan` VALUE and
+  `Supervisor.run` executes it in a single static forward pass. The new `governor` subpackage adds
+  a strictly-outer layer that runs a *bounded cycle around* that compiler — a **dynamic outer loop
+  hosting freeze inner episodes**: each round forms a FRESH frozen plan at the compiler front and
+  dispatches ONE new bounded episode. It never reaches inside a running `Supervisor`, never mutates
+  a frozen plan, and never turns the compiler into a runtime governor (identity invariants
+  INV-1..INV-5). **Entirely opt-in** — the zero-config path stays static `assemble` ->
+  `Supervisor.run`; you reach for the governor only when you want the cyclic driver. Modules:
+  - **`state.GovernorState`** (G-1) — persistent outer-loop state that holds the SEQUENCE of frozen
+    plan VALUEs by `plan_version` plus a POINTER to the append-only `StateStore` log (the sole
+    structural anchor of the executed prefix), never a mutable compiler plan. `advance` bumps the
+    version by swapping in a new plan formed at the compiler front; prior plan values stay
+    byte-identical. No `set_output`-style in-place edit exists (INV-3/INV-4/INV-5).
+  - **`loop.GovernorLoop`** (G-2/G-3/C-1/C-2/G-4) — the FIXED cyclic control loop, compiled once:
+    `planner -> router -> run_episode -> collect -> route_after_collect -> {planner | router |
+    synthesize} -> END`. `planner` forms a new frozen plan (first round `plan_from_goal` +
+    `assemble`, later rounds `recompile` — a fresh, monotonic, revision-bumped VALUE); `run_episode`
+    calls `Supervisor.run` ONCE to completion (one static pass, INV-1); `collect` folds the episode
+    outputs into the append-only log and re-derives the executed prefix from `store.completed()`
+    each round (never a mutable cache). Bounded four ways so it MUST terminate
+    (frontier-exhaustion / `no_progress_n` stall / `max_rounds` budget / a hard structural
+    `step_cap`). Mirrors the `DKSEngine` cyclic-driver template: LangGraph is an **optional** backend
+    imported LAZILY inside `_build_langgraph` (`backend="auto"|"python"|"langgraph"`), and the SAME
+    node functions + routing run via a pure-Python driver when it is absent — so `import concursus`
+    and the tests run with **no langgraph installed**. **C-1** re-declares the freeze boundary from
+    the log each round; **C-2** is the durable-store selection behind the `StateStore` Protocol seam
+    (in-process default, or a `MemoryStateStore` for durable dual resume — an outer `plan_version`
+    checkpoint + inner log replay). Exposes `GovernorResult`, `GovernorLoopError`, `GOV_NODES`, and
+    a `CheckpointStore` / `InProcessCheckpointStore`.
+  - **`scheduler.TrustLadderScheduler`** (S10-G6) — the `router` node's per-decision matcher. At
+    dispatch it matches each ready frontier step to a *standing* agent (via the read-only
+    `AgentRegistry`), reads that agent's *earned* trust off a GOV-side trust ladder, and returns a
+    `FrontierProposal` VALUE of the steps cleared to compile next (`DISPATCH`), those below-bar and
+    **escalated** L1->L3 (`ESCALATE`), and those with no serving agent (`UNMATCHED`). The proposal is
+    INPUT to the NEXT `recompile` — the scheduler never mutates a frozen plan, never calls
+    `assemble`/`recompile` itself, and never reaches into a running Supervisor (INV-3/INV-4).
+    `update_trust` — the ONLY place trust is (re)earned — is GOV-side only; `evaluate_deploy_gate`
+    remains the create-time seed the ladder READS once per agent, never per invocation (INV-5).
+  - **`registry.AgentRegistry`** (S9-G7) — the governor's **process table**, a read-only derived
+    view over the shipped `DeployLedger` that answers the dispatch-time question the ledger
+    deliberately does not (*"which standing agent, at which version, can do task X?"*). It groups
+    `ledger.rows()` into one current-version row per agent name (`AgentVersion`, newest fingerprint
+    wins, mirroring `DeployLedger.lookup`), matches a task to the current version whose declared
+    capabilities cover it, and offers on-demand spawn/fork by delegating to the shipped
+    `provision_agent` actuator (never a new deploy path). Capability metadata is registry-side and
+    never written back into the content-identity-only ledger; the registry is a rebuildable
+    projection (INV-5).
+  - **`cockpit.DirectorCockpit`** (S6-G5) — a read-only director view v0 that composes three
+    surfaces out of already-shipped read models: a **briefing** (`render_precedent_hub` +
+    `Supervisor.summary`), an **exception queue** (`RunIndex.query(status="failed")` +
+    `summary().failed`), and a **runs monitor** (`RunIndex` metadata + plan-version / progress). It
+    SELECTS nothing, SEEDS nothing, SCHEDULES nothing, and re-derives every view from the
+    append-only log on each call (INV-5).
+  - **`ktlo.KTLODaemon`** (S11-G8) — a standing "keep-the-lights-on" monitor *above* the loop that
+    wraps `monitor -> triage -> escalate -> (replan | close)` over a live `EventSource`: it wakes on
+    event arrival + drift, triages each signal (`TRIAGE_CLOSE` / `TRIAGE_INVESTIGATE` /
+    `TRIAGE_ESCALATE`), and per triggered investigation dispatches ONE fresh bounded `GovernorLoop`
+    episode over a fresh store. `LAUNCH` (one-shot drain) vs `KTLO` (standing cyclic, bounded by a
+    hard `max_ticks`) is a CONFIG on the same machinery, not two code paths. The daemon only
+    ENQUEUES episodes; it never reaches inside a running `Supervisor` and holds no mutable plan — N
+    events => N independent, bounded, replayable-in-isolation episodes; a failing episode is recorded
+    and the daemon survives (INV-1/INV-4). Ships an `InProcessEventQueue` / `ScriptedEventSource`.
+  - **`scope`** (S12-G9) — the program/portfolio layer *above* the single-run unit: an
+    `org -> portfolio -> program -> task` `ScopeAddress` stack, a `build_programs_index` /
+    `render_programs_index` cross-program memory synthesis at PROGRAM grain (the program-grain
+    analogue of the runs-grain precedent hub), and a 1:N `director_leverage_view` (one director over
+    many programs, each hosting many KTLO episodes). Pure GOV aggregation over READ MODELS — a
+    read-only projection over the per-run precedent notes loaded via `load_precedents`; it calls no
+    `assemble()`/`recompile()`/`Supervisor.run()`/`StateStore.put()`, drives no dispatch, and
+    regenerates byte-identically from the notes each call (INV-5).
+- **C-3 core seams (identity-preserving, wiring shipped machinery into the dispatch path)** —
+  - **C-3a `Supervisor` pre-dispatch structural gate** — the constructor now projects the frozen
+    plan (`plan.order` nodes + `plan.wiring` `AgentRef` edges) into a `RunGraph` and runs the
+    already-shipped `RunGraph.validate()` ONCE, rejecting a dangling `AgentRef` (a wire naming a
+    producer absent from `plan.order`) or a cycle **before the first invoke** (raising
+    `RunGraphError`) — the structural complement to the per-output `validate_output` shape check.
+    Evaluated once at construction; `run()` stays an untouched single static forward pass (INV-1),
+    closing the gap that `RunGraph.validate` shipped but was never called in the dispatch path.
+  - **C-3b `MemoryStateStore.replay()` documented as a full cold rebuild** — `replay()` remains a
+    full end-to-end re-read of the session log (caches REPLACED, never appended) with an inline
+    rationale for why an O(new) watermark is NOT wire-supported: AgentCore's `nextToken` is an
+    opaque pagination cursor, not an "events-after-eventId" filter, so an incremental replay would
+    either re-read + duplicate the retained prefix or silently drop a concurrent writer's
+    earlier-ordered event. The full rebuild is the only path that stays identical to the durable log
+    on every call — exactly the INV-5 discipline the governor relies on (re-derive the executed
+    prefix from the append-only log each round, never from a mutably-cached suffix).
+- **Public API** — `GovernorState`, `GovernorLoop`, `GovernorLoopError`, `GovernorResult`,
+  `CheckpointStore`, `InProcessCheckpointStore`, `GOV_NODES`, `TrustLadderScheduler`,
+  `ScheduleDecision`, `FrontierProposal`, `SchedulerError`, `DISPATCH`/`ESCALATE`/`UNMATCHED`,
+  `AgentRegistry`, `AgentVersion`, `RegistryError`, `DirectorCockpit`, `KTLODaemon`,
+  `KTLODaemonError`, `KTLOResult`, `EventSource`, `InProcessEventQueue`, `ScriptedEventSource`,
+  `LAUNCH`/`KTLO`/`TRIAGE_CLOSE`/`TRIAGE_INVESTIGATE`/`TRIAGE_ESCALATE`, `ScopeAddress`,
+  `ScopeError`, `SCOPE_LEVELS`/`SCOPE_SEP`, `build_programs_index`, `render_programs_index`,
+  `programs_dir`, and `director_leverage_view` are now exported from `concursus`.
 - **Reasoning-substrate tier (Phase 5, opt-in, LLM/LangGraph-free by default)** — the plan is
   FORMED by bounded deliberation strictly BEFORE `assemble`, then LOWERED to a frozen `AgentDAG`;
   `Supervisor.run` is untouched. Every model/agent seam is injected with deterministic-stub

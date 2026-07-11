@@ -125,7 +125,26 @@ from .reasoning.inner_graph import (
 from .reasoning.deliberate import form_plan, lower_to_dag, seed
 from .governor.state import GovernorState
 from .governor.cockpit import DirectorCockpit
+from .governor.scope import (
+    SCOPE_LEVELS,
+    SCOPE_SEP,
+    ScopeAddress,
+    ScopeError,
+    build_programs_index,
+    director_leverage_view,
+    programs_dir,
+    render_programs_index,
+)
 from .governor.registry import AgentRegistry, AgentVersion, RegistryError
+from .governor.scheduler import (
+    DISPATCH,
+    ESCALATE,
+    UNMATCHED,
+    FrontierProposal,
+    ScheduleDecision,
+    SchedulerError,
+    TrustLadderScheduler,
+)
 from .governor.loop import (
     GOV_NODES,
     CheckpointStore,
@@ -133,6 +152,19 @@ from .governor.loop import (
     GovernorLoopError,
     GovernorResult,
     InProcessCheckpointStore,
+)
+from .governor.ktlo import (
+    KTLO,
+    LAUNCH,
+    TRIAGE_CLOSE,
+    TRIAGE_ESCALATE,
+    TRIAGE_INVESTIGATE,
+    EventSource,
+    InProcessEventQueue,
+    KTLODaemon,
+    KTLODaemonError,
+    KTLOResult,
+    ScriptedEventSource,
 )
 
 __all__ = [
@@ -148,9 +180,24 @@ __all__ = [
     "BuildPlanEntry",
     "OrchestrationAssembler",
     "DirectorCockpit",
+    "ScopeAddress",
+    "ScopeError",
+    "SCOPE_LEVELS",
+    "SCOPE_SEP",
+    "build_programs_index",
+    "programs_dir",
+    "render_programs_index",
+    "director_leverage_view",
     "AgentRegistry",
     "AgentVersion",
     "RegistryError",
+    "TrustLadderScheduler",
+    "ScheduleDecision",
+    "FrontierProposal",
+    "SchedulerError",
+    "DISPATCH",
+    "ESCALATE",
+    "UNMATCHED",
     "ProvisioningPlan",
     "AssemblyError",
     "MonotonicityError",
@@ -223,5 +270,16 @@ __all__ = [
     "CheckpointStore",
     "InProcessCheckpointStore",
     "GOV_NODES",
+    "KTLODaemon",
+    "KTLODaemonError",
+    "KTLOResult",
+    "EventSource",
+    "InProcessEventQueue",
+    "ScriptedEventSource",
+    "LAUNCH",
+    "KTLO",
+    "TRIAGE_CLOSE",
+    "TRIAGE_INVESTIGATE",
+    "TRIAGE_ESCALATE",
     "__version__",
 ]

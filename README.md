@@ -173,6 +173,67 @@ outputs = sup.run({"uri": "s3://doc"})   # {node_id: output_dict}
 sup.context("critique")                  # {producer: output} for its transitive upstream
 ```
 
+## The governor (opt-in dynamic outer loop)
+
+The compiler and supervisor are **static**: `assemble` freezes one `ProvisioningPlan` and
+`Supervisor.run` executes it in a single forward pass. When you want a *dynamic* control loop —
+standing "keep-the-lights-on" monitoring, replan-on-signal, program/portfolio rollups — the
+**`governor`** subpackage wraps a **bounded cycle around** the compiler. The design is a **dynamic
+outer loop hosting freeze inner episodes**: each round the governor forms a *fresh frozen plan* at
+the compiler front and dispatches *one* new bounded `Supervisor.run` episode. It never reaches
+inside a running supervisor, never mutates a frozen plan, and never turns the compiler into a
+runtime governor — the compiler-not-runtime-governor identity holds.
+
+**It is entirely opt-in.** The zero-config path stays static `assemble` → `Supervisor.run`; you
+reach for the governor only when you want the cyclic driver. Like the reasoning tier, **LangGraph
+stays optional** — the loop mirrors the `DKSEngine` template (lazy import, pure-Python fallback), so
+everything imports and runs with no langgraph installed.
+
+```python
+from concursus import GovernorLoop
+
+# A bounded cycle: planner (assemble/recompile) -> router -> run_episode (one Supervisor.run)
+# -> collect -> {replan | synthesize}. Terminates on frontier-exhaustion / stall / max_rounds
+# / a hard step_cap. backend="auto" uses LangGraph if present, else the pure-Python driver.
+loop = GovernorLoop(goal="triage-abuse-signal", manifests=manifests, max_rounds=8)
+result = loop.run({"uri": "s3://signal"})   # GovernorResult: plan sequence + folded episode log
+```
+
+The subpackage is layered strictly outside the compiler (identity invariants INV-1..INV-5):
+
+- **`GovernorState`** — persistent outer-loop state: the *sequence* of frozen plan VALUEs by
+  `plan_version` + a pointer to the append-only `StateStore` log (the sole executed-prefix anchor),
+  never a mutable compiler plan.
+- **`GovernorLoop`** — the fixed cyclic driver. `planner` forms a fresh frozen plan each round
+  (first via `plan_from_goal` + `assemble`, later via monotonic `recompile`); `run_episode` calls
+  `Supervisor.run` once; `collect` folds outputs into the log and re-derives the executed prefix
+  from `store.completed()`. Durable dual resume (outer `plan_version` checkpoint + inner log replay)
+  when backed by a `MemoryStateStore`.
+- **`TrustLadderScheduler`** — the `router`'s per-decision matcher: matches each ready step to a
+  standing agent (read-only `AgentRegistry`), reads its *earned* trust, and proposes a frontier
+  (`DISPATCH` / `ESCALATE` L1→L3 / `UNMATCHED`) that feeds the *next* `recompile` — never mutating a
+  frozen plan.
+- **`AgentRegistry`** — the governor's process table: a read-only versioned view over the shipped
+  `DeployLedger` answering *"which standing agent, at which version, can do task X?"* (the ledger
+  answers content-identity only). Spawn/fork delegate to the shipped `provision_agent`.
+- **`DirectorCockpit`** — a read-only director view composing a briefing, an exception queue, and a
+  runs monitor purely out of `render_precedent_hub` + `Supervisor.summary()`/`.index()`.
+- **`KTLODaemon`** — a standing monitor above the loop (`monitor → triage → escalate → replan |
+  close`) that wakes on a live `EventSource` + drift and dispatches one fresh bounded episode per
+  investigation. `LAUNCH` (one-shot drain) vs `KTLO` (standing, `max_ticks`-bounded) is a config,
+  not two code paths.
+- **`scope`** — the `org → portfolio → program → task` layer above the single run: a `ScopeAddress`
+  stack, a cross-program programs index (the program-grain analogue of the runs-grain precedent
+  hub), and a 1:N `director_leverage_view` — all read-only projections over the per-run precedent
+  notes.
+
+Two shipped-but-idle core seams are now wired into the dispatch path (**C-3**, identity-preserving):
+the `Supervisor` constructor runs the shipped `RunGraph.validate()` **once** as a pre-dispatch
+structural gate (a dangling `AgentRef` or cycle is rejected before the first invoke; `run()` stays a
+single static pass), and `MemoryStateStore.replay()` is documented as a full cold rebuild — the
+INV-5-correct choice, since AgentCore's `nextToken` is an opaque pagination cursor, not an
+events-after filter.
+
 ## Roadmap
 
 - [x] Declarative core: `AgentDAG` + `AgentManifest` (`.agent.yaml`) + validation + CLI
@@ -181,6 +242,7 @@ sup.context("critique")                  # {producer: output} for its transitive
 - [x] The supervisor: topological dispatch over `InvokeAgentRuntime` with `AgentRef` wiring + one stable `runtimeSessionId`
 - [x] `plan` / `deploy` / `run` CLI verbs (deploy/run `--execute` bind boto3 lazily)
 - [x] Memory-backed shared run state (the `StateStore` seam: in-process default / AgentCore Memory opt-in, replay-resume, the AgentRef link graph + `context(node)`)
+- [x] The governor: an opt-in dynamic outer loop (`GovernorLoop` / `TrustLadderScheduler` / `AgentRegistry` / `DirectorCockpit` / `KTLODaemon` / `scope`) that drives the freeze compiler as bounded episodes (LangGraph optional)
 - [ ] Gateway/A2A node types; a data-driven catalog + recommender of team topologies
 
 ## License

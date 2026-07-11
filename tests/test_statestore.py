@@ -408,3 +408,55 @@ def test_memory_replay_paginates_next_token():
     assert store.completed() == {"a", "b"}
     assert store.get("a") == {"v": 1}
     assert store.get("b") == {"v": 2}
+
+
+# == (e) warm resume: a repeated replay stays IDENTICAL to a single full replay =======
+def test_replay_is_idempotent_full_rebuild_against_reference_fake():
+    """AgentCore's ``nextToken`` is an OPAQUE pagination continuation, not an "events after this
+    eventId" filter, so ``replay()`` must be a full cold rebuild of the whole log each call. A
+    repeated replay against the SHIPPED reference ``FakeMemoryClient`` (which — like the real API
+    — ignores ``nextToken`` as a watermark and returns the whole log) must NOT duplicate the
+    already-loaded prefix; ``records()`` stays byte-for-byte a single full replay.
+    """
+    prior = [
+        _seed_event("ingest", {"document": "DOC"}, 1),
+        _seed_event("summarize", {"summary": "SUM"}, 1, consumes=["ingest:$.document"]),
+    ]
+    client = FakeMemoryClient(events=prior)
+    store = _store(client)
+    store.replay()
+    store.replay()  # a SECOND replay must not append the log to itself.
+
+    # exactly one record per logged event, seq re-assigned 1..N in log order (no duplication).
+    assert [(r.node, r.seq) for r in store.records()] == [("ingest", 1), ("summarize", 2)]
+    assert store.completed() == {"ingest", "summarize"}
+
+
+def test_warm_resume_picks_up_concurrent_writer_events_via_full_replay():
+    """A warm resume that re-reads the durable log to pick up a concurrent writer's new events is
+    just another full replay: after a peer appends events to the SAME session, a re-``replay()``
+    yields a projection IDENTICAL to a fresh cold replay of the whole log — validated against the
+    reference ``FakeMemoryClient`` (real ``nextToken`` semantics), not a bespoke watermark fake.
+    """
+    prior = [
+        _seed_event("ingest", {"document": "DOC"}, 1),
+        _seed_event("summarize", {"summary": "SUM"}, 1, consumes=["ingest:$.document"]),
+    ]
+    client = FakeMemoryClient(events=prior)
+    store = _store(client)
+    store.replay()
+    assert store.completed() == {"ingest", "summarize"}
+
+    # A concurrent writer appends two MORE events to the same session log.
+    client._events.append(_seed_event("critique", {"critique": "OK"}, 1))
+    client._events.append(_seed_event("format", {"formatted": "F"}, 1))
+
+    store.replay()  # warm resume — a full rebuild that transparently sees the peer's events.
+
+    # the projection is IDENTICAL to a full cold replay of the whole 4-event log, no duplicates.
+    full = _store(FakeMemoryClient(events=list(client._events)))
+    full.replay()
+    assert store.completed() == full.completed()
+    assert [(r.node, r.seq) for r in store.records()] == [(r.node, r.seq) for r in full.records()]
+    for node in full.completed():
+        assert store.get(node) == full.get(node)

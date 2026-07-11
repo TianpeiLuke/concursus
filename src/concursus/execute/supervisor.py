@@ -152,6 +152,30 @@ class Supervisor:
         for node, arn in supplied.items():  # arns for nodes lacking a manifest
             self._arns.setdefault(node, arn)
 
+        # C-3: a ONE-TIME pre-dispatch structural gate (INV-1: not a runtime loop). Project the
+        # frozen plan (plan.order nodes + plan.wiring AgentRef edges) into a RunGraph and run its
+        # shipped validate() — rejecting a dangling AgentRef (a wire naming a producer absent from
+        # plan.order) or a cycle BEFORE the first invoke, the structural complement to the
+        # per-output validate_output shape check. Evaluated once here at construction; run() stays
+        # an untouched single static forward pass.
+        self._validate_plan_structure()
+
+    def _validate_plan_structure(self) -> None:
+        """Reject a structurally-invalid plan (dangling AgentRef / cycle) before any dispatch.
+
+        Builds a :class:`~concursus.rungraph.RunGraph` from ``plan.order`` (the node set) and the
+        ``plan.wiring`` :class:`AgentRef` edges (``ref.producer -> node`` at ``ref.path``), then
+        calls the shipped :meth:`RunGraph.validate`. Raises :class:`RunGraphError` if a wire names
+        a producer that is not a planned node, or if the wiring contains a cycle. A one-time
+        construction-time check — never a runtime loop, so :meth:`run` stays a static single pass.
+        """
+        nodes = list(self._plan.order)
+        edges: List[tuple] = []
+        for node in nodes:
+            for ref in self._plan.wiring.get(node, []):
+                edges.append((ref.producer, node, ref.path))
+        RunGraph.from_edges(nodes, edges).validate()
+
     @property
     def session_id(self) -> str:
         """The stable per-run ``runtimeSessionId`` shared across every invoke."""

@@ -432,11 +432,27 @@ class MemoryStateStore:
 
         This is the resume path — a run survives micro-VM teardown / mid-run crashes because
         the supervisor re-reads the durable log rather than remembering.
+
+        Every call is a **full cold rebuild** of the whole session log from scratch: ``list_events``
+        is paginated end-to-end via its opaque ``nextToken`` continuation, ``seq`` is re-assigned
+        1..N in log order, and the ``_records`` / ``_projection`` / ``_attempts`` caches are
+        REPLACED (never appended to). This is deliberate and required for correctness:
+        AgentCore's ``nextToken`` is an opaque pagination cursor, NOT an "events after this
+        eventId" filter — there is no wire-supported way to ask for only the suffix written since a
+        prior replay, so an "incremental" replay that fed a stored eventId back in as ``nextToken``
+        would (a) against the real API / the reference fake re-read the WHOLE log and duplicate the
+        retained prefix, and (b) even against a watermark-honoring client silently drop any
+        concurrent-writer event ordered before a locally-appended tail event. A full rebuild is the
+        only path that stays IDENTICAL to the durable log on every call — and it is exactly the
+        INV-5 discipline the governor relies on: re-derive the executed prefix from the append-only
+        log each round, never from a mutably-cached suffix. The projection is idempotent, so
+        re-reading is safe; a warm resume that picks up a concurrent writer's new events is just
+        another full replay.
         """
         with self._lock:
             records: List[Record] = []
-            token: Optional[str] = None
             seq = 0
+            token: Optional[str] = None
             while True:
                 response = self._list_events(includePayloads=True, nextToken=token)
                 for event in response.get("events", []):

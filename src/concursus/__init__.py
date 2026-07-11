@@ -123,6 +123,17 @@ from .reasoning.inner_graph import (
     partition_frontier,
 )
 from .reasoning.deliberate import form_plan, lower_to_dag, seed
+from .governor.state import GovernorState
+from .governor.cockpit import DirectorCockpit
+from .governor.registry import AgentRegistry, AgentVersion, RegistryError
+from .governor.loop import (
+    GOV_NODES,
+    CheckpointStore,
+    GovernorLoop,
+    GovernorLoopError,
+    GovernorResult,
+    InProcessCheckpointStore,
+)
 
 __all__ = [
     "AgentDAG",
@@ -136,6 +147,10 @@ __all__ = [
     "RuntimeBuilderFactory",
     "BuildPlanEntry",
     "OrchestrationAssembler",
+    "DirectorCockpit",
+    "AgentRegistry",
+    "AgentVersion",
+    "RegistryError",
     "ProvisioningPlan",
     "AssemblyError",
     "MonotonicityError",
@@ -201,5 +216,12 @@ __all__ = [
     "evaluate_deploy_gate",
     "DeployLedger",
     "DeployRow",
+    "GovernorState",
+    "GovernorLoop",
+    "GovernorLoopError",
+    "GovernorResult",
+    "CheckpointStore",
+    "InProcessCheckpointStore",
+    "GOV_NODES",
     "__version__",
 ]

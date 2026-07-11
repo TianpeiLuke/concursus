@@ -11,7 +11,8 @@ import types
 import pytest
 
 from concursus import AgentDAG, AgentManifest
-from concursus.core.resolve import resolve_edges
+from concursus.core.resolve import AgentRef, resolve_edges
+from concursus.state.rungraph import RunGraphError
 from concursus.state.statestore import InProcessStateStore
 from concursus.execute.supervisor import (
     _ARN_PLACEHOLDER,
@@ -563,6 +564,35 @@ def test_arn_resolver_confirming_compiled_arn_invokes_normally():
     assert outputs["critique"] == {"critique": "OK"}
     assert sorted(seen) == ["critique", "ingest", "summarize"]  # resolver consulted per node
     assert len(fake.calls) == 3
+
+
+# -- C-3: pre-dispatch structural validation (dangling AgentRef) ------------
+def test_dispatch_rejects_dangling_agentref_before_invoke():
+    # A plan whose wiring names a producer NOT present in plan.order is structurally invalid;
+    # the shipped RunGraph.validate must reject it at construction, before any invoke fires.
+    dag, manifests = _chain()
+    good = _plan(dag, manifests)
+    # Inject a dangling wire: 'critique' consumes a 'ghost' node that is not in plan.order.
+    dangling_wiring = dict(good.wiring)
+    dangling_wiring["critique"] = list(dangling_wiring.get("critique", [])) + [
+        AgentRef(producer="ghost", path="$.x", input_name="summary")
+    ]
+    bad_plan = types.SimpleNamespace(order=list(good.order), wiring=dangling_wiring)
+
+    fake = FakeInvoker(_fake_outputs())
+    # The structural gate fires in __init__ (before run), so no invoke ever happens.
+    with pytest.raises(RunGraphError, match="ghost"):
+        Supervisor(bad_plan, manifests, invoke_fn=fake, arns=_ARNS)
+    assert fake.calls == []  # no invoke fired: rejected pre-dispatch
+
+
+def test_dispatch_accepts_well_formed_plan_structure():
+    # Regression guard: a well-formed plan passes the C-3 structural gate untouched.
+    dag, manifests = _chain()
+    fake = FakeInvoker(_fake_outputs())
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS)
+    outputs = sup.run({"uri": "s3://doc"})
+    assert set(outputs) == {"ingest", "summarize", "critique"}
 
 
 # -- state store seam: diamond DAG + graph-aware context + resume -----------

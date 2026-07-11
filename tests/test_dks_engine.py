@@ -7,6 +7,7 @@ returns the right band per score, an injected AI-32 ``policy=`` overrides routin
 the engine needs neither langgraph nor a model. Nothing here touches ``Supervisor.run``.
 """
 
+import importlib.util
 import sys
 
 import pytest
@@ -24,8 +25,18 @@ from concursus.reasoning.dks_engine import (
 )
 from concursus.reasoning.trailstore import HypothesisTrail, ThreadNotResolved, require_resolved
 
+#: Whether langgraph is importable in THIS interpreter. The engine default (``backend="auto"``)
+#: upgrades to the langgraph StateGraph when it is present and falls back to the pure-Python driver
+#: when it is absent, so the "needs no langgraph" premise tests below are skipped when langgraph is
+#: installed (that path is validated by the langgraph-present branch here + the governor loop tests).
+LANGGRAPH_INSTALLED = importlib.util.find_spec("langgraph") is not None
+
 
 # -- (i) runs to termination on a stub investigator with NO langgraph -------
+@pytest.mark.skipif(
+    LANGGRAPH_INSTALLED,
+    reason="asserts the pure-Python fallback premise; langgraph present would auto-upgrade the backend",
+)
 def test_engine_runs_to_termination_pure_python_fallback(tmp_path):
     """With langgraph absent, the pure-Python fallback drives the cycle to a resolved frontier."""
     assert "langgraph" not in sys.modules  # sanity: no langgraph in this suite
@@ -94,6 +105,10 @@ def test_engine_rejects_bad_config():
         DKSEngine(_FakeTrail(), max_rounds=0)
 
 
+@pytest.mark.skipif(
+    LANGGRAPH_INSTALLED,
+    reason="asserts backend='langgraph' raises when langgraph is absent; skip when it is installed",
+)
 def test_engine_langgraph_backend_raises_when_missing(tmp_path):
     """Explicitly requesting the langgraph backend when it is absent raises (never a hard dep)."""
     trail = HypothesisTrail(tmp_path / "run")
@@ -101,6 +116,31 @@ def test_engine_langgraph_backend_raises_when_missing(tmp_path):
     engine = DKSEngine(trail, backend="langgraph")
     with pytest.raises(DKSEngineError):
         engine.run(root)
+
+
+@pytest.mark.skipif(
+    not LANGGRAPH_INSTALLED,
+    reason="exercises the langgraph StateGraph backend; requires the optional 'reasoning' extra",
+)
+def test_engine_langgraph_backend_runs_when_present(tmp_path):
+    """With langgraph installed, both backend='langgraph' and 'auto' run the SAME cyclic
+    deliberation via the StateGraph path and converge identically to the pure-Python driver."""
+    trail = HypothesisTrail(tmp_path / "run")
+    root = trail.fanout_root_hypotheses("why did the deploy fail?", ["h"])[0]
+
+    def investigator(h):
+        if h.depth < 1:
+            return ["sharper-1", "sharper-2"]
+        return {"verdict": "ACCEPT", "evidence": {"seen": h.text}}
+
+    for backend in ("langgraph", "auto"):
+        t2 = HypothesisTrail(tmp_path / backend)
+        r2 = t2.fanout_root_hypotheses("why did the deploy fail?", ["h"])[0]
+        engine = DKSEngine(t2, investigator=investigator, max_rounds=8, backend=backend)
+        result = engine.run(r2)
+        assert result.backend == "langgraph"  # present → StateGraph path taken
+        assert result.converged is True
+        assert result.frontier == []
 
 
 # -- (iii) route_by_confidence bands for 0.9 / 0.7 / 0.3 --------------------
@@ -180,7 +220,12 @@ def test_engine_uses_injected_policy_on_challenge_step(tmp_path):
 
 # -- (v) importing concursus + constructing the engine needs no langgraph ---
 def test_import_and_construct_need_no_langgraph_or_llm(tmp_path):
-    assert "langgraph" not in sys.modules
+    # The invariant is that concursus never HARD-imports langgraph: importing + constructing must
+    # not require it. When langgraph is installed a prior test may have imported it into
+    # sys.modules, so the "not in sys.modules" sanity checks apply only when it is absent (the
+    # zero-dependency system-python run enforces them); the model-free construction always holds.
+    if not LANGGRAPH_INSTALLED:
+        assert "langgraph" not in sys.modules
     import concursus  # top-level import must not pull langgraph/LLM
 
     assert hasattr(concursus, "DKSEngine")
@@ -188,7 +233,8 @@ def test_import_and_construct_need_no_langgraph_or_llm(tmp_path):
     trail = HypothesisTrail(tmp_path / "run")
     engine = concursus.DKSEngine(trail)  # construction is model-free
     assert isinstance(engine, concursus.DKSEngine)
-    assert "langgraph" not in sys.modules  # still not imported after constructing
+    if not LANGGRAPH_INSTALLED:
+        assert "langgraph" not in sys.modules  # still not imported after constructing
 
 
 class _FakeTrail:

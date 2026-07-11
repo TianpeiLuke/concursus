@@ -16,6 +16,9 @@ Everything is offline: a fake Supervisor + an :class:`InProcessStateStore`, no A
 """
 
 import copy
+import importlib.util
+
+import pytest
 
 from concursus import (
     AgentDAG,
@@ -28,6 +31,11 @@ from concursus import (
 )
 from concursus.governor import GovernorLoop as GovernorLoopFromSubpkg
 from concursus.state.statestore import InProcessStateStore, MemoryStateStore
+
+#: Whether langgraph is importable here. GovernorLoop(backend="auto") upgrades to the langgraph
+#: StateGraph when present and falls back to the pure-Python driver when absent — so an
+#: auto-backend run reports "python" only in the zero-dependency environment.
+LANGGRAPH_INSTALLED = importlib.util.find_spec("langgraph") is not None
 
 # pytest inserts the tests/ dir onto sys.path, so the shipped fake AgentCore data-plane client
 # (create_event / list_events) can be reused here — no boto3, no AWS.
@@ -191,10 +199,11 @@ def test_langgraph_absent_python_backend_runs():
         backend="python",
     )
     result = loop.run({"uri": "s3://doc"})
-    assert result.backend == "python"
+    assert result.backend == "python"  # explicit backend='python' always uses the pure driver
     assert result.done is True
     assert fake.run_count >= 1
-    # 'auto' also falls back to python when langgraph is not installed.
+    # 'auto' falls back to python when langgraph is absent, and upgrades to the StateGraph when
+    # present — either way the episode drives to a bounded, done termination.
     fake2 = _fresh_fake()
     loop2 = GovernorLoop(
         "summarize the document",
@@ -205,8 +214,30 @@ def test_langgraph_absent_python_backend_runs():
         backend="auto",
     )
     result2 = loop2.run({"uri": "s3://doc"})
-    assert result2.backend == "python"
+    assert result2.backend == ("langgraph" if LANGGRAPH_INSTALLED else "python")
     assert result2.done is True
+
+
+@pytest.mark.skipif(
+    not LANGGRAPH_INSTALLED,
+    reason="exercises the langgraph StateGraph backend; requires the optional 'reasoning' extra",
+)
+def test_langgraph_present_backend_runs_bounded_episode():
+    """With langgraph installed, backend='langgraph' drives the SAME outer loop via the StateGraph
+    to a bounded, done termination — the optional backend is equivalent to the pure-Python driver."""
+    fake = _fresh_fake()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=InProcessStateStore(),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        backend="langgraph",
+    )
+    result = loop.run({"uri": "s3://doc"})
+    assert result.backend == "langgraph"
+    assert result.done is True
+    assert fake.run_count >= 1
 
 
 class _PartialSupervisor:

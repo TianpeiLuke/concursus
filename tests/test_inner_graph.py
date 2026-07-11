@@ -14,10 +14,16 @@ to the durable trail or the committed plan), it is confined to the ``.2`` lane, 
 a ``.3`` verdict. Nothing here touches ``Supervisor.run``. Import needs no langgraph/LLM.
 """
 
+import importlib.util
 import sys
 import time
 
 import pytest
+
+#: The invariant is that concursus never HARD-imports langgraph. The "not in sys.modules" sanity
+#: checks below only hold when langgraph is absent (the zero-dependency system-python run enforces
+#: them); when it is installed a prior test may have imported it, so those assertions are gated.
+LANGGRAPH_INSTALLED = importlib.util.find_spec("langgraph") is not None
 
 from concursus.reasoning.inner_graph import (
     InnerGraph,
@@ -112,7 +118,8 @@ def test_dispatch_merge_is_order_insensitive(tmp_path):
 
 def test_dispatch_default_investigator_needs_no_llm(tmp_path):
     """The default deterministic stub investigates every open leaf with no model installed."""
-    assert "langgraph" not in sys.modules
+    if not LANGGRAPH_INSTALLED:
+        assert "langgraph" not in sys.modules
     trail, root = _trail_with_open_frontier(tmp_path, n=3)
     graph = compile_inner_graph(trail, root)
     merged = dispatch_frontier(graph)  # no investigator → deterministic stub
@@ -218,9 +225,11 @@ def test_inner_graph_is_a_fresh_disposable_projection(tmp_path):
 
 
 def test_import_needs_no_langgraph_or_llm(tmp_path):
-    assert "langgraph" not in sys.modules
+    if not LANGGRAPH_INSTALLED:
+        assert "langgraph" not in sys.modules
     import concursus
 
     assert hasattr(concursus, "compile_inner_graph")
     assert hasattr(concursus, "InnerGraphDigest")
-    assert "langgraph" not in sys.modules
+    if not LANGGRAPH_INSTALLED:
+        assert "langgraph" not in sys.modules

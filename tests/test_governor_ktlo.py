@@ -326,3 +326,131 @@ def test_tick_cap_bounds_a_never_draining_source():
     assert result.ticks == 5
     assert result.events_seen == 0
     assert result.episodes == []
+
+
+# == (J-1) OPT-IN governance forwarded per-episode into each fresh loop =========
+def _sched_manifest(name, *, side_effecting=False, trust_seed=None):
+    """A manifest for the scheduler's process table (mirrors the loop-test idiom)."""
+    from concursus import AgentManifest as _AM
+
+    data = {
+        "name": name,
+        "registry": {"container_uri": "img", "protocol": "HTTP"},
+        "contract": {"inputs": {}, "outputs": {"doc": {"type": "string", "required": True}}},
+        "side_effecting": side_effecting,
+    }
+    if trust_seed is not None:
+        data["trust_seed"] = trust_seed
+    return _AM.from_dict(data)
+
+
+class _HeldTrackingSupervisor:
+    """A store-bound fake episode supervisor that HONORS the ROUTER's ``held`` set: it invokes (and
+    writes) every still-open, NON-held plan node and NEVER touches a held (escalated) node — so a
+    below-bar node stays uncompleted and is surfaced on ``GovernorResult.escalated``."""
+
+    def __init__(self, *, plan, manifests, store, invoke_fn, arns, session_id, held=None):
+        self._plan = plan
+        self._store = store
+        self._held = set(held or ())
+
+    def run(self, inputs):
+        already = set(self._store.completed())
+        for node in self._plan.order:
+            if node in already or node in self._held:
+                continue  # skip completed AND held (escalated) nodes — no invoke
+            self._store.put(node, {"doc": f"{node}-out"})
+        return {
+            n: self._store.get(n)
+            for n in self._plan.order
+            if n in self._store.completed()
+        }
+
+
+def _trust_scheduler(tmp_path):
+    """A TrustLadderScheduler over a populated registry: ``summarize`` is side-effecting at a
+    below-bar trust seed (=> ESCALATE, held), ``ingest`` is non-side-effecting (=> DISPATCH)."""
+    from concursus import DeployLedger, TrustGrade
+    from concursus.governor.registry import AgentRegistry
+    from concursus.governor.scheduler import TrustLadderScheduler
+
+    ledger = DeployLedger(tmp_path / "ledger.json")
+    ledger.record(name="ingest", fingerprint="fp1", arn="arn:ingest", deployed_at="2026-07-01")
+    ledger.record(name="summarize", fingerprint="fp2", arn="arn:summarize", deployed_at="2026-07-01")
+    m_ingest = _sched_manifest("ingest", side_effecting=False)
+    m_sum = _sched_manifest("summarize", side_effecting=True, trust_seed=TrustGrade.L1_CANARY)
+    registry = AgentRegistry(ledger)
+    registry.register_agent(m_ingest)
+    registry.register_agent(m_sum)
+    return TrustLadderScheduler(
+        registry,
+        manifests={"ingest": m_ingest, "summarize": m_sum},
+        min_autonomy=TrustGrade.L2_GUARDED,          # bar above summarize's earned L1
+        escalation_grade=TrustGrade.L3_AUTONOMOUS,
+    )
+
+
+def _governed_daemon(source, scheduler, *, mode="ktlo", max_ticks=64):
+    """A governed variant of :func:`_daemon`: wires an OPT-IN Trust-Ladder scheduler so each spawned
+    episode is GOVERNED (holds a below-bar node), plus a held-honoring per-episode supervisor."""
+    return KTLODaemon(
+        _two_node_manifests(),
+        source=source,
+        mode=mode,
+        store_factory=InProcessStateStore,
+        supervisor_factory=lambda **kw: _HeldTrackingSupervisor(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_ticks=max_ticks,
+        episode_max_rounds=8,
+        episode_no_progress_n=2,
+        backend="python",
+        scheduler=scheduler,
+    )
+
+
+def test_ktlo_episodes_are_trust_governed_when_scheduler_passed(tmp_path):
+    """A daemon built WITH an OPT-IN Trust-Ladder scheduler spawns GOVERNED episodes: the below-bar
+    ``summarize`` node is HELD (escalated) by the per-episode loop's ROUTER — surfaced on the
+    spawned episode's ``GovernorResult.escalated`` — while the daemon still only ENQUEUES a fresh,
+    bounded GovernorLoop over a fresh store (INV-1/INV-4)."""
+    tickets = [
+        {"id": "t1", "goal": "summarize doc t1"},
+        {"id": "t2", "goal": "summarize doc t2"},
+    ]
+    source = InProcessEventQueue(tickets, closed=True)
+    daemon = _governed_daemon(source, _trust_scheduler(tmp_path), mode="ktlo")
+    result = daemon.run()
+
+    assert result.terminated_by == "source_drained"
+    assert result.events_investigated == 2
+    assert len(result.episodes) == 2
+    # Every spawned episode was GOVERNED: the below-bar node was escalated (held), never completed.
+    for e in result.episodes:
+        assert e.escalated == ["summarize"]
+        assert "summarize" not in set(e.completed)
+        assert "ingest" in set(e.completed)
+    # Still a fresh bounded episode per signal (INV-4): distinct frozen plans, each revision 0.
+    assert len(result.episode_plans) == 2
+    assert id(result.episode_plans[0]) != id(result.episode_plans[1])
+    assert all(p.revision == 0 for p in result.episode_plans)
+
+
+def test_ktlo_default_is_ungoverned_unchanged():
+    """Default (no scheduler, ``deliberate`` false) => every episode is byte-for-byte today's
+    ungoverned behavior: nothing escalated, both nodes complete, and the daemon defaults are the
+    Phase-5 opt-in switches OFF."""
+    tickets = [{"id": "t1", "goal": "summarize doc t1"}]
+    source = InProcessEventQueue(tickets, closed=True)
+    daemon = _daemon(source, mode="ktlo")
+
+    # Opt-in switches default OFF on the daemon.
+    assert daemon._scheduler is None
+    assert daemon._deliberate is False
+
+    result = daemon.run()
+    assert result.terminated_by == "source_drained"
+    assert len(result.episodes) == 1
+    episode = result.episodes[0]
+    assert episode.escalated == []
+    assert episode.terminated_by == "frontier_exhaust"
+    assert set(episode.completed) == {"ingest", "summarize"}

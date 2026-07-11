@@ -107,6 +107,61 @@ def test_exception_queue_matches_summary_failed():
         assert row["reason"] == summary_failed[row["node"]]
 
 
+def test_exception_queue_surfaces_escalations_and_unmatched():
+    """J-2: a cockpit handed escalated + unmatched sets APPENDS a distinct row for each,
+    with reasons 'escalated' / 'unmatched', on top of the summary's failed rows."""
+    sup, store, plan = _run_with_failure()
+    cockpit = DirectorCockpit(
+        supervisor=sup, plan=plan, escalated=["x"], unmatched=["y"]
+    )
+
+    summary_failed = sup.summary()["failed"]
+    assert summary_failed, "fixture must produce at least one failed node"
+
+    queue = cockpit.exception_queue()
+    by_reason = {}
+    for row in queue:
+        by_reason.setdefault(row["reason"], []).append(row["node"])
+
+    # Every failed row is still present with its summary reason.
+    for node, reason in summary_failed.items():
+        assert node in by_reason.get(reason, [])
+    # The escalated + unmatched sets appear as distinct governance rows.
+    assert by_reason["escalated"] == ["x"]
+    assert by_reason["unmatched"] == ["y"]
+    # All three reason kinds are represented.
+    assert {"escalated", "unmatched"} <= set(by_reason)
+
+
+def test_cockpit_still_read_only():
+    """J-2/INV-5: rendering the governance-augmented exception queue leaves the
+    append-only log byte-identical — the escalated/unmatched sets are pure values."""
+    sup, store, plan = _run_with_failure()
+    cockpit = DirectorCockpit(
+        supervisor=sup, plan=plan, escalated=["x"], unmatched=["y"]
+    )
+
+    before = [repr(r) for r in store.records()]
+    cockpit.exception_queue()
+    after = [repr(r) for r in store.records()]
+
+    assert before == after
+    assert len(before) == len(after)
+
+
+def test_exception_queue_default_is_failed_only():
+    """J-2 opt-in rule: with no governance sets, the queue is byte-for-byte today's
+    failed-only queue — no escalated/unmatched rows."""
+    sup, store, plan = _run_with_failure()
+    cockpit = DirectorCockpit(supervisor=sup, plan=plan)
+
+    summary_failed = sup.summary()["failed"]
+    queue = cockpit.exception_queue()
+
+    assert {row["node"] for row in queue} == set(summary_failed.keys())
+    assert all(row["reason"] not in ("escalated", "unmatched") for row in queue)
+
+
 def test_cockpit_over_live_loop(tmp_path):
     """I-3: a DirectorCockpit built over a LIVE GovernorLoop run is a PURE read surface — its
     exception_queue equals the run's summary().failed and rendering it leaves store.records()

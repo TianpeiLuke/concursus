@@ -31,10 +31,17 @@ class DirectorCockpit:
     """
 
     def __init__(self, *, supervisor: Any, vault_path: Optional[str] = None,
-                 plan: Any = None) -> None:
+                 plan: Any = None,
+                 escalated: Optional[List[str]] = None,
+                 unmatched: Optional[List[str]] = None) -> None:
         self._supervisor = supervisor
         self._vault_path = vault_path
         self._plan = plan
+        # OPT-IN read-only governance sets from the last GovernorLoop run (I-1). Default None => []
+        # => today's failed-only exception queue is byte-for-byte unchanged. These are just VALUES;
+        # the cockpit NEVER re-derives, assembles, or dispatches to obtain them (INV-5).
+        self._escalated: List[str] = list(escalated or [])
+        self._unmatched: List[str] = list(unmatched or [])
 
     # ---- (a) briefing -------------------------------------------------
     def briefing(self, *, slipbox_form: bool = False, date: str = "") -> Dict[str, Any]:
@@ -65,7 +72,14 @@ class DirectorCockpit:
         over ``store.completed()`` + terminal failures) and enriched, where
         available, with the latest failed :class:`Record` from
         ``RunIndex.query(status='failed')`` for attempt/address metadata. The
-        node set and reason are always exactly the summary's failed rows.
+        failed-node set and reason are always exactly the summary's failed rows.
+
+        In addition, when the cockpit was handed the last run's read-only
+        governance sets (I-1), one distinct row per escalated node
+        (``reason='escalated'``) and per unmatched node (``reason='unmatched'``)
+        is APPENDED. These are read-only VALUES passed in at construction — the
+        cockpit re-derives nothing and drives no dispatch (INV-5). With no
+        governance sets (the default), the queue is exactly the failed rows.
         """
         failed = self._supervisor.summary()["failed"]
         index = self._run_index()
@@ -86,6 +100,23 @@ class DirectorCockpit:
                 "attempt": getattr(rec, "attempt", None) if rec is not None else None,
                 "address": getattr(rec, "address", None) if rec is not None else None,
                 "content_hash": getattr(rec, "content_hash", None) if rec is not None else None,
+            })
+        # Append read-only governance rows (I-1): escalations then unmatched, in stable order.
+        for node in self._escalated:
+            queue.append({
+                "node": node,
+                "reason": "escalated",
+                "attempt": None,
+                "address": None,
+                "content_hash": None,
+            })
+        for node in self._unmatched:
+            queue.append({
+                "node": node,
+                "reason": "unmatched",
+                "attempt": None,
+                "address": None,
+                "content_hash": None,
             })
         return queue
 

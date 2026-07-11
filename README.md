@@ -246,6 +246,23 @@ behavior):
   `loop.leverage_view(vault)` render the `DirectorCockpit` / `scope` projections over the loop's own
   log and final frozen plan — pure reads that dispatch nothing.
 
+The scheduler/deliberation seams also thread up through the **standing daemon** and out to the
+**cockpit** (opt-in; the default `KTLODaemon(...)` with no `scheduler=` and `deliberate=False` is
+byte-for-byte today's plain episode):
+
+- **the `KTLODaemon` can spawn governed episodes** — pass `scheduler=TrustLadderScheduler(...)`
+  (and/or `deliberate=True`) and the daemon forwards them into each fresh bounded `GovernorLoop` it
+  enqueues per triggered investigation, so a keep-the-lights-on run is trust-gated and can deliberate
+  before freezing. The daemon still only *enqueues* fresh loops over fresh stores and holds no
+  mutable plan (INV-1/INV-4).
+- **the cockpit surfaces the governance holds** — `DirectorCockpit.exception_queue()` now folds the
+  last episode's below-bar `ESCALATE` and no-standing-agent `UNMATCHED` holds in alongside the
+  failed-node rows (threaded through `loop.cockpit()`), so a held frontier is operator-visible, not
+  just failures — still a pure read that dispatches nothing.
+- **an unmatched-node stall is named** — when a governed loop can make no further progress solely
+  because every remaining open-frontier node is `UNMATCHED`, `GovernorResult.terminated_by` reports
+  the distinct `unmatched_stall` label instead of a generic stall, so the terminal cause is explicit.
+
 Two shipped-but-idle core seams are now wired into the dispatch path (**C-3**, identity-preserving):
 the `Supervisor` constructor runs the shipped `RunGraph.validate()` **once** as a pre-dispatch
 structural gate (a dangling `AgentRef` or cycle is rejected before the first invoke; `run()` stays a

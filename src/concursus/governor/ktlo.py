@@ -241,6 +241,8 @@ class KTLODaemon:
         episode_no_progress_n: int = 2,
         max_revisions: int = DEFAULT_MAX_REVISIONS,
         backend: str = "python",
+        scheduler: Optional[Any] = None,
+        deliberate: bool = False,
     ) -> None:
         if mode not in (LAUNCH, KTLO):
             raise KTLODaemonError(f"mode must be {LAUNCH!r} | {KTLO!r}, got {mode!r}")
@@ -267,6 +269,12 @@ class KTLODaemon:
         self._episode_no_progress_n = episode_no_progress_n
         self._max_revisions = max_revisions
         self._backend = backend
+        # OPT-IN Phase-5 governance seams, forwarded per-episode into each fresh GovernorLoop
+        # (never held mutably here; the daemon still only ENQUEUES fresh bounded episodes —
+        # INV-1/INV-4). Default (scheduler=None, deliberate=False) => every episode is
+        # byte-for-byte today's ungoverned construction.
+        self._scheduler = scheduler
+        self._deliberate = bool(deliberate)
 
     # -- public entry -------------------------------------------------------
     def run(self) -> KTLOResult:
@@ -391,6 +399,12 @@ class KTLODaemon:
         Each investigation gets its OWN loop + store so the episode forms a brand-new frozen plan
         and terminates on its own bounds — no plan is shared across episodes (INV-4).  Optional
         assembler / supervisor / invoke seams are threaded through for offline testing.
+
+        The OPT-IN Phase-5 governance seams (``scheduler`` / ``deliberate``) are FORWARDED here into
+        each per-episode :class:`GovernorLoop` so a governed daemon spawns GOVERNED episodes — the
+        daemon holds no mutable plan and shares nothing across episodes; governance is applied
+        per-episode inside each fresh loop. When both are default (no scheduler, ``deliberate``
+        false) the kwargs dict is byte-for-byte today's ungoverned construction.
         """
         kwargs: Dict[str, Any] = dict(
             store=store,
@@ -407,4 +421,10 @@ class KTLODaemon:
             kwargs["assembler"] = self._assembler
         if self._supervisor_factory is not None:
             kwargs["supervisor_factory"] = self._supervisor_factory
+        # OPT-IN: only add the governance kwargs when set, so the default (ungoverned) construction
+        # stays byte-for-byte today's — INV-1/INV-4 preserved (still a fresh bounded episode).
+        if self._scheduler is not None:
+            kwargs["scheduler"] = self._scheduler
+        if self._deliberate:
+            kwargs["deliberate"] = self._deliberate
         return GovernorLoop(goal, self._manifests, **kwargs)

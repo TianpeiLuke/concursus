@@ -1478,3 +1478,75 @@ def test_no_scheduler_collect_unchanged():
     assert result.unmatched == []
     # One write per node in the append-only log — no extra trust bookkeeping records.
     assert {r.node for r in store.records()} == {"ingest", "summarize"}
+
+
+def test_unmatched_stall_is_labeled(tmp_path):
+    """When a scheduler's registry matches NOTHING for a frontier node, EVERY node is held UNMATCHED
+    so the frontier never advances at all: the loop stalls and is labeled ``unmatched_stall`` (a
+    mis-registered agent is legible), not the generic ``no_progress``."""
+    from concursus import DeployLedger, TrustGrade
+    from concursus.governor.registry import AgentRegistry
+    from concursus.governor.scheduler import TrustLadderScheduler
+
+    # A registry with NO agents at all → both 'ingest' and 'summarize' are UNMATCHED (no standing
+    # agent) → held every round → nothing ever completes → the frontier never advances.
+    ledger = DeployLedger(tmp_path / "ledger.json")
+    registry = AgentRegistry(ledger)
+    scheduler = TrustLadderScheduler(
+        registry,
+        manifests={},
+        min_autonomy=TrustGrade.L1_CANARY,
+    )
+
+    fake = _fresh_held_tracking()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=scheduler,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    # No standing agent matched any node → all held UNMATCHED, none dispatched, none completed.
+    assert fake.invoked == []
+    assert result.completed == []
+    assert result.done is False
+    assert set(result.unmatched) == {"ingest", "summarize"}
+    # The mis-registration stall is legible instead of an indistinguishable no_progress.
+    assert result.terminated_by == "unmatched_stall"
+
+
+def test_normal_no_progress_not_mislabeled():
+    """A no-progress stall with NO unmatched node (no scheduler → unmatched always empty) keeps the
+    generic ``no_progress`` label — the new ``unmatched_stall`` branch can never fire on it."""
+
+    class _NoopSupervisor:
+        def __init__(self, *, plan, manifests, store, invoke_fn, arns, session_id):
+            self._plan = plan
+
+        def run(self, inputs):
+            return {}  # writes nothing → no forward progress, but nothing is unmatched either
+
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        supervisor_factory=lambda **kw: _NoopSupervisor(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=20,
+        no_progress_n=2,
+        backend="python",
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    assert loop._scheduler is None  # no scheduler → unmatched is always empty
+    assert result.unmatched == []
+    assert result.terminated_by == "no_progress"
+    assert result.done is False

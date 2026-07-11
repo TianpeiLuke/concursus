@@ -133,6 +133,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     surfaces (INV-5): they build a `Supervisor` only to call its shipped read models, never call
     `run`, never assemble/recompile, never dispatch, and never `put` — rendering leaves the store
     byte-identical.
+- **Phase-5.5 governed-KTLO wiring — the standing daemon now spawns GOVERNED episodes and the
+  director cockpit surfaces the governance holds (opt-in, default path byte-for-byte unchanged).**
+  Phase-5 wired the scheduler/deliberation seams INTO a single `GovernorLoop`; Phase-5.5 threads
+  those same seams THROUGH the `KTLODaemon` (the standing monitor above the loop) and out to the
+  `DirectorCockpit`, so a keep-the-lights-on investigation can be trust-gated and a held frontier is
+  visible to the operator. With no new args the daemon still enqueues plain bounded episodes exactly
+  as today — all pre-existing tests are unchanged (INV-1/INV-4: each episode stays a fresh
+  frozen-plan bounded loop).
+  - **J-1 `KTLODaemon` forwards `scheduler=`/`deliberate=` into each spawned episode** — the daemon
+    gains opt-in `scheduler=`/`deliberate=` params that `_build_loop` forwards into the fresh
+    `GovernorLoop` it enqueues per triggered investigation, so a standing daemon can dispatch
+    GOVERNED episodes (earned-trust frontier gating + pre-freeze deliberation). Default
+    `scheduler=None`/`deliberate=False` is byte-for-byte the plain episode the daemon builds today;
+    the daemon still only ENQUEUES fresh bounded loops over fresh stores and holds no mutable plan.
+  - **J-2 the cockpit exception queue surfaces trust escalations + unmatched-agent stalls** — the
+    loop now retains the last episode's `escalated` / `unmatched` governance surfaces and passes them
+    through `GovernorLoop.cockpit()`, and `DirectorCockpit.exception_queue()` folds them in alongside
+    the failed-node rows — so below-bar `ESCALATE` holds and no-standing-agent `UNMATCHED` holds are
+    now operator-visible, not just failures. Still a pure read model (INV-5): it re-derives every row
+    from the append-only log and the final frozen plan VALUE, dispatching / seeding / scheduling
+    nothing.
+  - **J-3 an unmatched-node stall is labeled `unmatched_stall`** — when the loop can make no further
+    progress solely because every remaining open-frontier node is UNMATCHED (no standing agent can
+    serve it), `GovernorResult.terminated_by` now reports the distinct `unmatched_stall` label rather
+    than a generic `no_progress` / `frontier_exhaust`, so the terminal condition names the actual
+    cause. Only reachable with a `scheduler=` wired; the ungoverned loop's termination labels are
+    unchanged.
 - **C-3 core seams (identity-preserving, wiring shipped machinery into the dispatch path)** —
   - **C-3a `Supervisor` pre-dispatch structural gate** — the constructor now projects the frozen
     plan (`plan.order` nodes + `plan.wiring` `AgentRef` edges) into a `RunGraph` and runs the

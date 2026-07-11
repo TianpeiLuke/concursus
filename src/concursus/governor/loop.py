@@ -137,7 +137,9 @@ class GovernorResult:
     Attributes:
         rounds: Number of completed episodes (Supervisor.run passes).
         terminated_by: Which bound stopped the loop — ``frontier_exhaust`` | ``no_progress`` |
-            ``round_cap`` | ``step_cap``.
+            ``unmatched_stall`` | ``round_cap`` | ``step_cap``.  ``unmatched_stall`` is the specific
+            no_progress case where an UNMATCHED held node (a mis-registered agent) blocked the
+            frontier so it never advanced at all — legible instead of an indistinguishable stall.
         done: Whether the plan's frontier was exhausted (all nodes completed).
         completed: Sorted list of completed node ids (re-derived from the log).
         frontier: The still-open frontier at termination.
@@ -314,6 +316,11 @@ class GovernorLoop:
         # dispatching anything. None until the first run() completes. This is a pointer to an
         # already-frozen plan value — never a mutable snapshot (INV-3).
         self._last_plan: Optional[ProvisioningPlan] = None
+        # The CURRENT run's read-only governance sets, stashed by run() so a DirectorCockpit
+        # can surface them in its exception queue WITHOUT re-running or mutating anything (INV-5).
+        # Empty until the first run() completes; default-empty => today's failed-only cockpit queue.
+        self._last_escalated: List[str] = []
+        self._last_unmatched: List[str] = []
 
     # -- durable-store selection (C-2) --------------------------------------
     def _select_store(
@@ -397,6 +404,10 @@ class GovernorLoop:
         # Stash the run's final frozen plan VALUE for the read-only cockpit/scope accessors (I-3).
         # A pointer to an already-frozen value — never re-assembled, never mutated (INV-3).
         self._last_plan = ctx.get("plan")
+        # Stash the run's read-only governance sets for the cockpit exception queue (INV-5). These are
+        # the SAME values surfaced on GovernorResult below — read-only VALUES, never re-derived.
+        self._last_escalated = sorted(ctx.get("escalated") or [])
+        self._last_unmatched = sorted(ctx.get("unmatched") or [])
         return GovernorResult(
             rounds=int(ctx["round"]),
             terminated_by=str(ctx["terminated_by"]),
@@ -442,7 +453,11 @@ class GovernorLoop:
         from concursus.governor.cockpit import DirectorCockpit
 
         return DirectorCockpit(
-            supervisor=supervisor, vault_path=vault_path, plan=self._last_plan
+            supervisor=supervisor,
+            vault_path=vault_path,
+            plan=self._last_plan,
+            escalated=self._last_escalated,
+            unmatched=self._last_unmatched,
         )
 
     def programs_index(self, vault_path: str, *, sep: str = SCOPE_SEP) -> Dict[str, dict]:
@@ -958,19 +973,39 @@ class GovernorLoop:
                 ctx["terminated_by"] = "round_cap"
                 return "synthesize"
             if int(ctx["no_progress"]) >= self._no_progress_n:
-                ctx["terminated_by"] = "no_progress"
+                ctx["terminated_by"] = self._no_progress_label(ctx)
                 return "synthesize"
             return "planner"
         if ctx["done"]:
             ctx["terminated_by"] = "frontier_exhaust"
             return "synthesize"
         if int(ctx["no_progress"]) >= self._no_progress_n:
-            ctx["terminated_by"] = "no_progress"
+            ctx["terminated_by"] = self._no_progress_label(ctx)
             return "synthesize"
         if int(ctx["round"]) >= self._max_rounds:
             ctx["terminated_by"] = "round_cap"
             return "synthesize"
         return "planner"
+
+    def _no_progress_label(self, ctx: dict) -> str:
+        """Distinguish a mis-registration stall from a generic stall (J-3, opt-in-safe).
+
+        A no_progress stall is normally opaque: the frontier simply stopped advancing.  When the
+        OPT-IN scheduler HELD a node as UNMATCHED (no standing agent) and that node blocked the
+        frontier so hard that it NEVER advanced at all (nothing ever completed), the stall is caused
+        by a mis-registered agent, not a genuinely un-plannable frontier.  Label that specific case
+        ``unmatched_stall`` so the cockpit can explain it, while every other stall keeps the generic
+        ``no_progress`` label unchanged.
+
+        The guard is deliberately narrow so it can never re-label an existing path: it fires ONLY
+        when ``ctx["unmatched"]`` is non-empty AND no node ever completed (the frontier never
+        advanced).  A run where some nodes completed before stalling on an unmatched node — or any
+        run with no scheduler, where ``unmatched`` is always empty — stays ``no_progress``.
+        """
+        never_advanced = len(ctx.get("completed") or []) == 0
+        if ctx.get("unmatched") and never_advanced:
+            return "unmatched_stall"
+        return "no_progress"
 
     def _synthesize(self, ctx: dict) -> dict:
         """SYNTHESIZE: finalize the terminal summary from the log + plan-value sequence (read-only)."""

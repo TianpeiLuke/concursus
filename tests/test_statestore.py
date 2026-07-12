@@ -23,6 +23,11 @@ from concursus.state.statestore import (
 
 
 # -- fake AgentCore Memory data-plane client --------------------------------
+def _mv(value):
+    """Unwrap an AgentCore typed MetadataValue ({"stringValue": v}) to its flat string."""
+    return value.get("stringValue") if isinstance(value, dict) else value
+
+
 class FakeMemoryClient:
     """A fake ``bedrock-agentcore`` client: records ``create_event`` calls and replays them.
 
@@ -39,14 +44,17 @@ class FakeMemoryClient:
     def create_event(self, **kwargs):
         self.created.append(kwargs)
         self._seq += 1
+        # Model the live wire contract: metadata values arrive as the typed MetadataValue union
+        # ({"stringValue": ...}); store them flat for convenient assertions.
         event = {
             "eventId": f"ev-{self._seq}",
             "eventTimestamp": self._seq,
             "payload": list(kwargs.get("payload", [])),
-            "metadata": dict(kwargs.get("metadata", {})),
+            "metadata": {k: _mv(v) for k, v in kwargs.get("metadata", {}).items()},
         }
         self._events.append(event)
-        return {"eventId": event["eventId"], "eventTimestamp": event["eventTimestamp"]}
+        # Live CreateEvent nests the created event under "event".
+        return {"event": {"eventId": event["eventId"], "eventTimestamp": event["eventTimestamp"]}}
 
     def list_events(self, **kwargs):
         include = kwargs.get("includePayloads", True)
@@ -242,19 +250,22 @@ def test_memory_put_writes_blob_event_with_metadata_and_get_returns_it():
     assert call["actorId"] == "team-1"
     assert call["sessionId"] == "S" * 40
 
-    meta = call["metadata"]
+    # AgentCore metadata is the typed MetadataValue union, charset-sanitized (the '$' JSONPath in
+    # consumes becomes '_'); the lossless copy rides in the Blob __meta__ sidecar.
+    meta = {k: _mv(v) for k, v in call["metadata"].items()}
     assert meta["node"] == "summarize"
     assert meta["attempt"] == "1"
     assert meta["status"] == "validated"
     assert meta["record_type"] == "agent_output"
-    assert meta["consumes"] == "ingest:$.document"
+    assert meta["consumes"] == "ingest:_.document"  # sanitized in the filterable index
     assert meta["producer"] == "ingest"
     assert meta["schema"] == "sum.v1"
     assert meta["content_hash"] == content_hash({"summary": "SUM"})
 
-    # the Blob payload carries the verbatim output keyed by node.
+    # the Blob payload carries the verbatim output keyed by node + the lossless __meta__ sidecar.
     blob = json.loads(call["payload"][0]["blob"])
-    assert blob == {"summarize": {"summary": "SUM"}}
+    assert blob["summarize"] == {"summary": "SUM"}
+    assert blob["__meta__"]["consumes"] == "ingest:$.document"  # faithful (the '$' survives)
 
     # get reflects the write (lazy replay reconstructs it from the event log).
     assert store.get("summarize") == {"summary": "SUM"}
@@ -487,7 +498,7 @@ class FilteringFakeMemoryClient(FakeMemoryClient):
         for ev in base["events"]:
             meta = ev.get("metadata", {})
             if all(
-                meta.get(e["left"]["metadataKey"]) == e["right"]["metadataValue"]
+                meta.get(e["left"]["metadataKey"]) == _mv(e["right"]["metadataValue"])
                 for e in exprs
             ):
                 kept.append(ev)
@@ -535,7 +546,7 @@ def test_checkpoint_compaction_bounds_warm_resume():
 def _is_eq_filter(flt, **pairs):
     if not flt:
         return False
-    got = {e["left"]["metadataKey"]: e["right"]["metadataValue"] for e in flt.get("eventMetadata", [])}
+    got = {e["left"]["metadataKey"]: _mv(e["right"]["metadataValue"]) for e in flt.get("eventMetadata", [])}
     return all(got.get(k) == v for k, v in pairs.items())
 
 

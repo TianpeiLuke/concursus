@@ -16,8 +16,10 @@ fake client, so nothing here ever touches AWS.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
+import re
 import threading
 import warnings
 from dataclasses import dataclass, field
@@ -173,6 +175,11 @@ _DEDUP_RECORD_TYPE = "dedup"
 _CHECKPOINT_RECORD_TYPE = "checkpoint"
 
 
+#: AgentCore metadata string values must match this charset; anything else is sanitized to ``_``
+#: for the (filterable) event metadata. The lossless value rides in the Blob ``__meta__`` sidecar.
+_SAFE_METADATA_VALUE = re.compile(r"[^a-zA-Z0-9\s._:/=+@-]")
+
+
 def _metadata_equals_filter(**pairs: str) -> dict:
     """Build a ``ListEvents`` ``FilterInput`` that ANDs an ``EQUALS_TO`` per metadata key.
 
@@ -181,7 +188,13 @@ def _metadata_equals_filter(**pairs: str) -> dict:
     """
     return {
         "eventMetadata": [
-            {"left": {"metadataKey": k}, "operator": "EQUALS_TO", "right": {"metadataValue": v}}
+            {
+                "left": {"metadataKey": k},
+                "operator": "EQUALS_TO",
+                # AgentCore metadata values are the typed MetadataValue union, not bare strings;
+                # sanitize to match what was stored (a no-op for the safe C-4 keys record_type/epoch).
+                "right": {"metadataValue": {"stringValue": _SAFE_METADATA_VALUE.sub("_", v)}},
+            }
             for k, v in pairs.items()
         ]
     }
@@ -423,7 +436,8 @@ class MemoryStateStore:
                     branch = {"name": name, "rootEventId": root_event}
 
             metadata = _build_metadata(record)
-            payload = [{"blob": json.dumps({node: record.output})}]
+            # __meta__ sidecar: the LOSSLESS record fields (AgentCore metadata is charset-sanitized).
+            payload = [{"blob": json.dumps({node: record.output, "__meta__": metadata})}]
             response = self._create_event(metadata=metadata, payload=payload, branch=branch)
             record.event_id = response.get("eventId")
             record.timestamp = response.get("eventTimestamp")
@@ -494,7 +508,7 @@ class MemoryStateStore:
                 "content_hash": content_hash(snapshot),
                 "epoch": str(epoch),
             }
-            payload = [{"blob": json.dumps({"__checkpoint__": snapshot})}]
+            payload = [{"blob": json.dumps({"__checkpoint__": snapshot, "__meta__": metadata})}]
             response = self._create_event(metadata=metadata, payload=payload)
             # Rotate the window so no future put reuses this (now-compacted) epoch.
             self._epoch = epoch + 1
@@ -641,16 +655,31 @@ class MemoryStateStore:
         self, *, metadata: Dict[str, str], payload: List[dict], branch: Optional[dict] = None
     ) -> dict:
         """Append one Blob event; returns ``{"eventId": ..., "eventTimestamp": ...}``."""
+        # AgentCore metadata values are the typed MetadataValue union ({"stringValue": ...}), not
+        # bare strings, AND the string must match a restricted charset ([a-zA-Z0-9\\s._:/=+@-]) —
+        # so values like ``consumes`` (``$`` JSONPath) or ``supersedes`` (event id with ``#``) are
+        # SANITIZED here for the filterable index. The lossless copy travels in the Blob __meta__
+        # sidecar (see put/checkpoint + _event_to_record); wrap at this wire-shape boundary so
+        # callers keep flat {k: str} maps.
+        typed_metadata = {
+            k: {"stringValue": _SAFE_METADATA_VALUE.sub("_", v)} for k, v in metadata.items()
+        }
         kwargs: Dict[str, Any] = {
             "memoryId": self._memory_id,
             "actorId": self._actor_id,
             "sessionId": self._session_id,
+            # eventTimestamp is a REQUIRED CreateEvent param; ordering still uses the local
+            # _clock seq (not this wall-clock), per the single-writer checkpoint contract.
+            "eventTimestamp": datetime.datetime.now(datetime.timezone.utc),
             "payload": payload,
-            "metadata": metadata,
+            "metadata": typed_metadata,
         }
         if branch is not None:
             kwargs["branch"] = branch
-        return self._ensure_client().create_event(**kwargs)
+        resp = self._ensure_client().create_event(**kwargs)
+        # CreateEvent nests the created event under "event"; unwrap so callers read eventId /
+        # eventTimestamp flat (tolerant of test fakes that already return the flat shape).
+        return resp.get("event", resp) if isinstance(resp, dict) else resp
 
     def _list_events(
         self,
@@ -759,22 +788,39 @@ def _snapshot_to_record(raw: dict) -> Record:
 
 def _event_to_record(event: dict) -> Record:
     """Parse a ``list_events`` event (metadata + Blob payload) back into a :class:`Record`."""
-    meta = event.get("metadata") or {}
+    payload = event.get("payload") or []
+    blob = payload[0].get("blob") if payload else None
+    if isinstance(blob, (str, bytes, bytearray)):
+        try:
+            blob = json.loads(blob)
+        except (ValueError, TypeError):
+            blob = None
+
+    # Prefer the faithful ``__meta__`` sidecar carried in the Blob (unrestricted charset); fall back
+    # to AgentCore event metadata, unwrapping the typed MetadataValue union and tolerating already-
+    # flat values from injected test fakes. AgentCore metadata values are sanitized to a restricted
+    # charset on write, so the sidecar is the lossless source of truth for fields like ``consumes``
+    # (a ``$`` JSONPath) and ``supersedes`` (an event id with ``#``).
+    meta: Dict[str, Any]
+    if isinstance(blob, dict) and isinstance(blob.get("__meta__"), dict):
+        meta = dict(blob["__meta__"])
+    else:
+        raw_meta = event.get("metadata") or {}
+        meta = {
+            k: (v.get("stringValue") if isinstance(v, dict) else v)
+            for k, v in raw_meta.items()
+        }
     node = meta.get("node", "")
 
     consumes_raw = meta.get("consumes", "")
     consumes = [c for c in consumes_raw.split(",") if c] if consumes_raw else []
 
     output: dict = {}
-    payload = event.get("payload") or []
-    if payload:
-        blob = payload[0].get("blob")
-        if isinstance(blob, (str, bytes, bytearray)):
-            blob = json.loads(blob)
-        if isinstance(blob, dict):
-            output = blob.get(node, blob)
-        elif blob is not None:
-            output = blob
+    if isinstance(blob, dict):
+        body = {k: v for k, v in blob.items() if k != "__meta__"}
+        output = body.get(node, body)
+    elif blob is not None:
+        output = blob
 
     try:
         attempt = int(meta.get("attempt", "1"))

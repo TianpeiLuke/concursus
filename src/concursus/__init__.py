@@ -1,19 +1,29 @@
-"""Concursus — compile a DAG of subagents into an orchestrated team on AWS Bedrock AgentCore.
+"""Concursus — substrate of the OPC (one-person-company) operating model: persistent, governed agent crews run programs end-to-end on AWS Bedrock AgentCore with the human as *director*, not operator.
 
 Where **cursus** compiles a pipeline DAG + configs into a SageMaker pipeline, **Concursus**
 (Latin *"a running-together / convergence"*) compiles an ``AgentDAG`` + per-agent
 ``.agent.yaml`` manifests into (1) an AgentCore provisioning plan — one ``CreateAgentRuntime``
 per agent — and (2) a supervisor that dispatches the agents in topological order, wires each
 agent's declared output into its dependents' input, and routes shared state through AgentCore
-Memory. It is the coordinator AgentCore deliberately does not ship.
+Memory. The compiler is *one organ* — the coordinator AgentCore deliberately does not ship —
+and it stays a pure compiler (assemble = a value; one static forward pass over a frozen plan).
+Around it stand the OPC's other organs, and the plan/execute discipline is not a refusal to
+govern: it is *how* Concursus governs at OPC scale, safely and auditably.
 
 Status: early. This release provides the declarative core — the backend-agnostic
 :class:`~concursus.dag.AgentDAG` and the :class:`~concursus.manifest.AgentManifest`
-(``.agent.yaml``) model — plus the offline compiler: the dependency resolver
+(``.agent.yaml``) model — plus the compiler organ: the dependency resolver
 (:mod:`~concursus.resolve`), the runtime builder (:mod:`~concursus.build`), the
-:class:`~concursus.assemble.OrchestrationAssembler` (DAG + manifests → a
+:class:`~concursus.assemble.OrchestrationAssembler` (DAG + manifests → a frozen
 :class:`~concursus.assemble.ProvisioningPlan`), and the topological
-:class:`~concursus.supervisor.Supervisor`. Provisioning + invocation over AWS stay behind
+:class:`~concursus.supervisor.Supervisor`. Around the compiler stand the runtime-governance,
+standing-crew, director, and deliberation organs: fleet memory (:mod:`~concursus.state`);
+the runtime governor and per-episode standing crews (:mod:`~concursus.governor` — a
+strictly-outer bounded loop that never reaches inside a running Supervisor nor mutates a
+frozen plan, plus the director cockpit); and the bounded deliberation tier
+(:mod:`~concursus.reasoning` — terminates, forming a fresh frozen plan strictly *before*
+assemble, then hands off to the static topo walk; re-opening a trail is a new episode, never
+a live-plan mutation). Provisioning + invocation over AWS stay behind
 the optional ``[agentcore]`` extra (boto3 is imported lazily).
 
 Basic usage:

@@ -6,7 +6,10 @@ disposable per-round inner graph (:mod:`~concursus.inner_graph`), and the compil
 precedent retriever (:mod:`~concursus.precedent`) into one loop that FORMS a plan by deliberation
 and then LOWERS the converged conclusion into a frozen :class:`~concursus.dag.AgentDAG`.
 
-The concursus identity guard, held here at its highest-risk point:
+This is the DELIBERATION organ of the OPC substrate — where concursus forms plans by bounded
+reasoning before the compiler commits them. The plan/execute discipline held here is NOT a refusal
+to reason (nor an identity ceiling on the reasoning tier); it is HOW concursus governs bounded
+deliberation safely and auditably:
 
 * **SEED (AI-28)** starts a NEW plan-formation episode from a goal (optionally primed by retrieved
   precedents). It is triggered by a goal/ticket ONLY — never by a user retrieval query
@@ -88,9 +91,9 @@ def seed(
     This replaces the earlier *append-a-sibling-precedent-root* wiring, which made a warm start cost
     MORE than a cold one (an extra root to adjudicate, nothing pruned). Returns the seeded root ids.
 
-    IDENTITY: SEED is triggered by a goal/ticket, NEVER by a user retrieval query — the retriever is
-    a PRIMING read only; it does not itself start the write cycle. A caller wanting to *look up* a
-    precedent should call the retriever directly, not ``seed``.
+    SAFE-GOVERNANCE: SEED is triggered by a goal/ticket, NEVER by a user retrieval query — the
+    retriever is a PRIMING read only; it does not itself start the write cycle. A caller wanting to
+    *look up* a precedent should call the retriever directly, not ``seed``.
     """
     if not goal or not str(goal).strip():
         raise ValueError("seed requires a non-empty goal (a plan-formation episode needs a target)")
@@ -229,8 +232,9 @@ def form_plan(
     :mod:`~concursus.inner_graph`. Defaults are deterministic stubs, so the driver runs end-to-end
     with NEITHER langgraph NOR any LLM.
 
-    IDENTITY (the crux): the loop is dynamic but STRICTLY BEFORE ``assemble`` and TERMINATES in a
-    frozen plan. It never touches ``Supervisor.run``. After LOWER, execution is a static topo walk.
+    SAFE-GOVERNANCE (the crux): the loop is dynamic but STRICTLY BEFORE ``assemble`` and TERMINATES
+    in a frozen plan. It never touches ``Supervisor.run``. After LOWER, execution is a static topo
+    walk.
     """
     roots = seed(trail, goal, retriever=retriever)
 

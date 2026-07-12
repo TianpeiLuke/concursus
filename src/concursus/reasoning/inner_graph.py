@@ -1,11 +1,14 @@
 """The **inner graph** — parallel hypothesis-investigator dispatch + DIGEST write-back (AI-25 + AI-29).
 
-Concursus is a **compiler, not a runtime governor**. This module is the FAR-HORIZON reasoning tier
-and therefore the highest identity risk, so its contract is deliberately narrow: everything here is
-**PLAN-FORMATION**, STRICTLY BEFORE :meth:`~concursus.assemble.OrchestrationAssembler.assemble`, and
-it NEVER dispatches a committed agent, is NEVER wired inside
-:meth:`~concursus.supervisor.Supervisor.run` (which stays a single forward topo pass over a frozen
-``plan.order``), and NEVER writes a ``.3`` verdict (that is the engine's job, via
+Concursus is the **substrate of the OPC (One-Person-Company) operating model** — a
+director-not-operator system of persistent, governed crews. This module is that substrate's
+**deliberation organ**: the FAR-HORIZON reasoning tier that FORMS a plan by bounded reasoning
+BEFORE it is committed. Its plan/execute discipline is not a refusal to govern — it is HOW concursus
+deliberates SAFELY and AUDITABLY at OPC scale: everything here is **PLAN-FORMATION**, STRICTLY BEFORE
+:meth:`~concursus.assemble.OrchestrationAssembler.assemble`, and it NEVER dispatches a committed
+agent, is NEVER wired inside :meth:`~concursus.supervisor.Supervisor.run` (which stays a single
+forward topo pass over a frozen ``plan.order``), and NEVER writes a ``.3`` verdict (that is the
+engine's job, via
 :meth:`~concursus.trailstore.HypothesisTrail.write_verdict`). It is confined to the ``.2`` worker-log
 lane — exactly the lane a run's per-worker execution logs live in.
 
@@ -129,7 +132,9 @@ class InnerGraph:
     each round from the pre-commit MUTABLE hypothesis set and it is thrown away after
     :func:`dispatch_frontier`. It carries only a read snapshot (``projection``) of the frontier
     hypotheses plus the bounded fan-out ``batches`` — never the durable trail, never the committed
-    plan, so it cannot ossify into a runtime governor.
+    plan, so this deliberation projection stays pure plan-formation and never becomes a cyclic
+    executor. Runtime governance is a strictly-outer organ (the governor), never something this tier
+    grows into.
 
     Attributes:
         root: The ``.3`` root hypothesis whose subtree this projection was compiled from.

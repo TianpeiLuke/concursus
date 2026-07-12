@@ -1,12 +1,15 @@
 """The governor's fixed cyclic control loop — the OUTER driver around the compiler.
 
-concursus proper is a COMPILER: :meth:`OrchestrationAssembler.assemble` /
+concursus is the SUBSTRATE of the OPC (One-Person-Company) operating model — a
+director-not-operator system of persistent, governed crews.  The COMPILER is ONE organ:
+:meth:`OrchestrationAssembler.assemble` /
 :meth:`~concursus.assemble.OrchestrationAssembler.recompile` turn a DAG + manifests into a
 frozen :class:`~concursus.assemble.ProvisioningPlan` VALUE, and
 :meth:`~concursus.execute.supervisor.Supervisor.run` executes that plan in a SINGLE static
-forward pass.  :class:`GovernorLoop` is a NEW, strictly-outer layer that runs a bounded cycle
-*around* the compiler.  It never reaches inside a running Supervisor, never mutates a frozen
-plan, and never turns the compiler into a runtime governor.
+forward pass.  :class:`GovernorLoop` is the RUNTIME-GOVERNANCE organ: a strictly-outer bounded cycle
+*around* the compiler.  Running an outer control loop is NOT a refusal to govern — it is HOW concursus
+governs at OPC scale, safely and auditably: it never reaches inside a running Supervisor, never mutates
+a frozen plan, and never turns the compiler into a runtime governor.
 
 The topology is FIXED and compiled once::
 

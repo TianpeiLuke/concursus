@@ -1,15 +1,19 @@
-"""Governor: the OUTER cyclic driver layer around the concursus compiler.
+"""Governor: the runtime-governance organ of the concursus OPC substrate.
 
-concursus proper is a COMPILER: ``assemble()``/``recompile()`` turn a DAG +
-manifests into a frozen :class:`ProvisioningPlan` VALUE, and the ``Supervisor``
-executes that plan in a single static forward pass.  The governor is a NEW,
-strictly-outer layer that runs a bounded cycle *around* the compiler: each
-round it forms a fresh frozen plan at the compiler front and dispatches a new
-bounded episode.  It never reaches inside a running Supervisor, never mutates a
-frozen plan, and never turns the compiler into a runtime governor.
+concursus is the substrate of the OPC (One-Person-Company) operating model — a
+director-not-operator system of persistent, governed crews.  The compiler is
+ONE organ: ``assemble()``/``recompile()`` turn a DAG + manifests into a frozen
+:class:`ProvisioningPlan` VALUE, and the ``Supervisor`` executes that plan in a
+single static forward pass.  The governor is the runtime-governance organ that
+runs a bounded cycle *around* the compiler: each round it forms a fresh frozen
+plan at the compiler front and dispatches a new bounded episode.  Governing at
+OPC scale safely and auditably is exactly WHY this loop stays strictly outer —
+it never reaches inside a running Supervisor, never mutates a frozen plan, and
+never collapses the compiler into the loop.  Plan/execute is not a refusal to
+govern; it is HOW the governor governs.
 
-This package intentionally holds only outer-loop machinery.  The persistent
-outer-loop state lives in :mod:`concursus.governor.state`.
+This package holds the outer-loop, standing-crew, and director machinery.  The
+persistent outer-loop state lives in :mod:`concursus.governor.state`.
 """
 
 from concursus.governor.ktlo import (

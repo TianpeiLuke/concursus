@@ -1,15 +1,20 @@
 """Create-time **deploy gate** — decide ``live`` | ``shadow`` | ``hold`` for one agent node.
 
-Concursus is a compiler, not a runtime governor. This module supplies the *author-declared*,
-*create-time* trust vocabulary the deploy actuator consults **exactly once per node per deploy**
-to decide whether a side-effecting agent may stand up on its live (``DEFAULT``) endpoint, must
-land on a non-default **shadow** endpoint instead, or must be **held** for escalation.
+Graduated trust is one of concursus's OPC organs — how the substrate lets persistent, governed
+crews take side-effecting action at OPC scale *safely and auditably*, with the human as director.
+This module is its **create-time** face: the *author-declared* trust vocabulary the deploy actuator
+consults **exactly once per node per deploy** to decide whether a side-effecting agent may stand up
+on its live (``DEFAULT``) endpoint, must land on a non-default **shadow** endpoint instead, or must
+be **held** for escalation. (The runtime, per-decision face of the same trust ladder lives in
+``governor.TrustLadderScheduler``; this gate is the compile-time seed it grades against.)
 
-IDENTITY (non-negotiable): this gate fires ONCE at provision time for an author-declared node.
-It is NEVER a per-invocation check, it NEVER re-earns or updates trust from a run outcome, and
-it NEVER chooses among competing agents. :class:`TrustGrade` is a static seed the manifest
-author declares; :func:`evaluate_deploy_gate` is a pure function of that seed plus the caller's
-policy (``min_autonomy`` / ``require_approval``). No AWS, no state, pure stdlib.
+DISCIPLINE (non-negotiable — this is *how* the gate governs safely, not a scope ceiling): this
+gate fires ONCE at provision time for an author-declared node. It is NEVER a per-invocation check,
+it NEVER re-earns or updates trust from a run outcome, and it NEVER chooses among competing agents
+— that live, per-decision grading is the governor's job, and keeping it out of the compiler is
+what makes each deploy a pure, replayable, auditable decision. :class:`TrustGrade` is a static seed
+the manifest author declares; :func:`evaluate_deploy_gate` is a pure function of that seed plus the
+caller's policy (``min_autonomy`` / ``require_approval``). No AWS, no state, pure stdlib.
 """
 
 from __future__ import annotations

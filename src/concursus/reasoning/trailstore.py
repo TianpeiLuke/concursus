@@ -1,8 +1,10 @@
 """The **HypothesisTrail** — the durable ``.3`` reasoning-branch store (Phase 5, AI-23 + AI-26).
 
-Concursus is a **compiler, not a runtime governor**. This module is the FAR-HORIZON reasoning
-tier and therefore the highest identity risk, so its contract is deliberately narrow: everything
-here belongs to **PLAN-FORMATION**, STRICTLY BEFORE :meth:`~concursus.assemble.OrchestrationAssembler.assemble`.
+Concursus is the **substrate of the OPC (One-Person-Company) operating model** — a
+director-not-operator system of persistent, governed crews. The compiler is ONE organ; this module
+is its **DELIBERATION organ**, forming plans by bounded reasoning BEFORE committing them. Its
+contract is scoped for **safe, auditable governance**, not a refusal to govern: everything here
+belongs to **PLAN-FORMATION**, STRICTLY BEFORE :meth:`~concursus.assemble.OrchestrationAssembler.assemble`.
 It records a *deliberation* — a tree of hypotheses fanned out under a run's ``.3`` reasoning
 branch, each closed by a verdict — into a durable, replayable log. It **never** dispatches an
 agent, and it is **NEVER** wired inside :meth:`~concursus.supervisor.Supervisor.run` (which stays
@@ -565,8 +567,9 @@ def drive_deliberation(
     hypothesis) or a list of child candidates (which fans sharper children). The seam is fully
     optional and needs NO LLM/LangGraph: a stub callable drives it in tests. Returns the round count.
 
-    This is a fallback DRIVER, not a runtime governor — it never touches ``Supervisor.run``; the
-    caller lowers the CONVERGED trail into an immutable AgentDAG afterwards (guarded by
+    This is a plan-formation DRIVER within the deliberation organ — distinct from the outer
+    :class:`~concursus.governor.GovernorLoop`, and it never touches ``Supervisor.run``; the caller
+    lowers the CONVERGED trail into an immutable AgentDAG afterwards (guarded by
     :func:`require_resolved`).
     """
     rounds = 0

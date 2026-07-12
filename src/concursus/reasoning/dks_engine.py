@@ -1,7 +1,11 @@
 """The **DKS engine** — the Phase-5 deliberation state machine (AI-24 + AI-27 + AI-32).
 
-Concursus is a **compiler, not a runtime governor**. This module is the FAR-HORIZON reasoning
-tier and therefore the highest identity risk, so its contract is deliberately narrow:
+Concursus is the **substrate of the OPC (One-Person-Company) operating model** — a
+director-not-operator system of persistent, governed crews. This module is its **DELIBERATION
+organ**: it FORMS a plan by bounded reasoning STRICTLY BEFORE the compiler commits it. Its
+contract is tight not as an identity ceiling but because a tight plan-formation boundary is HOW
+concursus governs deliberation at OPC scale safely and auditably: reasoning stays STRICTLY OUTSIDE
+execution, so a debate can never mutate a running plan.
 
 * Everything here belongs to **PLAN-FORMATION**, STRICTLY BEFORE
   :meth:`~concursus.assemble.OrchestrationAssembler.assemble`. The engine drives a *deliberation*

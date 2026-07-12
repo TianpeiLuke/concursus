@@ -454,3 +454,43 @@ def test_ktlo_default_is_ungoverned_unchanged():
     assert episode.escalated == []
     assert episode.terminated_by == "frontier_exhaust"
     assert set(episode.completed) == {"ingest", "summarize"}
+
+
+# == signal -> episode inputs threading ========================================
+def _capturing_daemon(source, captured):
+    class _CapturingSupervisor(_FakeSupervisor):
+        def run(self, inputs):
+            captured.append(dict(inputs))
+            return super().run(inputs)
+
+    return KTLODaemon(
+        _two_node_manifests(),
+        source=source,
+        mode="ktlo",
+        store_factory=InProcessStateStore,
+        supervisor_factory=lambda **kw: _CapturingSupervisor(**kw),
+        plan_model_fn=_plan_model_fn,
+        backend="python",
+    )
+
+
+def test_flat_signal_fields_thread_into_episode_inputs():
+    """A plain ``{"uri": ...}`` signal (no explicit ``inputs`` key) threads its own non-reserved
+    fields into the episode run inputs instead of silently arriving as ``{}``."""
+    captured = []
+    source = InProcessEventQueue([{"id": "s1", "uri": "s3://doc"}], closed=True)
+    _capturing_daemon(source, captured).run()
+    assert captured, "an episode should have been dispatched"
+    assert captured[0].get("uri") == "s3://doc"  # flat field threaded through
+    assert captured[0].get("signal", {}).get("uri") == "s3://doc"  # whole signal still available
+
+
+def test_explicit_signal_inputs_take_precedence_over_flat_fields():
+    """When a signal carries an explicit ``inputs`` mapping, it wins — flat fields are NOT merged."""
+    captured = []
+    source = InProcessEventQueue(
+        [{"id": "s2", "inputs": {"document": "D"}, "uri": "ignored"}], closed=True
+    )
+    _capturing_daemon(source, captured).run()
+    assert captured and captured[0].get("document") == "D"
+    assert "uri" not in captured[0]  # explicit inputs mapping is authoritative

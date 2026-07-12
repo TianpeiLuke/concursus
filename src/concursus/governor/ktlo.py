@@ -380,7 +380,15 @@ class KTLODaemon:
         goal = self._goal_fn(signal)
         store = self._store_factory()
         loop = self._build_loop(goal, store, signal)
-        inputs = dict(signal.get("inputs") or {})
+        # Episode inputs: an explicit ``signal["inputs"]`` mapping if present; otherwise fall back to
+        # the signal's own non-reserved fields, so a plain ``{"uri": ...}`` signal threads through to
+        # the run inputs instead of silently arriving as ``{}``. The whole signal is still available
+        # under the ``"signal"`` key for goal/context use.
+        _RESERVED = ("inputs", "id", "source", "signal", "goal")
+        inputs = dict(
+            signal.get("inputs")
+            or {k: v for k, v in signal.items() if k not in _RESERVED}
+        )
         inputs.setdefault("signal", signal)
         try:
             episode = loop.run(inputs)

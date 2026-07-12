@@ -10,6 +10,7 @@ from concursus.core.manifest import AgentManifest
 from concursus.build.provision import (
     Clients,
     ProvisionError,
+    _await_runtime_ready,
     ensure_ecr_repo,
     ensure_execution_role,
     provision_agent,
@@ -600,3 +601,150 @@ def test_provision_agent_ledger_defaults_off(tmp_path):
     res = provision_agent(entry, clients=clients, source_dir=str(tmp_path), run=run)
     assert res["action"] == "created"
     assert not (tmp_path / "ledger.json").exists()
+
+
+# -- runtime readiness (CreateAgentRuntime is async) ------------------------
+class _AsyncControl(FakeControl):
+    """A control plane whose CreateAgentRuntime returns CREATING, then GetAgentRuntime walks a
+    scripted list of statuses (so the READY-wait can be exercised without real time)."""
+
+    def __init__(self, create_status="CREATING", get_statuses=("READY",), failure_reason=None):
+        super().__init__()
+        self._create_status = create_status
+        self._get = list(get_statuses)
+        self._failure_reason = failure_reason
+        self.get_calls = 0
+
+    def create_agent_runtime(self, **kw):
+        self.calls.append(kw)
+        name = kw["agentRuntimeName"]
+        return {
+            "agentRuntimeArn": f"arn:aws:bedrock-agentcore:us-east-1:111:runtime/{name}-xyz",
+            "agentRuntimeId": f"{name}-xyz",
+            "status": self._create_status,
+        }
+
+    def get_agent_runtime(self, **kw):
+        self.get_calls += 1
+        status = self._get.pop(0) if self._get else "READY"
+        out = {"status": status}
+        if status in ("CREATE_FAILED", "UPDATE_FAILED") and self._failure_reason:
+            out["failureReason"] = self._failure_reason
+        return out
+
+
+def test_await_runtime_ready_no_status_is_treated_ready_without_polling():
+    class _NoPoll:
+        def get_agent_runtime(self, **kw):
+            raise AssertionError("must not poll when status is None")
+
+    assert _await_runtime_ready(_NoPoll(), "rid", status=None, sleep=lambda *_: None) == "READY"
+
+
+def test_await_runtime_ready_polls_until_ready():
+    ctrl = _AsyncControl(get_statuses=["CREATING", "CREATING", "READY"])
+    status = _await_runtime_ready(ctrl, "rid", status="CREATING", sleep=lambda *_: None)
+    assert status == "READY"
+    assert ctrl.get_calls == 3
+
+
+def test_await_runtime_ready_raises_on_create_failed():
+    ctrl = _AsyncControl(get_statuses=["CREATE_FAILED"], failure_reason="image pull error")
+    with pytest.raises(ProvisionError, match="CREATE_FAILED.*image pull error"):
+        _await_runtime_ready(ctrl, "rid", status="CREATING", sleep=lambda *_: None)
+
+
+def test_await_runtime_ready_times_out():
+    ctrl = _AsyncControl(get_statuses=["CREATING"] * 100)
+    with pytest.raises(ProvisionError, match="did not reach READY"):
+        _await_runtime_ready(ctrl, "rid", status="CREATING", sleep=lambda *_: None, poll=1.0, timeout=3.0)
+
+
+def test_provision_agent_waits_for_runtime_ready(tmp_path):
+    _, run = _fakes()
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_AsyncControl(get_statuses=["CREATING", "READY"]))
+    res = provision_agent(_container_entry(), clients=clients, source_dir=str(tmp_path), run=run, sleep=lambda *_: None)
+    assert res["action"] == "created"
+    assert res["status"] == "READY"
+    assert clients.control.get_calls == 2  # polled past CREATING to READY
+
+
+def test_provision_agent_raises_on_create_failed(tmp_path):
+    ctrl = _AsyncControl(get_statuses=["CREATE_FAILED"], failure_reason="boom")
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=ctrl)
+    with pytest.raises(ProvisionError, match="CREATE_FAILED"):
+        provision_agent(_container_entry(), clients=clients, source_dir=str(tmp_path), run=FakeRun(), sleep=lambda *_: None)
+
+
+# -- arm64 image (AgentCore only launches linux/arm64) ----------------------
+def test_docker_build_targets_linux_arm64(tmp_path):
+    clients, run = _fakes()
+    provision_agent(_container_entry(), clients=clients, source_dir=str(tmp_path), run=run)
+    build = next(c for c in run.cmds if c[:2] == ["docker", "build"])
+    assert "--platform" in build and "linux/arm64" in build
+
+
+# -- role_arn observability (supplied role must not report null) ------------
+def test_supplied_role_arn_is_echoed_into_result(tmp_path):
+    m = AgentManifest.from_dict(
+        {
+            "name": "summarize",
+            "registry": {
+                "container_uri": "x",
+                "protocol": "HTTP",
+                "entry": "agents.summarize:handler",
+                "ecr_repo": "team/summarize",
+                "role_arn": "arn:aws:iam::111:role/preexisting-exec",
+            },
+            "contract": {
+                "inputs": {"document": {"type": "string"}},
+                "outputs": {"summary": {"type": "string", "required": True}},
+            },
+        }
+    )
+    entry = RuntimeBuilderFactory.synthesize(m, account="111", region="us-east-1")
+    assert entry.execution_role is None  # a supplied role_arn is NOT synthesized
+    clients, run = _fakes()
+    res = provision_agent(entry, clients=clients, source_dir=str(tmp_path), run=run)
+    assert res["role_arn"] == "arn:aws:iam::111:role/preexisting-exec"  # echoed, not null
+
+
+# -- partial-result guarantee holds for raw AWS errors, not only ProvisionError
+class _ClientErrorControl(FakeControl):
+    """CreateAgentRuntime raises a raw botocore-shaped ClientError (the AWS-side failure that the
+    old `except ProvisionError` let escape, discarding every already-provisioned node)."""
+
+    def __init__(self, fail_node, code="ThrottlingException"):
+        super().__init__()
+        self.fail_node = fail_node
+        self.code = code
+
+    def create_agent_runtime(self, **kw):
+        if kw["agentRuntimeName"] == self.fail_node:
+            raise _client_error(self.code)
+        return super().create_agent_runtime(**kw)
+
+
+def test_provision_plan_converts_raw_client_error_to_failed_result(tmp_path):
+    plan = _linear_plan(["n0", "n1", "n2", "n3"])
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_ClientErrorControl("n2"))
+    results = provision_plan(
+        plan, default_source_dir=str(tmp_path), clients=clients, run=FakeRun(), halt_on_error=False, sleep=lambda *_: None
+    )
+    # the raw ClientError becomes a per-node 'failed' result; the 2 already-provisioned ARNs survive
+    by_node = {r["node"]: r for r in results}
+    assert by_node["n0"]["action"] == "created" and by_node["n0"]["arn"]
+    assert by_node["n1"]["action"] == "created" and by_node["n1"]["arn"]
+    assert by_node["n2"]["action"] == "failed" and "ThrottlingException" in by_node["n2"]["error"]
+
+
+def test_provision_plan_reraises_non_aws_bug(tmp_path):
+    # A genuine bug (not a ProvisionError, not an AWS error) must NOT be swallowed as 'failed'.
+    class _BuggyControl(FakeControl):
+        def create_agent_runtime(self, **kw):
+            raise KeyError("programmer error")
+
+    plan = _linear_plan(["n0"])
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_BuggyControl())
+    with pytest.raises(KeyError):
+        provision_plan(plan, default_source_dir=str(tmp_path), clients=clients, run=FakeRun(), halt_on_error=False)

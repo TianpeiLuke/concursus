@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
@@ -35,6 +36,17 @@ if TYPE_CHECKING:  # pragma: no cover - hints only
 # Placeholders the build plan carries until deploy fills them (must match build.py).
 _IMAGE_PLACEHOLDER = "<image-uri>"
 _ROLE_PLACEHOLDER = "<execution-role-arn>"
+
+# AgentCore Runtime only accepts linux/arm64 images — build for it explicitly so a build on an
+# x86 host (e.g. a CI runner) does not push a green-but-unlaunchable amd64 image.
+_RUNTIME_PLATFORM = "linux/arm64"
+
+# CreateAgentRuntime is asynchronous (returns status=CREATING); poll GetAgentRuntime to a terminal
+# state before treating the runtime as deployed.
+_READY_STATUS = "READY"
+_FAILED_STATUSES = frozenset({"CREATE_FAILED", "UPDATE_FAILED"})
+_READY_POLL_SECONDS = 5.0
+_READY_TIMEOUT_SECONDS = 600.0
 
 # A shell runner: ``(cmd, input=?, cwd=?) -> None``; raises on non-zero exit.
 RunFn = Callable[..., None]
@@ -101,6 +113,23 @@ def _err_code(exc: Exception) -> str:
     if isinstance(resp, dict):
         return str(resp.get("Error", {}).get("Code", type(exc).__name__))
     return type(exc).__name__
+
+
+def _is_aws_error(exc: Exception) -> bool:
+    """True if ``exc`` is a botocore AWS error (``ClientError``/``BotoCoreError``).
+
+    Checks the duck-typed ``ClientError`` shape (a ``.response`` dict with an ``Error`` key — which
+    a real ``ClientError`` also carries) first, then falls back to botocore's exception types
+    (lazy-imported, so the module keeps no hard boto3 dependency at import).
+    """
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict) and "Error" in resp:
+        return True
+    try:
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError:  # pragma: no cover - only without the agentcore extra
+        return False
+    return isinstance(exc, (BotoCoreError, ClientError))
 
 
 # -- IAM execution role -----------------------------------------------------
@@ -179,11 +208,52 @@ def build_and_push_image(
             with open(req_path, "w", encoding="utf-8") as fh:
                 fh.write("bedrock-agentcore\n")
         _docker_login(ecr, run)
-        run(["docker", "build", "-t", image, context])
+        # AgentCore Runtime only launches linux/arm64 images; build for it explicitly so an x86
+        # host (e.g. CI) does not push a green-but-unlaunchable amd64 image.
+        run(["docker", "build", "--platform", _RUNTIME_PLATFORM, "-t", image, context])
         run(["docker", "push", image])
         return image
     finally:
         shutil.rmtree(context, ignore_errors=True)
+
+
+# -- runtime readiness ------------------------------------------------------
+def _await_runtime_ready(
+    control: Any,
+    runtime_id: Optional[str],
+    *,
+    status: Optional[str],
+    failure_reason: Optional[str] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    poll: float = _READY_POLL_SECONDS,
+    timeout: float = _READY_TIMEOUT_SECONDS,
+) -> str:
+    """Poll ``GetAgentRuntime`` until the runtime reaches ``READY``; return the terminal status.
+
+    ``CreateAgentRuntime`` is asynchronous — it returns while the runtime is still ``CREATING`` —
+    so a caller that treats the create response as "deployed" can record a runtime that later
+    ``CREATE_FAILED`` (or invoke one that is not yet ready). This polls to a terminal state and
+    raises :class:`ProvisionError` on a failure or a timeout. A ``None`` status (e.g. a minimal
+    injected fake, or an already-terminal create) is treated as already-``READY`` — so the poll is
+    a no-op unless the service actually reports ``CREATING``.
+    """
+    waited = 0.0
+    while status is not None and status != _READY_STATUS:
+        if status in _FAILED_STATUSES:
+            raise ProvisionError(
+                f"agent runtime {runtime_id} entered {status}: {failure_reason or 'no reason given'}"
+            )
+        if waited >= timeout:
+            raise ProvisionError(
+                f"agent runtime {runtime_id} did not reach READY within {int(timeout)}s "
+                f"(last status {status!r})"
+            )
+        sleep(poll)
+        waited += poll
+        got = control.get_agent_runtime(agentRuntimeId=runtime_id)
+        status = got.get("status")
+        failure_reason = got.get("failureReason", failure_reason)
+    return status or _READY_STATUS
 
 
 # -- per-agent + whole-plan provisioning ------------------------------------
@@ -200,6 +270,7 @@ def provision_agent(
     require_approval: bool = False,
     ledger: Optional["DeployLedger"] = None,
     now: Optional[Union[str, int, float]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Provision one agent; return ``{"node", "arn", "action", "role_arn", "image_uri"}``.
 
@@ -283,6 +354,10 @@ def provision_agent(
             f"{entry.name}: no execution role — set registry.role_arn or let the plan "
             "synthesize one (pass --account/--region)"
         )
+    else:
+        # A manifest-supplied registry.role_arn (no synthesized role) — echo it into the result +
+        # ledger so the deployed role is observable (not silently reported as null).
+        result["role_arn"] = req.get("roleArn")
 
     # 2) Container image — build + push only when the plan left a placeholder URI.
     if entry.build_mode == "container":
@@ -299,9 +374,20 @@ def provision_agent(
     #    result; the create request itself stays a clean CreateAgentRuntime — the shadow
     #    endpoint is a separate, downstream concern, not an unknown param smuggled into boto3.)
     created = clients.control.create_agent_runtime(**req)
-    result.update(
-        arn=created.get("agentRuntimeArn"),
-        action="updated" if changed else "created",
+    arn = created.get("agentRuntimeArn")
+    result.update(arn=arn, action="updated" if changed else "created")
+
+    # 3a) Wait out the async create — CreateAgentRuntime returns while CREATING, so a runtime that
+    #     later CREATE_FAILED must NOT be recorded as a usable 'created' node (dedup would then skip
+    #     re-creating it, and run --execute could invoke a dead/not-ready runtime). Raises on a
+    #     terminal failure or timeout. A fake/create response with no status is treated as READY.
+    runtime_id = created.get("agentRuntimeId") or (arn.rsplit("/", 1)[-1] if arn else None)
+    result["status"] = _await_runtime_ready(
+        clients.control,
+        runtime_id,
+        status=created.get("status"),
+        failure_reason=created.get("failureReason"),
+        sleep=sleep or time.sleep,
     )
 
     # 4) Persisted reuse-by-content (opt-in) — append this outcome to the ledger for audit +
@@ -345,6 +431,7 @@ def provision_plan(
     require_approval: bool = False,
     ledger: Optional["DeployLedger"] = None,
     now: Optional[Union[str, int, float]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Provision every agent in ``plan.order``; return one result dict per node (in order).
 
@@ -387,9 +474,16 @@ def provision_plan(
                     require_approval=require_approval,
                     ledger=ledger,
                     now=now,
+                    sleep=sleep,
                 )
             )
-        except ProvisionError as exc:
+        except Exception as exc:  # noqa: BLE001 - convert AWS/provision failures to a per-node result
+            # A ProvisionError (explained) OR a raw botocore error (AWS-side: throttle, access
+            # denied, conflict) becomes a per-node ``failed`` result so the partial-result
+            # guarantee actually holds — a raw ClientError would otherwise escape and discard every
+            # already-provisioned node's ARN. Anything else is a genuine bug: re-raise it.
+            if not isinstance(exc, ProvisionError) and not _is_aws_error(exc):
+                raise
             results.append({"node": node, "action": "failed", "error": str(exc)})
             if halt_on_error:
                 break

@@ -258,3 +258,47 @@ def test_injected_model_still_overrides_decompose():
 
     dag = plan_from_goal("anything", decompose=True, plan_model_fn=model)
     assert set(dag.nodes) == {"a", "b"}
+
+
+# -- FZ 35e2b3b C3: prime the decomposer with a cross-domain precedent shape ----------------
+def _precedent(nodes):
+    """A RetrievedPrecedent.to_dict()-shaped payload carrying a prior run's executed node names."""
+    return {"trail_id": "past", "method": "dense", "score": 0.8, "precedent": {"nodes": nodes}}
+
+
+def test_precedent_priming_borrows_stage_shape_for_a_novel_goal():
+    """A goal with NO keyword match borrows an adjacent precedent's stage shape (warm start)."""
+    prec = [_precedent(["inv__scope", "inv__gather_evidence", "inv__hypothesize", "inv__verify"])]
+    # 'flurb widget escalation' matches no _SHAPE_KEYWORDS => generic without a precedent.
+    generic = [n.split("__", 1)[1] for n in
+               plan_from_goal("handle the flurb widget escalation", decompose=True).topological_sort()]
+    assert generic == ["ingest", "analyze", "synthesize", "format"]
+    # With the precedent, it borrows scope/gather_evidence/hypothesize/verify.
+    primed = [n.split("__", 1)[1] for n in
+              plan_from_goal("handle the flurb widget escalation", decompose=True, precedents=prec).topological_sort()]
+    assert primed == ["scope", "gather_evidence", "hypothesize", "verify"]
+
+
+def test_precedent_priming_yields_to_keyword_match():
+    """An explicit goal keyword match still WINS over a precedent (keyword routing is more specific)."""
+    prec = [_precedent(["x__gather", "x__analyze", "x__draft"])]
+    # 'investigate' is a keyword => the investigate shape, NOT the precedent's report shape.
+    nodes = [n.split("__", 1)[1] for n in
+             plan_from_goal("investigate the outage", decompose=True, precedents=prec).topological_sort()]
+    assert nodes == ["scope", "gather_evidence", "hypothesize", "verify"]
+
+
+def test_precedent_priming_ignores_unusable_precedents():
+    """A precedent with no multi-stage capability shape is ignored (fall back to the generic shape)."""
+    # A single-node / non-capability precedent (no "__" stages) can't prime => generic fallback.
+    prec = [_precedent(["opaque_single_node"]), {"trail_id": "t", "precedent": {}}]
+    nodes = [n.split("__", 1)[1] for n in
+             plan_from_goal("handle the flurb widget", decompose=True, precedents=prec).topological_sort()]
+    assert nodes == ["ingest", "analyze", "synthesize", "format"]
+
+
+def test_precedent_priming_only_when_decompose():
+    """Priming is a decompose-mode feature; default (single-node) authoring ignores precedents."""
+    prec = [_precedent(["inv__scope", "inv__verify"])]
+    dag = plan_from_goal("handle the flurb widget", precedents=prec)  # decompose defaults False
+    assert len(dag.nodes) == 1  # still the single-node fallback

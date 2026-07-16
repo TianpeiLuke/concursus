@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-domain precedent priming for the decomposer (`plan_from_goal(decompose=True,
+  precedents=…)`).** A goal with no keyword match now warm-starts its decomposition from a
+  structurally-adjacent prior run: the decomposer borrows the capability-stage shape from the
+  most-relevant retrieved precedent's executed `nodes` (stripping each `<prefix>__<stage>` to its
+  `<stage>`), re-prefixed to the new goal. Priority: an explicit `_SHAPE_KEYWORDS` keyword match still
+  wins; then a usable precedent shape; then the generic `ingest → analyze → synthesize → format`
+  fallback. Deterministic + offline; a precedent with no multi-stage capability shape is ignored.
+  Realizes cross-domain transfer at the planner front (FZ 35e2b3b C3, plan P5.2). +4 tests.
+
+### Changed
+
+- **`AgentDAG.nodes` now returns nodes in TOPOLOGICAL (dispatch) order** — producers before
+  consumers, ties broken by name for determinism — instead of a plain name-sort. This makes
+  `dag.nodes` read as the actual chain order (matching `topological_sort()`). It falls back to a
+  name-sort for a cyclic graph, so `nodes` still never raises (`to_dict` / `if not dag.nodes` stay
+  safe on an invalid DAG; cycles are still rejected by `validate`/`topological_sort`). For a single
+  node the result is unchanged.
+- **Capability node ids no longer carry a spurious leading `_` on the stage** — the goal-slug prefix
+  is `rstrip("_")`-ed before the `__<stage>` join, so a goal whose 24-char truncation ended in `_`
+  yields `…checkout__scope`, not `…checkout___scope` / a `_scope` stage.
+
+### Added
+
 - **`governor.authoring.staff_with_rebind()` — re-bind on alignment failure (the compiler as
   regulator, not just validator).** Instead of hard-erroring when a bound team fails the deep type
   gate, this SEARCHES per-node candidate lists for a type-aligning assignment: given

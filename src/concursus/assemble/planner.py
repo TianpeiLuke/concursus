@@ -107,9 +107,37 @@ _SHAPE_KEYWORDS = {
 }
 
 
+def _stages_from_precedent(precedents: "Optional[Sequence[Mapping[str, object]]]") -> tuple:
+    """Borrow a capability-stage shape from the most-relevant retrieved precedent (FZ 35e2b3b C3).
+
+    Cross-domain PRIMING: a new domain with no keyword match can warm-start its decomposition from a
+    structurally-adjacent prior run. Reads the FIRST precedent's executed ``nodes`` (a
+    ``RetrievedPrecedent.to_dict()`` payload, ``{"precedent": {"nodes": [...]}}``, or a bare payload),
+    strips each node's ``<prefix>__<stage>`` down to its ``<stage>`` suffix, and returns the ordered,
+    de-duplicated stage tuple. Returns ``()`` when no precedent carries a usable capability shape (so
+    the caller falls back to keyword routing / the generic shape). Deterministic + offline.
+    """
+    for entry in precedents or ():
+        if not isinstance(entry, Mapping):
+            continue
+        payload = entry.get("precedent") if isinstance(entry.get("precedent"), Mapping) else entry
+        nodes = payload.get("nodes") if isinstance(payload, Mapping) else None
+        if not isinstance(nodes, (list, tuple)):
+            continue
+        stages: list = []
+        for node in nodes:
+            stage = str(node).split("__", 1)[1] if "__" in str(node) else None
+            if stage and stage not in stages:
+                stages.append(stage)
+        if len(stages) > 1:  # a real multi-stage capability shape (not a single opaque node)
+            return tuple(stages)
+    return ()
+
+
 def _template_decompose(
     goal: str,
     *,
+    precedents: "Optional[Sequence[Mapping[str, object]]]" = None,
     max_nodes: int = DEFAULT_MAX_NODES,
     max_depth: int = DEFAULT_MAX_DEPTH,
     max_fanout: int = DEFAULT_MAX_FANOUT,
@@ -118,24 +146,31 @@ def _template_decompose(
 
     Decomposes ``goal`` into a small *linear* chain of agent-agnostic **capability** task nodes
     (task labels, never agent/manifest names — P1.2), so the scheduler has real tasks to bind
-    rather than a single opaque node. The shape is keyword-routed against :data:`_SHAPE_KEYWORDS`
-    with a generic ``ingest -> analyze -> synthesize -> format`` fallback. No LLM, no AWS — a real
-    ``plan_model_fn`` UPGRADES this, it does not enable it.
+    rather than a single opaque node. The shape is chosen in priority order: (C3) borrow an adjacent
+    retrieved ``precedent``'s stage shape if one is supplied; else keyword-route against
+    :data:`_SHAPE_KEYWORDS`; else a generic ``ingest -> analyze -> synthesize -> format`` fallback.
+    No LLM, no AWS — a real ``plan_model_fn`` UPGRADES this, it does not enable it.
 
     The emitted DAG is passed through :func:`_check_complexity` so it honors the per-sub-task
     complexity contract (P1.3).
     """
     text = str(goal).strip().lower()
+    # C3: prefer a cross-domain precedent's stage shape (warm-start a new domain from adjacent
+    # experience) when the goal keywords don't already name a specific shape.
     stages: tuple = ()
     for kw, shape in _SHAPE_KEYWORDS.items():
         if kw in text:
             stages = shape
             break
     if not stages:
+        stages = _stages_from_precedent(precedents)
+    if not stages:
         stages = ("ingest", "analyze", "synthesize", "format")
 
     # A goal-scoped prefix keeps node ids stable + readable without embedding agent identity.
-    prefix = _slug(goal)[:24] or "task"
+    # Strip any trailing '_' left by the 24-char truncation so the '__<stage>' boundary is a clean
+    # double-underscore (not '..._' + '__' -> a spurious leading '_' on the stage).
+    prefix = _slug(goal)[:24].rstrip("_") or "task"
     dag = AgentDAG()
     prev: Optional[str] = None
     for stage in stages:
@@ -270,7 +305,8 @@ def plan_from_goal(
         if not decompose:
             return _fallback_template(goal)
         return _template_decompose(
-            goal, max_nodes=max_nodes, max_depth=max_depth, max_fanout=max_fanout
+            goal, precedents=ctx_precedents,
+            max_nodes=max_nodes, max_depth=max_depth, max_fanout=max_fanout
         )
 
     spec = plan_model_fn(goal, ctx_precedents, ctx_directives)

@@ -55,7 +55,17 @@ class AgentDAG:
     # -- inspection ---------------------------------------------------------
     @property
     def nodes(self) -> List[str]:
-        return sorted(self._nodes)
+        """Node ids in a valid dispatch (TOPOLOGICAL) order — producers before consumers.
+
+        Ties among ready nodes break by name, so the order is deterministic. Falls back to a plain
+        name-sort for a CYCLIC graph (so ``nodes`` never raises — ``to_dict`` / ``if not dag.nodes``
+        stay safe on an invalid DAG; cycles are still rejected by :meth:`validate` /
+        :meth:`topological_sort`). For a single node this equals ``[that_node]``.
+        """
+        try:
+            return self.topological_sort()
+        except DAGError:
+            return sorted(self._nodes)
 
     @property
     def edges(self) -> List[tuple]:

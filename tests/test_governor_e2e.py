@@ -348,3 +348,54 @@ def test_e2e_deliberate_resume_reconciles_and_completes(tmp_path):
     # The deliberated DAG reconciled to the manifest topology (no AlignmentError/AssemblyError).
     assert set(result.completed) == {"ingest", "summarize"}
     assert result.state.current_frozen_plan.order == ["ingest", "summarize"]
+
+
+# == FZ 35e2b3b C1: cold-start north-star — a NOVEL goal launches end-to-end, zero bench =======
+class _ResultInvoke:
+    """A fake InvokeFn for staffed capability roles (their output schema is ``{result}``)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, arn, qualifier, session_id, payload_bytes):
+        self.calls.append(arn.split(":")[-1])
+        return {"result": f"{arn.split(':')[-1]}-out"}
+
+
+def test_e2e_cold_start_novel_goal_launches_with_zero_manifests():
+    """THE NORTH-STAR (plan P0.2): a goal with NO precedent, NO matching agents, and NO caller
+    manifests launches end-to-end via decompose -> staff -> assemble through the REAL Supervisor.
+    Before this line of work it produced a 1-node plan / needed hand-authored manifests; now the
+    loop decomposes into a capability chain, authors a role per capability, and runs it."""
+    from concursus.assemble.planner import plan_from_goal
+
+    goal = "investigate the checkout latency regression"
+    # A deploy step would provision each authored role; simulate that by supplying an ARN per node.
+    nodes = plan_from_goal(goal, decompose=True).nodes
+    arns = {n: f"arn:{n}" for n in nodes}
+    invoke = _ResultInvoke()
+
+    loop = GovernorLoop(
+        goal, {},                       # ZERO caller manifests — the cold-start premise
+        invoke_fn=invoke, arns=arns, backend="python", decompose=True,
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    # A real multi-node capability plan was authored, staffed, frozen, and RUN to completion.
+    order = result.state.current_frozen_plan.order
+    assert len(order) > 1 and all("__" in n for n in order)     # agent-agnostic capability roles
+    assert result.terminated_by == "frontier_exhaust"
+    assert set(result.completed) == set(order)
+    assert invoke.calls == order                                # real Supervisor invoked each, in topo order
+
+
+def test_e2e_cold_start_unprovisioned_roles_cannot_dispatch():
+    """The freshly-authored roles are UNPROVISIONED (placeholder container_uri, no ARN), so the real
+    Supervisor's binding-integrity gate refuses to dispatch them until a deploy supplies ARNs — a
+    freshly-created role must be provisioned before it can run (deploy is a separate, gated step)."""
+    loop = GovernorLoop(
+        "investigate the checkout latency regression", {},
+        invoke_fn=_ResultInvoke(), backend="python", decompose=True,  # NO arns => not provisioned
+    )
+    with pytest.raises(RuntimeError, match="no provisioned runtime ARN"):
+        loop.run({"uri": "s3://doc"})

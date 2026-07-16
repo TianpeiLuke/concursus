@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Supervisor(check_acceptance=True)` + `check_acceptance()` — output-QA acceptance contract
+  (opt-in, default off).** A post-run gate DEEPER than the required-key presence check: after a
+  successful shape-validate, each output field's *value* is checked against a declared per-field
+  ``acceptance`` contract (``non_empty`` / ``min_length`` / ``max_length`` / ``enum`` / ``pattern`` —
+  declarative + deterministic, no code eval). A present-but-wrong output fails here exactly like a
+  schema failure, so it is NOT admitted to the store and does NOT complete — the machine-checkable
+  "good output" signal the Trust Ladder needs (a failed QA never earns trust). It rides the existing
+  retry/record path (raises under ``on_error='raise'``, records-failed under ``'record'``), never
+  mutates a frozen plan (INV-3), and adds no compiler loop (INV-2). Conservative: a field with no
+  ``acceptance`` mapping is unconstrained, so a manifest that declares none is unaffected. Default
+  ``check_acceptance=False`` keeps the run byte-for-byte unchanged. FZ 35e2b3b Phase-6 compiler
+  contract (#3 output-QA). +5 tests.
+
 - **`OrchestrationAssembler(single_writer=True)` / `check_alignment(..., single_writer=True)` —
   non-overlap / single-writer gate (opt-in, default off).** Rejects a plan where any consumer input
   is fed by more than one `depends_on` edge. Two edges targeting the same `input_name` are a

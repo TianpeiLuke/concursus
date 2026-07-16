@@ -18,6 +18,7 @@ from concursus.execute.supervisor import (
     _ARN_PLACEHOLDER,
     SchemaError,
     Supervisor,
+    check_acceptance,
     validate_output,
 )
 
@@ -696,3 +697,96 @@ def test_run_resumes_and_skips_already_completed_node():
     assert invoked == {"arn:b", "arn:c", "arn:d"}
     assert outputs["a"] == {"doc": "PRESET"}
     assert fake.payload_for("arn:b") == {"doc": "PRESET"}
+
+
+# -- FZ 35e2b3b B3: output-acceptance QA contract ---------------------------
+def test_check_acceptance_unit_rules():
+    """check_acceptance enforces each declarative rule; a field with no acceptance is unconstrained."""
+    # non_empty
+    schema = {"summary": {"type": "string", "acceptance": {"non_empty": True}}}
+    check_acceptance({"summary": "ok"}, schema)  # passes
+    with pytest.raises(SchemaError, match="non-empty"):
+        check_acceptance({"summary": ""}, schema)
+    # min_length / max_length
+    with pytest.raises(SchemaError, match="min_length"):
+        check_acceptance({"s": "ab"}, {"s": {"acceptance": {"min_length": 3}}})
+    with pytest.raises(SchemaError, match="max_length"):
+        check_acceptance({"s": "abcd"}, {"s": {"acceptance": {"max_length": 3}}})
+    # enum
+    with pytest.raises(SchemaError, match="not in enum"):
+        check_acceptance({"label": "maybe"}, {"label": {"acceptance": {"enum": ["yes", "no"]}}})
+    check_acceptance({"label": "yes"}, {"label": {"acceptance": {"enum": ["yes", "no"]}}})
+    # pattern
+    with pytest.raises(SchemaError, match="does not match pattern"):
+        check_acceptance({"id": "xyz"}, {"id": {"acceptance": {"pattern": r"\d+"}}})
+    check_acceptance({"id": "123"}, {"id": {"acceptance": {"pattern": r"\d+"}}})
+    # a field WITHOUT an acceptance mapping is unconstrained (present-but-anything passes)
+    check_acceptance({"free": ""}, {"free": {"type": "string"}})
+
+
+def _acceptance_manifests(min_length):
+    """A single-node plan whose output field 'summary' carries a min_length acceptance rule."""
+    dag = AgentDAG()
+    dag.add_node("summarize")
+    manifests = {
+        "summarize": AgentManifest.from_dict(
+            {
+                "name": "summarize",
+                "registry": {"container_uri": "x", "protocol": "HTTP"},
+                "contract": {
+                    "inputs": {},
+                    "outputs": {
+                        "summary": {"type": "string", "required": True,
+                                    "acceptance": {"min_length": min_length}},
+                    },
+                },
+            }
+        ),
+    }
+    return dag, manifests
+
+
+def test_supervisor_acceptance_default_off_admits_present_but_weak_output():
+    """DEFAULT (check_acceptance=False): a present-but-weak output (passes shape) is admitted —
+    byte-for-byte today's behavior."""
+    dag, manifests = _acceptance_manifests(min_length=100)
+    fake = FakeInvoker({"arn:summarize": {"summary": "tiny"}})  # present, but < min_length
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake,
+                     arns={"summarize": "arn:summarize"})
+    out = sup.run({})
+    assert out["summarize"] == {"summary": "tiny"}  # admitted despite failing the acceptance rule
+
+
+def test_supervisor_acceptance_on_rejects_present_but_wrong_output():
+    """check_acceptance=True: a present-but-wrong output FAILS the QA gate and is NOT admitted —
+    it does not complete, so it cannot earn trust."""
+    dag, manifests = _acceptance_manifests(min_length=100)
+    fake = FakeInvoker({"arn:summarize": {"summary": "tiny"}})
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake,
+                     arns={"summarize": "arn:summarize"}, check_acceptance=True)
+    with pytest.raises(SchemaError, match="acceptance contract"):
+        sup.run({})  # default on_error='raise' => the QA miss propagates
+
+
+def test_supervisor_acceptance_on_passes_good_output():
+    """check_acceptance=True: an output that MEETS its acceptance contract is admitted normally."""
+    dag, manifests = _acceptance_manifests(min_length=3)
+    fake = FakeInvoker({"arn:summarize": {"summary": "a good long enough summary"}})
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake,
+                     arns={"summarize": "arn:summarize"}, check_acceptance=True)
+    out = sup.run({})
+    assert out["summarize"]["summary"].startswith("a good")
+
+
+def test_supervisor_acceptance_miss_records_not_raises_under_on_error_record():
+    """With on_error='record', a QA miss is RECORDED (failed) not raised — the node does not
+    complete, so it earns no trust and prunes its subtree (never admitted)."""
+    dag, manifests = _acceptance_manifests(min_length=100)
+    fake = FakeInvoker({"arn:summarize": {"summary": "tiny"}})
+    store = InProcessStateStore()
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=fake,
+                     arns={"summarize": "arn:summarize"}, check_acceptance=True,
+                     on_error="record", state_store=store)
+    out = sup.run({})  # must NOT raise
+    assert "summarize" not in store.completed()  # QA miss => not admitted, not trusted
+    assert out == {}

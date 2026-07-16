@@ -16,6 +16,7 @@ in a run (session affinity + AgentCore Memory).
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
@@ -68,6 +69,67 @@ def validate_output(obj: Any, schema: Dict[str, Any]) -> None:
         raise SchemaError(
             f"agent output missing required field(s): {missing} (present: {sorted(obj)})"
         )
+
+
+# -- output ACCEPTANCE contract (FZ 35e2b3b B3) -----------------------------
+def _acceptance_violation(value: Any, rules: Dict[str, Any]) -> Any:
+    """Return a human-readable reason string iff ``value`` fails a declared acceptance ``rules``
+    mapping, else ``None``. Rules are DECLARATIVE + DETERMINISTIC (no code eval), a superset of
+    the required-key presence check:
+
+    - ``non_empty: true``  — a str/list/dict/tuple must be truthy (non-empty), and ``None`` fails.
+    - ``min_length: N``    — ``len(value) >= N`` (str/list/etc.).
+    - ``max_length: N``    — ``len(value) <= N``.
+    - ``enum: [...]``      — ``value`` must be one of the listed values.
+    - ``pattern: "re"``    — a str must fully match the regex.
+    """
+    if not isinstance(rules, dict):
+        return None
+    if rules.get("non_empty") is True:
+        if value is None or (hasattr(value, "__len__") and len(value) == 0):
+            return "must be non-empty"
+    min_len = rules.get("min_length")
+    if isinstance(min_len, int) and hasattr(value, "__len__") and len(value) < min_len:
+        return f"length {len(value)} < min_length {min_len}"
+    max_len = rules.get("max_length")
+    if isinstance(max_len, int) and hasattr(value, "__len__") and len(value) > max_len:
+        return f"length {len(value)} > max_length {max_len}"
+    enum = rules.get("enum")
+    if isinstance(enum, (list, tuple)) and value not in enum:
+        return f"{value!r} not in enum {list(enum)}"
+    pattern = rules.get("pattern")
+    if isinstance(pattern, str) and isinstance(value, str):
+        if re.fullmatch(pattern, value) is None:
+            return f"{value!r} does not match pattern {pattern!r}"
+    return None
+
+
+def check_acceptance(obj: Any, schema: Dict[str, Any]) -> None:
+    """Post-run QA gate: every declared per-field ``acceptance`` rule must hold (FZ 35e2b3b B3).
+
+    This is DEEPER than :func:`validate_output` (which only checks required-key *presence*): it
+    verifies each output field's *value* against a declared acceptance contract — the machine-checkable
+    definition of "a good output" the Trust Ladder needs (a present-but-wrong output FAILS here and so
+    does NOT earn trust). Conservative: a field with no ``acceptance`` mapping is unconstrained, so a
+    manifest that declares none is never newly rejected. Raises :class:`SchemaError` on any violation.
+    """
+    if not isinstance(obj, dict) or not isinstance(schema, dict) or not schema:
+        return
+    props = schema.get("properties")
+    properties = props if isinstance(props, dict) else {
+        k: v for k, v in schema.items() if k != "required"
+    }
+    for field_name, subschema in properties.items():
+        if not isinstance(subschema, dict):
+            continue
+        rules = subschema.get("acceptance")
+        if not isinstance(rules, dict):
+            continue
+        reason = _acceptance_violation(obj.get(field_name), rules)
+        if reason is not None:
+            raise SchemaError(
+                f"output field {field_name!r} fails its acceptance contract: {reason}"
+            )
 
 
 # -- default invoke transport -----------------------------------------------
@@ -123,6 +185,7 @@ class Supervisor:
         max_attempts: int = 1,
         arn_resolver: Optional[Callable[[str, "AgentManifest"], str]] = None,
         held: Optional[Set[str]] = None,
+        check_acceptance: bool = False,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
@@ -148,6 +211,14 @@ class Supervisor:
         # behavior byte-for-byte. When supplied, it fetches the AUTHORITATIVE ARN so we can ASSERT
         # the compiled binding is still current — it NEVER re-binds the invoke to a re-fetched ARN.
         self._arn_resolver = arn_resolver
+        # FZ 35e2b3b B3: OPT-IN post-run output-ACCEPTANCE gate. False (default) => only the
+        # required-key presence check (validate_output) runs, byte-for-byte unchanged. When True,
+        # after a successful shape-validate the output's VALUES are checked against each field's
+        # declared ``acceptance`` contract (check_acceptance); a present-but-wrong output fails here
+        # exactly like a schema failure — so it is NOT admitted to the store and does NOT earn trust
+        # (the machine-checkable "good output" signal the Trust Ladder needs). It rides the existing
+        # retry/record path; it never mutates a frozen plan (INV-3) and adds no compiler loop (INV-2).
+        self._check_acceptance = bool(check_acceptance)
 
         supplied = dict(arns or {})
         self._arns: Dict[str, str] = {}
@@ -311,6 +382,11 @@ class Supervisor:
             try:
                 result = self._invoke_fn(arn, qualifier, self._session_id, payload_bytes)
                 validate_output(result, manifest.output_schema if manifest else {})
+                # B3 (opt-in): post-shape QA — the output's VALUES must satisfy each field's
+                # declared acceptance contract. A present-but-wrong output raises here, so it is
+                # NOT admitted and does NOT earn trust; rides the same retry/record path below.
+                if self._check_acceptance:
+                    check_acceptance(result, manifest.output_schema if manifest else {})
             except Exception as exc:
                 if self._on_error != "record":
                     raise  # fail-fast: default path propagates unchanged

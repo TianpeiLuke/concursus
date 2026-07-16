@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`governor.authoring.staff_with_rebind()` — re-bind on alignment failure (the compiler as
+  regulator, not just validator).** Instead of hard-erroring when a bound team fails the deep type
+  gate, this SEARCHES per-node candidate lists for a type-aligning assignment: given
+  `candidates_fn(node) -> [AgentManifest, …]` (best-first, e.g. the scheduler's trust-ranked set), it
+  strict-assembles and, on an `AlignmentError`, advances the offending node to its next candidate and
+  retries — bounded by `max_rebinds` (INV-2: a pure author-time search, never a compiler while-loop
+  in the run). It re-binds the *producer* first (whose output type is the mismatch), falling back to
+  the consumer. Returns the aligning `{node: AgentManifest}` set, or raises `RebindExhausted` if no
+  combination aligns within the bound. This is the FZ 35e2b1a1 "weak regulator → real regulator" fix:
+  the compiler now influences *who talks to whom* by rejecting-and-rebinding, not merely validating a
+  pre-decided team.
+  - `AlignmentError` now carries `.node` / `.producer` attributes (when edge-specific) so a re-binder
+    can target the exact node without parsing the message. Back-compat: the positional message
+    constructor is unchanged.
+  - +4 tests. FZ 35e2b3b C2 (plan P4.3).
+
 - **`GovernorLoop(decompose=True, bind_fn=…)` — the decompose→bind pipeline as the loop's live
   authoring path (opt-in, default off).** Makes `decompose → staff → assemble` the actual runtime
   behavior of `GovernorLoop.run()`, not just a library call: round-1 authors a multi-node CAPABILITY

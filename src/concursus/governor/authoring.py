@@ -213,9 +213,105 @@ def staff_capability_dag(
     return manifests
 
 
+class RebindExhausted(ValueError):
+    """Raised when a bounded re-bind cannot find a type-aligning agent assignment (FZ 35e2b3b C2)."""
+
+
+#: A ranked-candidates seam: ``node -> [AgentManifest, ...]`` best-first. The re-binder tries the
+#: first, and on a type-alignment failure at that node advances to the next candidate.
+CandidatesFn = Callable[[str], "list"]
+
+
+def staff_with_rebind(
+    dag: "AgentDAG",
+    candidates_fn: CandidatesFn,
+    *,
+    assembler: Any = None,
+    max_rebinds: int = 8,
+) -> Dict[str, AgentManifest]:
+    """Bind each capability node to a type-ALIGNING agent, RE-BINDING on an alignment failure (C2).
+
+    The compiler's regulator half ([FZ 35e2b1a1b]): instead of hard-erroring when a bound team fails
+    the deep type gate, this SEARCHES per-node candidate lists for an assignment that assembles.
+    ``candidates_fn(node)`` returns that node's agents best-first (e.g. the scheduler's
+    trust-ranked ``decide_ranked`` candidate set). Starting from every node's first candidate, it
+    strict-assembles; on an :class:`~concursus.core.resolve.AlignmentError` that names an offending
+    ``node``, it advances THAT node to its next candidate and retries — a bounded search (INV-2: a
+    pure author-time loop, never a compiler while-loop in the run; ``max_rebinds`` caps it). Returns
+    the aligning ``{node: AgentManifest}`` set (assemblable under ``strict_types``); raises
+    :class:`RebindExhausted` if no combination aligns within the bound.
+
+    Each candidate manifest is re-keyed/renamed to its node id and given the edge-derived wiring
+    (like :func:`staff_capability_dag`), so the frozen ``plan.order`` stays the capability topology.
+    Author-time + offline; never dispatches, never mutates a running plan (INV-1/3).
+    """
+    from concursus.assemble.assemble import OrchestrationAssembler
+    from concursus.core.resolve import AlignmentError
+
+    asm = assembler or OrchestrationAssembler(strict_types=True)
+    # Per-node candidate lists + the index currently selected for each.
+    cands: Dict[str, list] = {node: list(candidates_fn(node) or []) for node in dag.nodes}
+    picked: Dict[str, int] = {node: 0 for node in dag.nodes}
+
+    def _staff(node: str) -> AgentManifest:
+        options = cands[node]
+        if not options or picked[node] >= len(options):
+            raise RebindExhausted(f"no remaining candidate aligns for node {node!r}")
+        base = options[picked[node]]
+        producers = list(dag.get_dependencies(node))
+        # Reconstruct a fresh manifest dict from the candidate's fields (deep-copied so the
+        # candidate object is never mutated), re-keyed to the node id + given edge-derived wiring.
+        base_inputs = dict(base.contract.get("inputs", {})) if isinstance(base.contract, dict) else {}
+        for p in producers:  # one input per upstream producer
+            base_inputs.setdefault(p, {"type": "string"})
+        data = {
+            "name": node,  # assemble requires manifest.name == node id
+            "registry": {**dict(base.registry), "capabilities": [node],
+                         "bound_agent": base.name},
+            "contract": {
+                "inputs": base_inputs,
+                "outputs": dict(base.contract.get("outputs", {})) if isinstance(base.contract, dict) else {},
+            },
+            "spec": {"depends_on": [{"from": f"{p}.{_CAP_OUTPUT}", "to": p} for p in producers]},
+            "trust_seed": base.trust_seed,
+            "side_effecting": base.side_effecting,
+        }
+        return AgentManifest.from_dict(data).validate()
+
+    for _ in range(max_rebinds + 1):
+        manifests = {node: _staff(node) for node in dag.nodes}
+        try:
+            asm.assemble(dag, manifests)
+            return manifests
+        except AlignmentError as exc:
+            # A type mismatch is the PRODUCER's output type vs the CONSUMER's input. Prefer
+            # re-binding the PRODUCER (whose output is the problem) if it still has candidates left;
+            # else fall back to the consumer node. Neither re-bindable => not fixable.
+            producer = getattr(exc, "producer", None)
+            consumer = getattr(exc, "node", None)
+            offender = None
+            for cand in (producer, consumer):
+                if cand in picked and picked[cand] + 1 < len(cands[cand]):
+                    offender = cand
+                    break
+            if offender is None:
+                # No candidate has a remaining alternative to try.
+                if producer in picked or consumer in picked:
+                    raise RebindExhausted(
+                        f"re-bind exhausted for edge {producer!r} -> {consumer!r}: "
+                        "no remaining candidate aligns"
+                    ) from exc
+                raise  # not an edge-specific failure a re-bind could fix
+            picked[offender] += 1  # advance the offending node to its next candidate
+    raise RebindExhausted(f"re-bind did not converge within max_rebinds={max_rebinds}")
+
+
 __all__ = [
     "ManifestAuthorFn",
     "ManifestAuthorError",
+    "RebindExhausted",
+    "CandidatesFn",
     "author_manifest",
     "staff_capability_dag",
+    "staff_with_rebind",
 ]

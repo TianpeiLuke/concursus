@@ -20,7 +20,18 @@ if TYPE_CHECKING:  # pragma: no cover - hints only, no runtime coupling
 
 
 class AlignmentError(ValueError):
-    """Raised when a ``depends_on`` edge fails to type-align against the DAG/manifests."""
+    """Raised when a ``depends_on`` edge fails to type-align against the DAG/manifests.
+
+    Carries the offending ``node`` (consumer) and ``producer`` when known (FZ 35e2b3b C2), so a
+    re-binder can target the exact node to re-staff WITHOUT parsing the message. ``None`` when the
+    failure is not edge-specific.
+    """
+
+    def __init__(self, message: str, *, node: "Optional[str]" = None,
+                 producer: "Optional[str]" = None) -> None:
+        super().__init__(message)
+        self.node = node
+        self.producer = producer
 
 
 @dataclass(frozen=True)
@@ -242,5 +253,7 @@ def check_alignment(
                     raise AlignmentError(
                         f"{node}: edge {producer}.{field} -> {input_name} is type-INCOMPATIBLE — "
                         f"producer declares {producer_type!r} but consumer input expects "
-                        f"{consumer_type!r}"
+                        f"{consumer_type!r}",
+                        node=node,
+                        producer=producer,
                     )

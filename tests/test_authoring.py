@@ -12,8 +12,10 @@ from concursus import AgentDAG, OrchestrationAssembler
 from concursus.assemble.planner import plan_from_goal
 from concursus.governor.authoring import (
     ManifestAuthorError,
+    RebindExhausted,
     author_manifest,
     staff_capability_dag,
+    staff_with_rebind,
 )
 
 
@@ -149,3 +151,77 @@ def test_staff_capability_dag_single_node():
     plan = OrchestrationAssembler().assemble(dag, manifests)
     assert plan.order == ["resolve_ticket"]
     assert plan.wiring["resolve_ticket"] == []  # a source node has no inbound wiring
+
+
+# -- FZ 35e2b3b C2: re-bind on alignment failure (staff_with_rebind) ------------------------
+def _cand(name, out_type):
+    """A candidate agent manifest declaring a given output ``result`` type."""
+    from concursus.core.manifest import AgentManifest
+    return AgentManifest.from_dict({
+        "name": name,
+        "registry": {"container_uri": "img", "protocol": "HTTP", "entry": "a.b:run"},
+        "contract": {"inputs": {}, "outputs": {"result": {"type": out_type}}},
+    })
+
+
+def _ab_dag():
+    from concursus import AgentDAG
+    dag = AgentDAG()
+    dag.add_node("cap_a").add_node("cap_b").add_edge("cap_a", "cap_b")
+    return dag
+
+
+def test_staff_with_rebind_selects_aligning_producer():
+    """The first candidate for the producer type-MISMATCHES the consumer; staff_with_rebind advances
+    to the next candidate that ALIGNS, and the result assembles under strict_types."""
+    dag = _ab_dag()
+
+    def candidates(node):
+        if node == "cap_a":
+            return [_cand("int_agent", "integer"), _cand("str_agent", "string")]  # 1st mismatches
+        return [_cand("consumer", "string")]
+
+    manifests = staff_with_rebind(dag, candidates)
+    # The producer was re-bound to the aligning candidate (str_agent), not the first (int_agent).
+    assert manifests["cap_a"].registry.get("bound_agent") == "str_agent"
+    assert manifests["cap_a"].name == "cap_a"  # topology preserved (keyed by node id)
+    # It assembles under the strict deep gate (the whole point — a type-aligning team).
+    plan = OrchestrationAssembler(strict_types=True).assemble(dag, manifests)
+    assert plan.order == ["cap_a", "cap_b"]
+
+
+def test_staff_with_rebind_first_candidate_wins_when_it_aligns():
+    """No re-bind needed when the first candidate already aligns (the common fast path)."""
+    dag = _ab_dag()
+    manifests = staff_with_rebind(
+        dag, lambda node: [_cand(f"{node}_agent", "string")]  # everything string => aligns
+    )
+    assert manifests["cap_a"].registry.get("bound_agent") == "cap_a_agent"
+    OrchestrationAssembler(strict_types=True).assemble(dag, manifests)  # must not raise
+
+
+def test_staff_with_rebind_exhausts_when_no_candidate_aligns():
+    """When no producer candidate can align the edge, the bounded search raises RebindExhausted."""
+    dag = _ab_dag()
+
+    def candidates(node):
+        if node == "cap_a":
+            return [_cand("int_agent", "integer")]  # only a mismatching producer
+        return [_cand("consumer", "string")]
+
+    with pytest.raises(RebindExhausted):
+        staff_with_rebind(dag, candidates)
+
+
+def test_staff_with_rebind_is_bounded():
+    """The search is bounded by max_rebinds even with many mismatching candidates (INV-2)."""
+    dag = _ab_dag()
+
+    def candidates(node):
+        if node == "cap_a":
+            return [_cand(f"int{i}", "integer") for i in range(50)]  # all mismatch
+        return [_cand("consumer", "string")]
+
+    # It stops (raises) rather than looping unbounded.
+    with pytest.raises(RebindExhausted):
+        staff_with_rebind(dag, candidates, max_rebinds=5)

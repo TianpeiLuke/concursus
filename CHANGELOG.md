@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`make_trust_strictness()` + `strict_fn=` / `acceptance_fn=` — adaptive strictness dial (opt-in,
+  default off).** The capstone of the Phase-6 compiler contract: turns the three global contract
+  gates (B1 single-writer, B2 type-align, B3 output-QA) into a *per-agent* dial keyed on the Trust
+  Ladder. `governor.make_trust_strictness(scheduler, strict_below=L2_GUARDED)` returns a
+  `node -> bool` predicate that is `True` for a WEAK/below-bar agent (gets the strict contract) and
+  `False` for a STRONG/proven one (runs lean); an unknown/unproven node is treated as weak
+  (conservative strict). Wire it as `OrchestrationAssembler(..., strict_fn=…)` (dials B1/B2) and/or
+  `Supervisor(..., acceptance_fn=…)` (dials B3). Default (`strict_fn=None`/`acceptance_fn=None`)
+  applies an enabled gate to every node — byte-for-byte the un-dialed behavior. Realizes "contract
+  strictness ∝ 1/strength, read off the same ladder that governs autonomy"; author/compile-time
+  only (INV-2). +5 tests. **Phase-6 compiler contract complete (B1+B2+B3+B4).**
+
 - **`Supervisor(check_acceptance=True)` + `check_acceptance()` — output-QA acceptance contract
   (opt-in, default off).** A post-run gate DEEPER than the required-key presence check: after a
   successful shape-validate, each output field's *value* is checked against a declared per-field

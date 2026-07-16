@@ -11,7 +11,7 @@ resulting :class:`ProvisioningPlan` is a pure, JSON-serializable preview (a ``co
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Optional, Set
 
 from ..core import resolve
 from ..build.build import BuildPlanEntry, RuntimeBuilderFactory
@@ -150,6 +150,7 @@ class OrchestrationAssembler:
         precedent_retriever: Optional["PrecedentRetriever"] = None,
         strict_types: bool = False,
         single_writer: bool = False,
+        strict_fn: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.account = account
         self.region = region
@@ -171,6 +172,12 @@ class OrchestrationAssembler:
         #: reject a plan where any consumer input is fed by more than one ``depends_on`` edge (a
         #: silent last-wins overwrite at run time). Compile-time only — INV-2 preserved.
         self.single_writer = bool(single_writer)
+        #: OPT-IN adaptive-strictness dial (FZ 35e2b3b B4). ``None`` (default) applies the enabled
+        #: deep gates (``strict_types`` / ``single_writer``) to EVERY node. When set, it is a
+        #: ``node -> bool`` predicate that NARROWS them to the nodes it returns truthy for — wire
+        #: :func:`~concursus.governor.make_trust_strictness` so WEAK/low-trust agents get the strict
+        #: contract and STRONG/high-trust ones get the lean path. Author/compile-time only (INV-2).
+        self.strict_fn = strict_fn
 
     def assemble(
         self, dag: "AgentDAG", manifests: Dict[str, "AgentManifest"]
@@ -188,7 +195,8 @@ class OrchestrationAssembler:
         for manifest in manifests.values():
             manifest.validate()
         resolve.check_alignment(
-            dag, manifests, strict_types=self.strict_types, single_writer=self.single_writer
+            dag, manifests, strict_types=self.strict_types,
+            single_writer=self.single_writer, strict_fn=self.strict_fn,
         )
         wiring = resolve.resolve_edges(dag, manifests)
 

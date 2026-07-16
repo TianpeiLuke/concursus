@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Set
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 if TYPE_CHECKING:  # pragma: no cover - hints only, no runtime coupling
     from .dag import AgentDAG
@@ -151,6 +151,7 @@ def check_alignment(
     *,
     strict_types: bool = False,
     single_writer: bool = False,
+    strict_fn: "Optional[Callable[[str], bool]]" = None,
 ) -> None:
     """Type-gate every ``depends_on`` edge; raise :class:`AlignmentError` on any violation.
 
@@ -171,9 +172,22 @@ def check_alignment(
     ``input_name`` are a single-writer violation — at run time the supervisor overlays
     ``payload[input_name] = …`` per edge, so a second writer SILENTLY last-wins (a non-deterministic
     data-flow bug). This catches it at compile time. Default off keeps behavior unchanged.
+
+    ``strict_fn`` (default ``None``, FZ 35e2b3b B4 — the ADAPTIVE STRICTNESS DIAL) NARROWS the deep
+    gates to a subset of consumer nodes: an enabled ``strict_types`` / ``single_writer`` check is
+    applied to a node ONLY when ``strict_fn(node)`` is truthy. ``None`` applies the enabled checks to
+    every node (byte-for-byte the un-dialed behavior). Wire a trust-derived predicate
+    (:func:`~concursus.governor.make_trust_strictness`) so a WEAK/low-trust agent gets the strict
+    contract while a STRONG/high-trust one gets the lean path — the compiler-contract read of the
+    Trust Ladder. It never RELAXES the name-level gate (a → d always run for every edge); it only
+    gates the OPT-IN deep checks. Author/compile-time only.
     """
     for node, manifest in manifests.items():
         consumer_inputs = manifest.inputs
+        # B4: is a NODE subject to the deep gates this compile? (strict_fn=None => every node).
+        node_strict = True if strict_fn is None else bool(strict_fn(node))
+        node_strict_types = strict_types and node_strict
+        node_single_writer = single_writer and node_strict
         writers_of: Dict[str, str] = {}  # B1: consumer input_name -> the producer already wiring it
         for edge in manifest.depends_on:
             producer, _, rest = str(edge["from"]).partition(".")
@@ -202,7 +216,7 @@ def check_alignment(
 
             # B1 (opt-in): single-writer per consumer input. A second edge feeding the same input
             # would silently last-wins at run time (payload[input_name] = … per edge) — reject it.
-            if single_writer:
+            if node_single_writer:
                 prior = writers_of.get(input_name)
                 if prior is not None:
                     raise AlignmentError(
@@ -221,7 +235,7 @@ def check_alignment(
             # B2 (opt-in): the DEEP gate — producer output type must be compatible with the
             # consumer input type. Only a concrete, mutually-declared mismatch raises; unknown
             # types pass (conservative), so this never rejects an un-annotated manifest.
-            if strict_types:
+            if node_strict_types:
                 producer_type = _field_type(producer_manifest.output_schema, field)
                 consumer_type = _field_type(consumer_inputs, input_name)
                 if not _types_compatible(producer_type, consumer_type):

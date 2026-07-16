@@ -365,3 +365,40 @@ def test_assembler_single_writer_rejects_double_fed_input():
     # single_writer assembler: the non-overlap gate rejects the double-fed input.
     with pytest.raises(AlignmentError, match="single-writer violation"):
         OrchestrationAssembler(single_writer=True).assemble(dag, manifests)
+
+
+# -- FZ 35e2b3b B4: strict_fn dials the deep gate per node -------------------
+def _type_mismatch_chain():
+    """ingest emits 'integer' into summarize's 'string' input — a deep-gate type mismatch."""
+    dag = AgentDAG()
+    dag.add_node("ingest").add_node("summarize").add_edge("ingest", "summarize")
+    manifests = {
+        "ingest": _agent("ingest", {"uri": {"type": "string"}}, {"document": {"type": "integer"}}),
+        "summarize": _agent(
+            "summarize",
+            {"document": {"type": "string"}},
+            {"summary": {"type": "string"}},
+            depends_on=[{"from": "ingest.document", "to": "document"}],
+        ),
+    }
+    return dag, manifests
+
+
+def test_strict_fn_narrows_deep_gate_to_selected_nodes():
+    """With strict_types on, strict_fn restricts the deep gate to the nodes it selects: the mismatch
+    on 'summarize' is caught only when strict_fn('summarize') is truthy."""
+    dag, manifests = _type_mismatch_chain()
+    # strict_fn excludes 'summarize' (treat it as STRONG/lean) => the deep gate does not run for it.
+    lean = OrchestrationAssembler(strict_types=True, strict_fn=lambda node: node != "summarize")
+    assert lean.assemble(dag, manifests).order == ["ingest", "summarize"]
+    # strict_fn includes 'summarize' (treat it as WEAK/strict) => the mismatch is caught.
+    strict = OrchestrationAssembler(strict_types=True, strict_fn=lambda node: node == "summarize")
+    with pytest.raises(AlignmentError, match="type-INCOMPATIBLE"):
+        strict.assemble(dag, manifests)
+
+
+def test_strict_fn_none_applies_deep_gate_to_all_nodes():
+    """strict_fn=None (default) keeps the enabled deep gate applied to every node."""
+    dag, manifests = _type_mismatch_chain()
+    with pytest.raises(AlignmentError, match="type-INCOMPATIBLE"):
+        OrchestrationAssembler(strict_types=True).assemble(dag, manifests)  # strict_fn defaults None

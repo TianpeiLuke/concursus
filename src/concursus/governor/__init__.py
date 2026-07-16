@@ -50,6 +50,7 @@ from concursus.governor.scheduler import (
     ScheduleDecision,
     SchedulerError,
     TrustLadderScheduler,
+    make_trust_strictness,
 )
 from concursus.governor.scope import (
     SCOPE_LEVELS,
@@ -77,6 +78,7 @@ __all__ = [
     "AgentVersion",
     "RegistryError",
     "TrustLadderScheduler",
+    "make_trust_strictness",
     "ScheduleDecision",
     "FrontierProposal",
     "SchedulerError",

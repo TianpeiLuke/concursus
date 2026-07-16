@@ -26,7 +26,7 @@ IDENTITY INVARIANTS (non-negotiable):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from concursus.build.trust import GateDecision, TrustGrade, evaluate_deploy_gate
 from concursus.governor.registry import AgentRegistry, AgentVersion
@@ -388,3 +388,35 @@ class TrustLadderScheduler:
     def _side_effecting(self, name: str) -> bool:
         manifest = self._manifests.get(name)
         return bool(getattr(manifest, "side_effecting", False)) if manifest is not None else False
+
+
+# -- FZ 35e2b3b B4: the adaptive-strictness dial ----------------------------
+def make_trust_strictness(
+    scheduler: "TrustLadderScheduler",
+    *,
+    strict_below: TrustGrade = TrustGrade.L2_GUARDED,
+) -> Callable[[str], bool]:
+    """A ``node -> bool`` predicate for the compiler/QA STRICTNESS DIAL (FZ 35e2b3b B4).
+
+    Returns ``True`` (apply the strict contract) for a node whose serving agent's EARNED trust is
+    BELOW ``strict_below`` — i.e. WEAK / unproven agents (default: below ``L2_GUARDED``, so L0/L1)
+    get the strict deep gates (type-align, single-writer, output-QA), while STRONG / proven ones
+    (>= the bar) run the lean path. This is the [35e2b1a1b1] resolution in code: strictness ∝
+    1/strength, read off the SAME Trust Ladder that governs autonomy.
+
+    The grade is read live via ``scheduler.earned_grade(node)`` (author/compile-time, GOV-side).
+    An UNKNOWN / never-seeded node — no evidence yet — is treated as WEAK (returns ``True``, the
+    conservative default: an unproven role earns the strict contract until it proves otherwise).
+    Wire it as ``OrchestrationAssembler(..., strict_fn=make_trust_strictness(sched))`` and/or
+    ``Supervisor(..., acceptance_fn=make_trust_strictness(sched))``.
+    """
+    bar = TrustGrade.coerce(strict_below) if not isinstance(strict_below, TrustGrade) else strict_below
+
+    def is_strict(node: str) -> bool:
+        try:
+            grade = scheduler.earned_grade(node)
+        except Exception:  # noqa: BLE001 - an unresolvable node is treated as weak (strict)
+            return True
+        return int(grade) < int(bar)
+
+    return is_strict

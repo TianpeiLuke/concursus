@@ -186,6 +186,7 @@ class Supervisor:
         arn_resolver: Optional[Callable[[str, "AgentManifest"], str]] = None,
         held: Optional[Set[str]] = None,
         check_acceptance: bool = False,
+        acceptance_fn: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
@@ -219,6 +220,11 @@ class Supervisor:
         # (the machine-checkable "good output" signal the Trust Ladder needs). It rides the existing
         # retry/record path; it never mutates a frozen plan (INV-3) and adds no compiler loop (INV-2).
         self._check_acceptance = bool(check_acceptance)
+        # FZ 35e2b3b B4: OPT-IN adaptive-strictness dial for the acceptance gate. None (default)
+        # applies check_acceptance to EVERY node. When set, a ``node -> bool`` predicate narrows the
+        # QA gate to the nodes it returns truthy for — wire a trust-derived predicate so a WEAK agent
+        # is QA-checked while a proven STRONG one runs lean. No effect when check_acceptance is off.
+        self._acceptance_fn = acceptance_fn
 
         supplied = dict(arns or {})
         self._arns: Dict[str, str] = {}
@@ -385,7 +391,10 @@ class Supervisor:
                 # B3 (opt-in): post-shape QA — the output's VALUES must satisfy each field's
                 # declared acceptance contract. A present-but-wrong output raises here, so it is
                 # NOT admitted and does NOT earn trust; rides the same retry/record path below.
-                if self._check_acceptance:
+                # B4 (opt-in dial): when acceptance_fn is set, QA-gate only the nodes it selects.
+                if self._check_acceptance and (
+                    self._acceptance_fn is None or self._acceptance_fn(node)
+                ):
                     check_acceptance(result, manifest.output_schema if manifest else {})
             except Exception as exc:
                 if self._on_error != "record":

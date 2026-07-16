@@ -23,6 +23,7 @@ from concursus.governor.scheduler import (
     FrontierProposal,
     ScheduleDecision,
     TrustLadderScheduler,
+    make_trust_strictness,
 )
 
 
@@ -262,3 +263,79 @@ def test_propose_bindings_covers_the_frontier(tmp_path):
     assert set(bindings) == {"b", "c"}            # 'a' completed => skipped
     assert bindings["b"].action == DISPATCH
     assert bindings["c"].action == UNMATCHED      # no agent serves 'c'
+
+
+# -- FZ 35e2b3b B4: the adaptive-strictness dial (make_trust_strictness) --------------------
+def test_make_trust_strictness_weak_strict_strong_lean(tmp_path):
+    """A below-bar (WEAK) agent => strict; an at/above-bar (STRONG) agent => lean; unknown => strict."""
+    ledger = DeployLedger(tmp_path / "l.json")
+    ledger.record(name="weak", fingerprint="f1", arn="arn:weak", deployed_at="2026-07-01")
+    ledger.record(name="strong", fingerprint="f2", arn="arn:strong", deployed_at="2026-07-01")
+    m_weak = _manifest("weak", trust_seed=TrustGrade.L1_CANARY)      # below L2 bar
+    m_strong = _manifest("strong", trust_seed=TrustGrade.L3_AUTONOMOUS)  # above L2 bar
+    reg = _registry_with(ledger, m_weak, m_strong)
+    sched = TrustLadderScheduler(reg, manifests={"weak": m_weak, "strong": m_strong})
+
+    is_strict = make_trust_strictness(sched, strict_below=TrustGrade.L2_GUARDED)
+    assert is_strict("weak") is True        # L1 < L2 => strict contract
+    assert is_strict("strong") is False     # L3 >= L2 => lean path
+    assert is_strict("never_seen") is True  # unknown/unproven => conservative strict
+
+
+def test_make_trust_strictness_threshold_is_configurable(tmp_path):
+    """The strict_below bar is tunable: raising it pulls more agents into the strict set."""
+    ledger = DeployLedger(tmp_path / "l.json")
+    ledger.record(name="mid", fingerprint="f1", arn="arn:mid", deployed_at="2026-07-01")
+    m_mid = _manifest("mid", trust_seed=TrustGrade.L2_GUARDED)
+    reg = _registry_with(ledger, m_mid)
+    sched = TrustLadderScheduler(reg, manifests={"mid": m_mid})
+
+    # At bar L2: L2 is NOT below L2 => lean.
+    assert make_trust_strictness(sched, strict_below=TrustGrade.L2_GUARDED)("mid") is False
+    # Raise the bar to L3: now L2 IS below => strict.
+    assert make_trust_strictness(sched, strict_below=TrustGrade.L3_AUTONOMOUS)("mid") is True
+
+
+def test_trust_dial_end_to_end_with_assembler(tmp_path):
+    """CAPSTONE: the same type-mismatched plan is REJECTED when its consumer node is a WEAK agent
+    (dial => strict) but PASSES when it is a STRONG agent (dial => lean) — strictness ∝ 1/trust,
+    read off the Trust Ladder and wired straight into the compiler's deep gate."""
+    from concursus import AgentDAG, AgentManifest, OrchestrationAssembler
+    from concursus.core.resolve import AlignmentError
+
+    def _plan_manifest(name, inputs, outputs, depends_on=None):
+        data = {"name": name,
+                "registry": {"container_uri": "img", "protocol": "HTTP", "entry": f"a.{name}:run"},
+                "contract": {"inputs": inputs, "outputs": outputs}}
+        if depends_on is not None:
+            data["spec"] = {"depends_on": depends_on}
+        return AgentManifest.from_dict(data)
+
+    # A plan whose 'summarize' consumes an integer into a string input (a deep-gate mismatch).
+    dag = AgentDAG()
+    dag.add_node("ingest").add_node("summarize").add_edge("ingest", "summarize")
+    plan_manifests = {
+        "ingest": _plan_manifest("ingest", {"uri": {"type": "string"}},
+                                 {"document": {"type": "integer"}}),
+        "summarize": _plan_manifest("summarize", {"document": {"type": "string"}},
+                                    {"summary": {"type": "string"}},
+                                    depends_on=[{"from": "ingest.document", "to": "document"}]),
+    }
+
+    def _dial_for(summarize_seed):
+        ledger = DeployLedger(tmp_path / f"l_{summarize_seed.name}.json")
+        ledger.record(name="summarize", fingerprint="fp", arn="arn:s", deployed_at="2026-07-01")
+        m = _manifest("summarize", trust_seed=summarize_seed)
+        reg = _registry_with(ledger, m)
+        sched = TrustLadderScheduler(reg, manifests={"summarize": m})
+        return make_trust_strictness(sched, strict_below=TrustGrade.L2_GUARDED)
+
+    # WEAK summarize (L1) => strict => the mismatch is caught.
+    weak_dial = _dial_for(TrustGrade.L1_CANARY)
+    with __import__("pytest").raises(AlignmentError, match="type-INCOMPATIBLE"):
+        OrchestrationAssembler(strict_types=True, strict_fn=weak_dial).assemble(dag, plan_manifests)
+
+    # STRONG summarize (L3) => lean => the same plan assembles.
+    strong_dial = _dial_for(TrustGrade.L3_AUTONOMOUS)
+    plan = OrchestrationAssembler(strict_types=True, strict_fn=strong_dial).assemble(dag, plan_manifests)
+    assert plan.order == ["ingest", "summarize"]

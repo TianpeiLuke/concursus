@@ -202,3 +202,67 @@ def test_check_alignment_accepts_flat_output_schema():
         ),
     }
     assert check_alignment(dag, manifests) is None
+
+
+# -- FZ 35e2b3b B2: opt-in deep type-alignment gate -------------------------
+def _typed_edge(producer_out_type, consumer_in_type):
+    """A 2-node chain p -> c whose edge carries the given producer-output / consumer-input types."""
+    dag = AgentDAG()
+    dag.add_node("p").add_node("c").add_edge("p", "c")
+    manifests = {
+        "p": AgentManifest.from_dict(
+            {
+                "name": "p",
+                "registry": {"container_uri": "x", "protocol": "HTTP"},
+                "contract": {"outputs": {"result": {"type": producer_out_type}}},
+            }
+        ),
+        "c": AgentManifest.from_dict(
+            {
+                "name": "c",
+                "registry": {"container_uri": "x", "protocol": "HTTP"},
+                "contract": {
+                    "inputs": {"r": {"type": consumer_in_type}},
+                    "outputs": {"o": {"type": "string"}},
+                },
+                "spec": {"depends_on": [{"from": "p.result", "to": "r"}]},
+            }
+        ),
+    }
+    return dag, manifests
+
+
+def test_strict_types_passes_well_typed_chain():
+    """A chain whose edge types match passes the deep gate (and the default name-level gate)."""
+    dag, manifests = _chain()  # all string -> string
+    assert check_alignment(dag, manifests, strict_types=True) is None
+
+
+def test_strict_types_rejects_concrete_mismatch():
+    """A producer 'string' fed into a consumer 'integer' input is caught ONLY under strict_types."""
+    dag, manifests = _typed_edge("string", "integer")
+    # Default (name-level) gate passes — the field names line up.
+    assert check_alignment(dag, manifests) is None
+    # The deep gate catches the concrete type mismatch.
+    with pytest.raises(AlignmentError, match="type-INCOMPATIBLE"):
+        check_alignment(dag, manifests, strict_types=True)
+
+
+def test_strict_types_conservative_on_unknown_types():
+    """An unknown/absent type on either side passes the deep gate (cannot prove incompatible)."""
+    # Producer declares no type; consumer declares 'integer' -> unknown producer type => passes.
+    dag, manifests = _typed_edge(None, "integer")
+    assert check_alignment(dag, manifests, strict_types=True) is None
+    # Consumer declares no type -> unknown consumer type => passes.
+    dag2, manifests2 = _typed_edge("string", None)
+    assert check_alignment(dag2, manifests2, strict_types=True) is None
+
+
+def test_strict_types_union_overlap_passes():
+    """A JSON-Schema union type passes when the producer type overlaps the consumer's accepted set."""
+    dag, manifests = _typed_edge("string", ["string", "null"])
+    assert check_alignment(dag, manifests, strict_types=True) is None
+    # A disjoint union is still rejected.
+    dag2, manifests2 = _typed_edge("boolean", ["string", "integer"])
+    with pytest.raises(AlignmentError, match="type-INCOMPATIBLE"):
+        check_alignment(dag2, manifests2, strict_types=True)

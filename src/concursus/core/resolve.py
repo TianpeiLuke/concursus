@@ -113,13 +113,57 @@ def _top_field(path_rest: str) -> str:
     return re.split(r"[.\[]", path_rest, maxsplit=1)[0]
 
 
-def check_alignment(dag: "AgentDAG", manifests: Dict[str, "AgentManifest"]) -> None:
+def _field_type(schema: Dict[str, Any], field: str) -> Any:
+    """The declared JSON-Schema ``type`` of ``field`` in a (nested or flat) schema, or ``None``.
+
+    Returns ``None`` when the field carries no ``type`` annotation (or the entry is not a mapping)
+    — an UNKNOWN type, which the strict gate treats as "cannot prove incompatible" and passes.
+    """
+    if not isinstance(schema, dict):
+        return None
+    props = schema.get("properties")
+    table = props if isinstance(props, dict) else schema
+    entry = table.get(field)
+    if isinstance(entry, dict):
+        return entry.get("type")
+    return None
+
+
+def _types_compatible(producer_type: Any, consumer_type: Any) -> bool:
+    """True iff a producer output ``type`` may satisfy a consumer input ``type``.
+
+    CONSERVATIVE: only a concrete, mutually-declared MISMATCH is incompatible. An unknown/absent
+    type on either side (``None``) passes — the gate can only *prove* a violation, never guess one,
+    so a manifest that omits type annotations is never newly rejected. Both a scalar (``"string"``)
+    and a list-of-types (``["string", "null"]``, JSON-Schema union) are supported; a producer type
+    is compatible if it overlaps the consumer's accepted set.
+    """
+    if producer_type is None or consumer_type is None:
+        return True
+    prod = set(producer_type) if isinstance(producer_type, (list, tuple)) else {producer_type}
+    cons = set(consumer_type) if isinstance(consumer_type, (list, tuple)) else {consumer_type}
+    return bool(prod & cons)
+
+
+def check_alignment(
+    dag: "AgentDAG",
+    manifests: Dict[str, "AgentManifest"],
+    *,
+    strict_types: bool = False,
+) -> None:
     """Type-gate every ``depends_on`` edge; raise :class:`AlignmentError` on any violation.
 
     For each edge on each manifest: (a) the producer must be a known manifest; (b) the
     referenced top-level output field must be a declared property of the producer's
     ``output_schema``; (c) the ``to`` input must be a declared input of the consumer; and
     (d) the DAG must carry the edge ``producer -> consumer``.
+
+    ``strict_types`` (default ``False``) adds a DEEPER gate (FZ 35e2b3b B2): the producer output
+    field's declared ``type`` must be COMPATIBLE with the consumer input's declared ``type`` — a
+    concrete mismatch (e.g. producer ``"string"`` into consumer ``"integer"``) raises. It is
+    conservative: an unknown/absent type on either side passes (see :func:`_types_compatible`), so
+    turning it on never rejects a manifest that simply omits type annotations. Default off keeps
+    the name-level gate byte-for-byte unchanged.
     """
     for node, manifest in manifests.items():
         consumer_inputs = manifest.inputs
@@ -153,3 +197,16 @@ def check_alignment(dag: "AgentDAG", manifests: Dict[str, "AgentManifest"]) -> N
                     f"{node}: manifest depends_on {producer!r} but the DAG has no edge "
                     f"{producer!r} -> {node!r}"
                 )
+
+            # B2 (opt-in): the DEEP gate — producer output type must be compatible with the
+            # consumer input type. Only a concrete, mutually-declared mismatch raises; unknown
+            # types pass (conservative), so this never rejects an un-annotated manifest.
+            if strict_types:
+                producer_type = _field_type(producer_manifest.output_schema, field)
+                consumer_type = _field_type(consumer_inputs, input_name)
+                if not _types_compatible(producer_type, consumer_type):
+                    raise AlignmentError(
+                        f"{node}: edge {producer}.{field} -> {input_name} is type-INCOMPATIBLE — "
+                        f"producer declares {producer_type!r} but consumer input expects "
+                        f"{consumer_type!r}"
+                    )

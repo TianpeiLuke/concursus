@@ -310,3 +310,32 @@ def test_recompile_compile_next_filters_unknown_nodes():
         compile_next=["summarize", "ghost_node"],
     )
     assert new.frontier == ["summarize"]  # ghost_node dropped
+
+
+# -- FZ 35e2b3b B2: OrchestrationAssembler(strict_types=) threads the deep gate ----------
+def test_assembler_strict_types_passes_well_typed_chain():
+    """The well-typed chain assembles under strict_types (byte-identical plan)."""
+    dag, manifests = _chain()
+    baseline = OrchestrationAssembler().assemble(dag, manifests)
+    strict = OrchestrationAssembler(strict_types=True).assemble(dag, manifests)
+    assert strict.to_dict() == baseline.to_dict()  # deep gate changes nothing when types align
+
+
+def test_assembler_strict_types_rejects_type_mismatch():
+    """A type-mismatched edge assembles by DEFAULT (name-level) but is REJECTED under strict_types."""
+    dag = AgentDAG()
+    dag.add_node("ingest").add_node("summarize").add_edge("ingest", "summarize")
+    manifests = {
+        "ingest": _agent("ingest", {"uri": {"type": "string"}}, {"document": {"type": "integer"}}),
+        "summarize": _agent(
+            "summarize",
+            {"document": {"type": "string"}},   # expects string, producer emits integer
+            {"summary": {"type": "string"}},
+            depends_on=[{"from": "ingest.document", "to": "document"}],
+        ),
+    }
+    # Default assembler: the name-level gate passes (field names line up).
+    assert OrchestrationAssembler().assemble(dag, manifests).order == ["ingest", "summarize"]
+    # Strict assembler: the deep type gate rejects the concrete mismatch.
+    with pytest.raises(AlignmentError, match="type-INCOMPATIBLE"):
+        OrchestrationAssembler(strict_types=True).assemble(dag, manifests)

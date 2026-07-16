@@ -148,6 +148,7 @@ class OrchestrationAssembler:
         account: Optional[str] = None,
         region: Optional[str] = None,
         precedent_retriever: Optional["PrecedentRetriever"] = None,
+        strict_types: bool = False,
     ) -> None:
         self.account = account
         self.region = region
@@ -157,6 +158,13 @@ class OrchestrationAssembler:
         #: NEVER touches AWS or a run log. Default ``None`` keeps ``assemble`` byte-for-byte
         #: unchanged (the feedback edge lives AROUND assemble, never inside ``Supervisor.run``).
         self.precedent_retriever = precedent_retriever
+        #: OPT-IN deep-alignment gate (FZ 35e2b3b B2). Default ``False`` keeps ``check_alignment`` at
+        #: its name-level gate (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile``
+        #: ALSO type-gate every ``depends_on`` edge (producer output type must be compatible with the
+        #: consumer input type); a concrete mismatch raises :class:`AlignmentError`. Conservative:
+        #: unknown/absent types pass, so it never rejects an un-annotated manifest. Compile-time only
+        #: — no runtime effect, INV-2 preserved.
+        self.strict_types = bool(strict_types)
 
     def assemble(
         self, dag: "AgentDAG", manifests: Dict[str, "AgentManifest"]
@@ -173,7 +181,7 @@ class OrchestrationAssembler:
         dag.validate()
         for manifest in manifests.values():
             manifest.validate()
-        resolve.check_alignment(dag, manifests)
+        resolve.check_alignment(dag, manifests, strict_types=self.strict_types)
         wiring = resolve.resolve_edges(dag, manifests)
 
         entries: Dict[str, BuildPlanEntry] = {}

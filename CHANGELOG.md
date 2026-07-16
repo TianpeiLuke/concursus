@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`OrchestrationAssembler(strict_types=True)` / `check_alignment(..., strict_types=True)` — deep
+  type-alignment gate (opt-in, default off).** Upgrades the compiler's edge check from field-*name*
+  presence to *type compatibility*: for each `depends_on` edge, the producer output field's declared
+  JSON-Schema `type` must be compatible with the consumer input's declared `type`, or
+  `AlignmentError` is raised. It is **conservative** — an unknown/absent type on either side passes
+  (the gate can only *prove* a mismatch, never guess one), so turning it on never rejects a manifest
+  that omits type annotations — and it supports JSON-Schema union types (`["string", "null"]`),
+  passing when the producer type overlaps the consumer's accepted set. Compile-time only (no runtime
+  effect, INV-2 preserved); routes through `assemble`/`recompile`. Default `strict_types=False` keeps
+  the name-level gate byte-for-byte unchanged. First slice of the FZ 35e2b3b Phase-6 compiler
+  contract (deepen #2). +6 tests.
+
 - **`GovernorLoop(record_frontier=True)` — wire the scheduler→compiler channel onto the live path
   (opt-in, default off).** Closes the previously-dead `compile_next` channel *in the loop* (the
   mechanism shipped in 0.4.3; this connects it): when a `TrustLadderScheduler` is set and

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-16
+
 ### Added
 
 - **Pipeline gap-fill: planner-decompose → scheduler-bind → create → align → transfer (all opt-in).**

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GovernorLoop(decompose=True, bind_fn=…)` — the decompose→bind pipeline as the loop's live
+  authoring path (opt-in, default off).** Makes `decompose → staff → assemble` the actual runtime
+  behavior of `GovernorLoop.run()`, not just a library call: round-1 authors a multi-node CAPABILITY
+  DAG (`plan_from_goal(decompose=True)`) and staffs it via `staff_capability_dag()` into an
+  assemblable manifest set (bind each capability to a standing agent via `bind_fn`, else author a
+  low-trust skeleton) — replacing the manifest-as-plan reconcile. The staffed set is computed once
+  and memoized so `assemble`/`recompile` and every episode supervisor share ONE deterministic set,
+  and a resume re-derives it identically (INV-4). Runs cold-start with ZERO caller manifests. Pure/
+  offline authoring (INV-2); the emitted DAG is still frozen by `assemble` (INV-3). Composes with the
+  Phase-6 contract gates (`strict_types`/`single_writer`/`check_acceptance` + the trust dial). Default
+  `decompose=False` keeps round-1 authoring byte-for-byte the single-shot `plan_from_goal` path over
+  the caller's manifests. +4 tests. **This completes the integration half — the decompose→bind→align
+  pipeline the FZ 35e2b critique called for now runs end-to-end through the governor loop.**
+
 - **`governor.authoring.staff_capability_dag()` — staff a capability DAG into an assemblable
   manifest set (the decompose→bind→relabel front).** Closes the hard middle that made a decomposed
   plan un-runnable: a capability `AgentDAG` (from `plan_from_goal(..., decompose=True)`) has

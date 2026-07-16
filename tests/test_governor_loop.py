@@ -1681,3 +1681,96 @@ def test_record_frontier_default_off_leaves_frontier_empty(tmp_path):
     for plan in result.state.plan_history:
         assert plan.frontier == []
         assert "frontier" not in plan.to_dict()  # emitted only when non-empty
+
+
+# -- FZ 35e2b3b A2: decompose-mode authoring (loop calls staff_capability_dag) --------------
+def test_decompose_mode_authors_and_runs_a_capability_plan():
+    """A2: GovernorLoop(decompose=True) authors a MULTI-NODE capability DAG, STAFFS it into an
+    assemblable manifest set with NO caller manifests, and runs it end-to-end (cold start)."""
+    fake = _fresh_fake()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "investigate the checkout latency regression",
+        {},  # ZERO caller manifests — the loop staffs the capability DAG itself
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+        decompose=True,
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    # A real multi-node capability plan was authored + frozen (not the 1-node fallback).
+    first_plan = result.state.plan_history[0]
+    assert len(first_plan.order) > 1
+    assert all("__" in n for n in first_plan.order)          # agent-agnostic capability labels
+    # It ran to frontier-exhaustion over the staffed manifests.
+    assert result.terminated_by == "frontier_exhaust"
+    assert result.done is True
+    assert set(result.completed) == set(first_plan.order)
+
+
+def test_decompose_mode_binds_via_bind_fn():
+    """A2: bind_fn lets the loop bind capability nodes to standing agents (recorded as bound_agent)."""
+    fake = _fresh_fake()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "investigate root cause",
+        {},
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        backend="python",
+        decompose=True,
+        bind_fn=lambda node: "veteran" if "scope" in node else None,  # bind the scope stage
+    )
+    result = loop.run({})
+    # The staffed manifest for the scope node records the binding; others were authored.
+    staffed = loop._staffed_manifests
+    scope_nodes = [n for n in staffed if "scope" in n]
+    assert scope_nodes and staffed[scope_nodes[0]].registry.get("bound_agent") == "veteran"
+    assert result.done is True
+
+
+def test_decompose_mode_default_off_unchanged():
+    """Back-compat: without decompose=, authoring is byte-for-byte the single-shot manifest path."""
+    fake = _fresh_fake()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=InProcessStateStore(),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        backend="python",
+        # decompose defaults False
+    )
+    result = loop.run({"uri": "s3://doc"})
+    assert loop._staffed_manifests is None            # no staffing happened
+    assert set(result.completed) == {"ingest", "summarize"}  # the caller's manifest topology
+
+
+def test_decompose_mode_resume_reproduces_staffed_manifests(tmp_path):
+    """A2 + resume: re-authoring on resume re-derives the IDENTICAL staffed manifest set + DAG order,
+    so the executed prefix stays pinned (INV-4)."""
+    from concursus.governor.loop import InProcessCheckpointStore
+
+    goal = "build a detection model"
+    ckpt = InProcessCheckpointStore()
+    store = InProcessStateStore()
+    loop1 = GovernorLoop(goal, {}, store=store, checkpointer=ckpt,
+                         supervisor_factory=lambda **kw: _fresh_partial()(**kw),
+                         backend="python", decompose=True, max_rounds=1, no_progress_n=5)
+    loop1.run({})
+    staffed1 = dict(loop1._staffed_manifests)
+
+    # A fresh loop over the SAME goal + surviving log/checkpoint re-authors identically.
+    loop2 = GovernorLoop(goal, {}, store=store, checkpointer=ckpt,
+                         supervisor_factory=lambda **kw: _fresh_partial()(**kw),
+                         backend="python", decompose=True, max_rounds=8, no_progress_n=5)
+    result2 = loop2.run({})
+    staffed2 = dict(loop2._staffed_manifests)
+
+    # Same capability nodes + same authored order => deterministic re-derivation (INV-4).
+    assert set(staffed1) == set(staffed2)
+    assert [m.name for m in staffed1.values()] == [m.name for m in staffed2.values()]
+    assert result2.done is True

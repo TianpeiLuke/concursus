@@ -258,6 +258,8 @@ class GovernorLoop:
         run_id: str = "governor",
         checkpoint_every: int = 0,
         record_frontier: bool = False,
+        decompose: bool = False,
+        bind_fn: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         if backend not in ("auto", "python", "langgraph"):
             raise GovernorLoopError(
@@ -350,6 +352,22 @@ class GovernorLoop:
         # a pure provenance annotation, not a plan mutation (INV-2/INV-3/INV-4). Requires a scheduler
         # to produce a frontier; a no-op when ``scheduler is None``.
         self._record_frontier = bool(record_frontier)
+        # -- OPT-IN capability-decompose authoring path (FZ 35e2b3b A1-A3) ---
+        # False (default) => round-1 authoring is byte-for-byte today's single-shot plan_from_goal
+        # over the CALLER's manifests. True => the loop authors a multi-node CAPABILITY DAG
+        # (plan_from_goal(decompose=True)) and STAFFS it via staff_capability_dag() into an
+        # assemblable manifest set (bind each capability to a standing agent via ``bind_fn``, else
+        # author a low-trust skeleton) — the decompose -> bind -> assemble front, replacing the
+        # manifest-as-plan reconcile. The staffed set is computed ONCE (deterministically) and cached
+        # so ``assemble``/``recompile`` and the episode supervisor all see the SAME manifests, and a
+        # resume re-derives the identical set (INV-4). Pure/offline authoring (INV-2); the emitted DAG
+        # is still frozen by ``assemble`` exactly as before (INV-3). ``bind_fn`` default None authors
+        # every node (the zero-bench cold-start path).
+        self._decompose = bool(decompose)
+        self._bind_fn = bind_fn
+        # The staffed capability manifests, memoized on first authoring (decompose mode only) so every
+        # compiler call + the episode supervisor share ONE deterministic set; None in the default path.
+        self._staffed_manifests: Optional[Dict[str, AgentManifest]] = None
         # -- READ-ONLY cockpit/scope seam (I-3) -----------------------------
         # The CURRENT run's final frozen plan VALUE, stashed by run() so a caller can build a
         # DirectorCockpit / read the scope projections over the LIVE run WITHOUT re-assembling or
@@ -483,7 +501,7 @@ class GovernorLoop:
         """
         supervisor = Supervisor(
             self._last_plan if self._last_plan is not None else _EMPTY_PLAN,
-            self._manifests,
+            self._active_manifests(),
             invoke_fn=self._invoke_fn,
             arns=self._arns,
             state_store=self._store,
@@ -580,7 +598,7 @@ class GovernorLoop:
         # ``recompile`` would then reject with MonotonicityError. Round-1 authored from an empty
         # trail, so a fresh empty trail on resume reproduces the same node names (INV-3/INV-4).
         dag = self._author_first_dag(resume=True)
-        plan = self._assembler.assemble(dag, self._manifests)
+        plan = self._assembler.assemble(dag, self._active_manifests())
         state = GovernorState(current_frozen_plan=plan, store=self._store)
         # Replay the compiler front to re-fetch the plan at the checkpointed version. Each recompile
         # PINS the surviving executed prefix (re-derived from the log this instant) and bumps the
@@ -593,7 +611,7 @@ class GovernorLoop:
                 completed=completed,
                 content_hashes=content_hashes,
                 dag=dag,
-                manifests=self._manifests,
+                manifests=self._active_manifests(),
                 max_revisions=self._max_revisions,
             )
             state.advance(plan, reason=ckpt.get("replan_reason") or "resume", progressed=True)
@@ -664,6 +682,18 @@ class GovernorLoop:
             content_hashes[record.node] = chash
         return completed, content_hashes
 
+    def _active_manifests(self) -> Dict[str, AgentManifest]:
+        """The manifest set the compiler + episode supervisor operate on this run.
+
+        Default path: the caller's ``self._manifests``. Decompose mode (A1-A3): the memoized staffed
+        capability manifests (:func:`staff_capability_dag`), computed once in ``_author_first_dag`` so
+        assemble/recompile and every episode share ONE deterministic set (INV-4). Falls back to the
+        caller's manifests if decompose mode has not yet authored (e.g. an empty pre-run cockpit).
+        """
+        if self._decompose and self._staffed_manifests is not None:
+            return self._staffed_manifests
+        return self._manifests
+
     # ================================================= first-round DAG authoring (I-0)
     def _author_first_dag(self, *, resume: bool = False):
         """Author the round-1 DAG at the compiler FRONT — single-shot by default, deliberated opt-in.
@@ -693,6 +723,18 @@ class GovernorLoop:
         would raise :class:`MonotonicityError`. Round-1 authored from an empty trail; a fresh empty
         trail on resume reproduces the identical node names, so the executed prefix stays pinned.
         """
+        if self._decompose:
+            # A1-A3: author a multi-node CAPABILITY DAG and STAFF it into an assemblable manifest set
+            # (bind via bind_fn, else author a skeleton). Deterministic + offline, so it reproduces
+            # byte-for-byte on resume (INV-4). Memoize the staffed set so every compiler call + the
+            # episode supervisor share ONE manifest set (self._active_manifests()).
+            from concursus.governor.authoring import staff_capability_dag
+
+            dag = plan_from_goal(
+                self._goal, plan_model_fn=self._plan_model_fn, decompose=True
+            )
+            self._staffed_manifests = staff_capability_dag(dag, bind_fn=self._bind_fn)
+            return dag
         if not self._deliberate:
             return plan_from_goal(self._goal, plan_model_fn=self._plan_model_fn)
         # Imported here (not at module top) so the default single-shot path never imports the
@@ -777,7 +819,7 @@ class GovernorLoop:
             # The DAG is authored single-shot by default, or via the bounded pre-freeze deliberation
             # when deliberate=True — both return a frozen AgentDAG ready for assemble (INV-3/INV-4).
             dag = self._author_first_dag()
-            plan = self._assembler.assemble(dag, self._manifests)
+            plan = self._assembler.assemble(dag, self._active_manifests())
             state = GovernorState(current_frozen_plan=plan, store=self._store)
             ctx["dag"] = dag
             ctx["state"] = state
@@ -800,7 +842,7 @@ class GovernorLoop:
                 completed=completed,
                 content_hashes=content_hashes,
                 dag=ctx["dag"],
-                manifests=self._manifests,
+                manifests=self._active_manifests(),
                 max_revisions=self._max_revisions,
                 compile_next=compile_next,
             )
@@ -907,7 +949,7 @@ class GovernorLoop:
         """
         factory_kwargs = dict(
             plan=ctx["plan"],
-            manifests=self._manifests,
+            manifests=self._active_manifests(),
             store=self._store,
             invoke_fn=self._invoke_fn,
             arns=self._arns,

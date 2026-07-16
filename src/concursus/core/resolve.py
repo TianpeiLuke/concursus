@@ -150,6 +150,7 @@ def check_alignment(
     manifests: Dict[str, "AgentManifest"],
     *,
     strict_types: bool = False,
+    single_writer: bool = False,
 ) -> None:
     """Type-gate every ``depends_on`` edge; raise :class:`AlignmentError` on any violation.
 
@@ -164,9 +165,16 @@ def check_alignment(
     conservative: an unknown/absent type on either side passes (see :func:`_types_compatible`), so
     turning it on never rejects a manifest that simply omits type annotations. Default off keeps
     the name-level gate byte-for-byte unchanged.
+
+    ``single_writer`` (default ``False``) adds the NON-OVERLAP gate (FZ 35e2b3b B1): no consumer
+    input may be fed by more than one ``depends_on`` edge. Two edges targeting the same
+    ``input_name`` are a single-writer violation — at run time the supervisor overlays
+    ``payload[input_name] = …`` per edge, so a second writer SILENTLY last-wins (a non-deterministic
+    data-flow bug). This catches it at compile time. Default off keeps behavior unchanged.
     """
     for node, manifest in manifests.items():
         consumer_inputs = manifest.inputs
+        writers_of: Dict[str, str] = {}  # B1: consumer input_name -> the producer already wiring it
         for edge in manifest.depends_on:
             producer, _, rest = str(edge["from"]).partition(".")
             input_name = edge["to"]
@@ -191,6 +199,18 @@ def check_alignment(
                     f"{node}: depends_on target input {input_name!r} is not a declared input "
                     f"of {node!r} (declared: {sorted(consumer_inputs)})"
                 )
+
+            # B1 (opt-in): single-writer per consumer input. A second edge feeding the same input
+            # would silently last-wins at run time (payload[input_name] = … per edge) — reject it.
+            if single_writer:
+                prior = writers_of.get(input_name)
+                if prior is not None:
+                    raise AlignmentError(
+                        f"{node}: input {input_name!r} is fed by MORE THAN ONE producer "
+                        f"({prior!r} and {producer!r}) — a single-writer violation "
+                        "(the second edge would silently overwrite the first at run time)"
+                    )
+                writers_of[input_name] = producer
 
             if producer not in dag.get_dependencies(node):
                 raise AlignmentError(

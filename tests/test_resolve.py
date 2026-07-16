@@ -266,3 +266,62 @@ def test_strict_types_union_overlap_passes():
     dag2, manifests2 = _typed_edge("boolean", ["string", "integer"])
     with pytest.raises(AlignmentError, match="type-INCOMPATIBLE"):
         check_alignment(dag2, manifests2, strict_types=True)
+
+
+# -- FZ 35e2b3b B1: opt-in single-writer (non-overlap) gate -----------------
+def _two_writers_one_input():
+    """A diamond where BOTH `a` and `b` feed the SAME consumer input `doc` of `c` — a single-writer
+    violation (the second edge would silently overwrite the first at run time)."""
+    dag = AgentDAG()
+    for n in ["a", "b", "c"]:
+        dag.add_node(n)
+    dag.add_edge("a", "c")
+    dag.add_edge("b", "c")
+    manifests = {
+        "a": AgentManifest.from_dict(
+            {"name": "a", "registry": {"container_uri": "x", "protocol": "HTTP"},
+             "contract": {"outputs": {"out": {"type": "string"}}}}
+        ),
+        "b": AgentManifest.from_dict(
+            {"name": "b", "registry": {"container_uri": "x", "protocol": "HTTP"},
+             "contract": {"outputs": {"out": {"type": "string"}}}}
+        ),
+        "c": AgentManifest.from_dict(
+            {"name": "c", "registry": {"container_uri": "x", "protocol": "HTTP"},
+             "contract": {
+                 "inputs": {"doc": {"type": "string"}},
+                 "outputs": {"o": {"type": "string"}},
+             },
+             "spec": {"depends_on": [
+                 {"from": "a.out", "to": "doc"},
+                 {"from": "b.out", "to": "doc"},   # SECOND edge to the same input 'doc'
+             ]}}
+        ),
+    }
+    return dag, manifests
+
+
+def test_single_writer_rejects_double_fed_input():
+    """Two producers feeding one consumer input is caught ONLY under single_writer."""
+    dag, manifests = _two_writers_one_input()
+    # Default gate passes — both edges are individually well-formed (producer/field/input/DAG-edge).
+    assert check_alignment(dag, manifests) is None
+    # The non-overlap gate rejects the second writer.
+    with pytest.raises(AlignmentError, match="single-writer violation"):
+        check_alignment(dag, manifests, single_writer=True)
+
+
+def test_single_writer_passes_normal_chain():
+    """A one-producer-per-input chain passes the single-writer gate (nothing is double-fed)."""
+    dag, manifests = _chain()
+    assert check_alignment(dag, manifests, single_writer=True) is None
+
+
+def test_single_writer_and_strict_types_compose():
+    """B1 and B2 are independent, composable gates: both can be on at once."""
+    dag, manifests = _chain()  # well-typed AND single-writer-clean
+    assert check_alignment(dag, manifests, single_writer=True, strict_types=True) is None
+    # A double-fed input still trips single_writer even with strict_types on.
+    dag2, manifests2 = _two_writers_one_input()
+    with pytest.raises(AlignmentError, match="single-writer violation"):
+        check_alignment(dag2, manifests2, single_writer=True, strict_types=True)

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`OrchestrationAssembler(single_writer=True)` / `check_alignment(..., single_writer=True)` —
+  non-overlap / single-writer gate (opt-in, default off).** Rejects a plan where any consumer input
+  is fed by more than one `depends_on` edge. Two edges targeting the same `input_name` are a
+  single-writer violation: at run time the supervisor overlays `payload[input_name] = …` per edge, so
+  a second writer would silently last-wins (a non-deterministic data-flow bug) — this catches it at
+  compile time (`AlignmentError`). Composable with `strict_types`; compile-time only (INV-2). Default
+  `single_writer=False` keeps behavior byte-for-byte unchanged. FZ 35e2b3b Phase-6 compiler contract
+  (#1 non-overlap). +4 tests.
+
 - **`OrchestrationAssembler(strict_types=True)` / `check_alignment(..., strict_types=True)` — deep
   type-alignment gate (opt-in, default off).** Upgrades the compiler's edge check from field-*name*
   presence to *type compatibility*: for each `depends_on` edge, the producer output field's declared

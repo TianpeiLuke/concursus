@@ -339,3 +339,29 @@ def test_assembler_strict_types_rejects_type_mismatch():
     # Strict assembler: the deep type gate rejects the concrete mismatch.
     with pytest.raises(AlignmentError, match="type-INCOMPATIBLE"):
         OrchestrationAssembler(strict_types=True).assemble(dag, manifests)
+
+
+# -- FZ 35e2b3b B1: OrchestrationAssembler(single_writer=) threads the non-overlap gate ----------
+def test_assembler_single_writer_rejects_double_fed_input():
+    """A plan where two producers feed one consumer input assembles by DEFAULT but is REJECTED
+    under single_writer=True."""
+    dag = AgentDAG()
+    for n in ["a", "b", "c"]:
+        dag.add_node(n)
+    dag.add_edge("a", "c")
+    dag.add_edge("b", "c")
+    manifests = {
+        "a": _agent("a", {}, {"out": {"type": "string"}}),
+        "b": _agent("b", {}, {"out": {"type": "string"}}),
+        "c": _agent(
+            "c",
+            {"doc": {"type": "string"}},
+            {"o": {"type": "string"}},
+            depends_on=[{"from": "a.out", "to": "doc"}, {"from": "b.out", "to": "doc"}],
+        ),
+    }
+    # Default assembler: both edges are individually well-formed → it assembles.
+    assert set(OrchestrationAssembler().assemble(dag, manifests).order) == {"a", "b", "c"}
+    # single_writer assembler: the non-overlap gate rejects the double-fed input.
+    with pytest.raises(AlignmentError, match="single-writer violation"):
+        OrchestrationAssembler(single_writer=True).assemble(dag, manifests)

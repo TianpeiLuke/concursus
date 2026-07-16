@@ -149,6 +149,7 @@ class OrchestrationAssembler:
         region: Optional[str] = None,
         precedent_retriever: Optional["PrecedentRetriever"] = None,
         strict_types: bool = False,
+        single_writer: bool = False,
     ) -> None:
         self.account = account
         self.region = region
@@ -165,6 +166,11 @@ class OrchestrationAssembler:
         #: unknown/absent types pass, so it never rejects an un-annotated manifest. Compile-time only
         #: — no runtime effect, INV-2 preserved.
         self.strict_types = bool(strict_types)
+        #: OPT-IN single-writer gate (FZ 35e2b3b B1). Default ``False`` keeps ``check_alignment`` at
+        #: its default (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile`` ALSO
+        #: reject a plan where any consumer input is fed by more than one ``depends_on`` edge (a
+        #: silent last-wins overwrite at run time). Compile-time only — INV-2 preserved.
+        self.single_writer = bool(single_writer)
 
     def assemble(
         self, dag: "AgentDAG", manifests: Dict[str, "AgentManifest"]
@@ -181,7 +187,9 @@ class OrchestrationAssembler:
         dag.validate()
         for manifest in manifests.values():
             manifest.validate()
-        resolve.check_alignment(dag, manifests, strict_types=self.strict_types)
+        resolve.check_alignment(
+            dag, manifests, strict_types=self.strict_types, single_writer=self.single_writer
+        )
         wiring = resolve.resolve_edges(dag, manifests)
 
         entries: Dict[str, BuildPlanEntry] = {}

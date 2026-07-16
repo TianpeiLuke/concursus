@@ -18,6 +18,8 @@ from concursus.governor.registry import AgentRegistry
 from concursus.governor.scheduler import (
     DISPATCH,
     ESCALATE,
+    UNMATCHED,
+    Binding,
     FrontierProposal,
     ScheduleDecision,
     TrustLadderScheduler,
@@ -155,3 +157,108 @@ def test_binding_is_input_to_recompile_not_mutation(tmp_path):
     # The proposal is a plain-dict-able VALUE ready to hand to the next recompile.
     d = proposal.to_dict()
     assert set(d) >= {"compile_next", "escalated", "unmatched"}
+
+
+# -- FZ 35e2b3 Phase 3a: auto-Create wires UNMATCHED -> spawn (opt-in) -------
+
+def test_auto_create_off_by_default_leaves_unmatched_held(tmp_path):
+    """Back-compat: without auto_create, an UNMATCHED role stays held (no spawn attempted)."""
+    from concursus.governor.loop import GovernorLoop
+
+    ledger = DeployLedger(tmp_path / "l.json")
+    sched = TrustLadderScheduler(_registry_with(ledger), manifests={})
+    loop = GovernorLoop(goal="g", manifests={}, scheduler=sched)  # auto_create defaults False
+    ctx = {"plan": _plan(["needs_agent"]), "trace": []}
+    out = loop._router(ctx)
+    assert "needs_agent" in out["held"]
+    assert not out.get("created")
+
+
+def test_auto_create_spawns_for_unmatched_role(tmp_path):
+    """P3a: with auto_create + a fake create_fn, an UNMATCHED role triggers an on-demand spawn."""
+    from concursus.governor.loop import GovernorLoop
+
+    ledger = DeployLedger(tmp_path / "l.json")
+    sched = TrustLadderScheduler(_registry_with(ledger), manifests={})
+    spawned = []
+
+    def fake_create(task):
+        spawned.append(task)          # a FAKE provisioner — no boto3, no CreateAgentRuntime
+        return True                    # report the agent is now standing
+
+    loop = GovernorLoop(goal="g", manifests={}, scheduler=sched,
+                        auto_create=True, create_fn=fake_create)
+    ctx = {"plan": _plan(["needs_agent"]), "trace": []}
+    out = loop._router(ctx)
+    assert spawned == ["needs_agent"]           # the spawn seam fired for the unmatched role
+    assert out["created"] == ["needs_agent"]    # surfaced for the cockpit
+
+
+def test_auto_create_failed_spawn_leaves_node_held(tmp_path):
+    """A spawn that fails/does-not-confirm leaves the node held (safe degradation)."""
+    from concursus.governor.loop import GovernorLoop
+
+    ledger = DeployLedger(tmp_path / "l.json")
+    sched = TrustLadderScheduler(_registry_with(ledger), manifests={})
+    loop = GovernorLoop(goal="g", manifests={}, scheduler=sched,
+                        auto_create=True, create_fn=lambda task: False)  # spawn "fails"
+    ctx = {"plan": _plan(["needs_agent"]), "trace": []}
+    out = loop._router(ctx)
+    assert not out.get("created")
+    assert "needs_agent" in out["held"]         # still held; loop degrades safely
+
+
+# -- FZ 35e2b3 Phase 2: the BINDER (candidate set × trust-priority × availability) --
+
+def test_decide_ranked_picks_best_trust_from_candidate_set(tmp_path):
+    """P2.1/P2.2: among two capable agents, bind the higher-earned-trust one (not first-match)."""
+    ledger = DeployLedger(tmp_path / "l.json")
+    ledger.record(name="low", fingerprint="f1", arn="arn:low", deployed_at="2026-07-01")
+    ledger.record(name="high", fingerprint="f2", arn="arn:high", deployed_at="2026-07-01")
+    m_low = _manifest("low", capabilities={"triage"}, trust_seed=TrustGrade.L1_CANARY)
+    m_high = _manifest("high", capabilities={"triage"}, trust_seed=TrustGrade.L3_AUTONOMOUS)
+    reg = _registry_with(ledger, m_low, m_high)
+    sched = TrustLadderScheduler(reg, manifests={"low": m_low, "high": m_high})
+
+    b = sched.decide_ranked("triage")
+    assert isinstance(b, Binding)
+    assert b.action == DISPATCH
+    assert b.agent == "high"                      # best trust wins, not first-registered
+    assert set(b.candidates) == {"low", "high"}   # full candidate set considered (P2.1)
+
+
+def test_decide_ranked_unmatched_when_no_agent(tmp_path):
+    """UNMATCHED when no standing agent serves the task (the Create arrow's trigger)."""
+    ledger = DeployLedger(tmp_path / "l.json")
+    reg = _registry_with(ledger)
+    sched = TrustLadderScheduler(reg, manifests={})
+    assert sched.decide_ranked("no_such_task").action == UNMATCHED
+
+
+def test_decide_ranked_availability_breaks_trust_ties(tmp_path):
+    """P2.3: among equal-trust candidates, prefer the least-loaded via load_fn."""
+    ledger = DeployLedger(tmp_path / "l.json")
+    ledger.record(name="busy", fingerprint="f1", arn="arn:busy", deployed_at="2026-07-01")
+    ledger.record(name="free", fingerprint="f2", arn="arn:free", deployed_at="2026-07-01")
+    m_busy = _manifest("busy", capabilities={"triage"}, trust_seed=TrustGrade.L2_GUARDED)
+    m_free = _manifest("free", capabilities={"triage"}, trust_seed=TrustGrade.L2_GUARDED)
+    reg = _registry_with(ledger, m_busy, m_free)
+    load = {"busy": 5, "free": 0}
+    sched = TrustLadderScheduler(reg, manifests={"busy": m_busy, "free": m_free},
+                                 load_fn=lambda n: load.get(n, 0))
+    b = sched.decide_ranked("triage")
+    assert b.agent == "free" and b.load == 0
+
+
+def test_propose_bindings_covers_the_frontier(tmp_path):
+    """P2.4: propose_bindings returns {node: Binding} over the ready frontier, skipping completed."""
+    ledger = DeployLedger(tmp_path / "l.json")
+    ledger.record(name="t", fingerprint="f1", arn="arn:t", deployed_at="2026-07-01")
+    m = _manifest("t", capabilities={"a", "b"}, trust_seed=TrustGrade.L2_GUARDED)
+    reg = _registry_with(ledger, m)
+    sched = TrustLadderScheduler(reg, manifests={"t": m})
+    plan = _plan(["a", "b", "c"])
+    bindings = sched.propose_bindings(plan, completed={"a"})
+    assert set(bindings) == {"b", "c"}            # 'a' completed => skipped
+    assert bindings["b"].action == DISPATCH
+    assert bindings["c"].action == UNMATCHED      # no agent serves 'c'

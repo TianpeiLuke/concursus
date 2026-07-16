@@ -205,3 +205,56 @@ def test_approval_gate_non_tty_without_yes_aborts(monkeypatch):
 
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))  # not a tty (StringIO has no isatty->True)
     assert cli._plan_approval_gate(_FakePlan(), _run_args(approve=True, yes=False)) is False
+
+
+# -- FZ 35e2b3 Phase 1: capability decomposer (opt-in) ----------------------
+
+def test_decompose_default_off_is_single_node():
+    """Back-compat: without decompose=, the fallback is still a single node (byte-identical)."""
+    dag = plan_from_goal("Investigate the alarm burst")
+    assert len(dag.nodes) == 1
+
+
+def test_decompose_emits_multinode_capability_chain():
+    """decompose=True with no model => a multi-node agent-agnostic capability chain (P1.1/P1.2)."""
+    dag = plan_from_goal("Investigate the alarm burst", decompose=True)
+    assert len(dag.nodes) > 1
+    assert dag.edges  # a real chain, not isolated nodes
+    dag.validate()  # acyclic + valid
+    # nodes are capability task labels, never agent/manifest names
+    assert all("__" in n for n in dag.nodes)
+
+
+def test_decompose_routes_by_keyword_shape():
+    """Different goal keywords route to different capability shapes (deterministic, offline)."""
+    inv = plan_from_goal("investigate root cause", decompose=True).nodes
+    mdl = plan_from_goal("build a detection model", decompose=True).nodes
+    assert any("hypothesize" in n for n in inv)
+    assert any("calibrate" in n for n in mdl)
+
+
+def test_decompose_generic_fallback_shape():
+    """A goal with no keyword match still decomposes via the generic ingest->...->format shape."""
+    nodes = plan_from_goal("do the thing", decompose=True).nodes
+    assert any("ingest" in n for n in nodes) and any("format" in n for n in nodes)
+
+
+def test_complexity_contract_caps_nodes():
+    """P1.3: the authored DAG is rejected when it exceeds max_nodes."""
+    with pytest.raises(PlanAuthorError):
+        plan_from_goal("investigate root cause", decompose=True, max_nodes=2)
+
+
+def test_complexity_contract_caps_depth():
+    """P1.3: the authored DAG is rejected when the chain is deeper than max_depth."""
+    with pytest.raises(PlanAuthorError):
+        plan_from_goal("investigate root cause", decompose=True, max_depth=1)
+
+
+def test_injected_model_still_overrides_decompose():
+    """An injected plan_model_fn always wins over the template, even with decompose=True."""
+    def model(goal, precedents, directives):
+        return {"nodes": ["a", "b"], "edges": [["a", "b"]]}
+
+    dag = plan_from_goal("anything", decompose=True, plan_model_fn=model)
+    assert set(dag.nodes) == {"a", "b"}

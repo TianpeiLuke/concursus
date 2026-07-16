@@ -233,6 +233,8 @@ class GovernorLoop:
         checkpointer: Optional[CheckpointStore] = None,
         assembler: Optional[OrchestrationAssembler] = None,
         scheduler: Optional["TrustLadderScheduler"] = None,
+        auto_create: bool = False,
+        create_fn: Optional[Callable[[str], Any]] = None,
         supervisor_factory: Optional[SupervisorFactory] = None,
         invoke_fn: Optional[InvokeFn] = None,
         arns: Optional[Dict[str, str]] = None,
@@ -291,6 +293,14 @@ class GovernorLoop:
         # would raise MonotonicityError), so holding is achieved by non-dispatch, not by shrinking the
         # plan.
         self._scheduler = scheduler
+        # FZ 35e2b3 P3a: OPT-IN auto-Create. When ``auto_create`` and a scheduler are set, the
+        # router turns an UNMATCHED role (no standing agent) into an on-demand SPAWN instead of a
+        # permanent hold. ``create_fn(task) -> bool`` is the INJECTED spawn seam (default: the
+        # scheduler's registry.ensure_task, which routes to provision_agent -> CreateAgentRuntime);
+        # tests inject a FAKE so no boto3 / no live AWS. Spawning happens between rounds (a later
+        # round's proposal binds the now-standing agent) — never a live-plan mutation (INV-3).
+        self._auto_create = bool(auto_create)
+        self._create_fn = create_fn
         self._supervisor_factory = supervisor_factory or _default_supervisor_factory
         self._invoke_fn = invoke_fn
         self._arns = arns
@@ -785,6 +795,25 @@ class GovernorLoop:
         ctx["trace"].append("planner")
         return ctx
 
+    def _default_create_fn(self):
+        """The default P3a spawn seam: the scheduler's registry ``ensure_task`` (or ``None``).
+
+        Routes an on-demand spawn through ``registry.ensure_task(task)`` -> ``provision_agent`` ->
+        ``CreateAgentRuntime`` (the real Create actuator). Returns a ``create_fn(task) -> bool`` that
+        reports whether an agent is now standing for the task, or ``None`` when no registry is
+        reachable (auto-create then no-ops, leaving the node held). Tests inject their own fake via
+        ``create_fn=`` so nothing touches AWS.
+        """
+        registry = getattr(self._scheduler, "_registry", None)
+        if registry is None or not hasattr(registry, "ensure_task"):
+            return None
+
+        def spawn(task: str) -> bool:
+            version = registry.ensure_task(task)
+            return version is not None
+
+        return spawn
+
     def _router(self, ctx: dict) -> dict:
         """ROUTER: OPT-IN Trust-Ladder frontier gate; a pure pass-through when no scheduler is set.
 
@@ -807,6 +836,26 @@ class GovernorLoop:
             proposal = self._scheduler.propose_frontier(
                 ctx["plan"], completed=self._store.completed()
             )
+            # P3a: turn UNMATCHED roles into on-demand SPAWNS (opt-in). A spawn makes an agent
+            # standing for the NEXT round's proposal (between-episode growth, INV-3 safe); the
+            # spawned set is surfaced on ctx["created"] for the cockpit. Any spawn that fails or is
+            # not confirmed leaves the node UNMATCHED (still held), so the loop degrades safely.
+            if self._auto_create and proposal.unmatched:
+                created = set(ctx.get("created") or [])
+                spawn = self._create_fn or self._default_create_fn()
+                still_unmatched = []
+                for task in proposal.unmatched:
+                    try:
+                        ok = bool(spawn(task)) if spawn is not None else False
+                    except Exception:  # noqa: BLE001 - a spawn failure must not crash the round
+                        ok = False
+                    (created.add(task) if ok else still_unmatched.append(task))
+                ctx["created"] = sorted(created)
+                if created:
+                    # Re-propose so a just-spawned agent binds THIS round if it is now standing.
+                    proposal = self._scheduler.propose_frontier(
+                        ctx["plan"], completed=self._store.completed()
+                    )
             held = set(proposal.escalated) | set(proposal.unmatched)
             ctx["proposal"] = proposal
             ctx["held"] = held

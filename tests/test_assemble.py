@@ -260,3 +260,53 @@ def test_recompile_requires_dag_and_manifests():
     prior = asm.assemble(dag, manifests)
     with pytest.raises(AssemblyError, match="recompile requires"):
         asm.recompile(prior, completed=set())
+
+
+# -- FZ 35e2b3 Phase 4: wire compile_next -> recompile (close the dead channel) --
+
+def test_assemble_frontier_empty_and_absent_from_to_dict():
+    """Back-compat: assemble() has an empty frontier and to_dict omits the key (byte-identical)."""
+    dag, manifests = _chain()
+    prior = OrchestrationAssembler().assemble(dag, manifests)
+    assert prior.frontier == []
+    assert "frontier" not in prior.to_dict()
+
+
+def test_recompile_without_compile_next_has_empty_frontier():
+    """recompile with no compile_next -> frontier empty; to_dict omits it (back-compat)."""
+    dag, manifests = _chain()
+    asm = OrchestrationAssembler()
+    prior = asm.assemble(dag, manifests)
+    new = asm.recompile(prior, completed={"ingest"}, dag=dag, manifests=manifests)
+    assert new.frontier == []
+    assert "frontier" not in new.to_dict()
+
+
+def test_recompile_records_compile_next_without_changing_topology():
+    """P4.2: compile_next is recorded on frontier; order/entries/wiring are byte-identical."""
+    dag, manifests = _chain()
+    asm = OrchestrationAssembler()
+    prior = asm.assemble(dag, manifests)
+    baseline = asm.recompile(prior, completed={"ingest"}, dag=dag, manifests=manifests)
+    withfront = asm.recompile(
+        prior, completed={"ingest"}, dag=dag, manifests=manifests,
+        compile_next=["summarize", "critique"],
+    )
+    # the monotonic superset (topology) is untouched by compile_next
+    assert withfront.order == baseline.order
+    assert list(withfront.entries) == list(baseline.entries)
+    # only the advisory frontier differs
+    assert withfront.frontier == ["summarize", "critique"]
+    assert withfront.to_dict()["frontier"] == ["summarize", "critique"]
+
+
+def test_recompile_compile_next_filters_unknown_nodes():
+    """A cleared node not in the compiled topology is filtered out of frontier (spec-error guard)."""
+    dag, manifests = _chain()
+    asm = OrchestrationAssembler()
+    prior = asm.assemble(dag, manifests)
+    new = asm.recompile(
+        prior, completed={"ingest"}, dag=dag, manifests=manifests,
+        compile_next=["summarize", "ghost_node"],
+    )
+    assert new.frontier == ["summarize"]  # ghost_node dropped

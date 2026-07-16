@@ -11,7 +11,7 @@ resulting :class:`ProvisioningPlan` is a pure, JSON-serializable preview (a ``co
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Set
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set
 
 from ..core import resolve
 from ..build.build import BuildPlanEntry, RuntimeBuilderFactory
@@ -66,13 +66,21 @@ class ProvisioningPlan:
     #: than the prior plan, bounded by ``max_revisions``. Surfaced in :meth:`to_dict` ONLY when
     #: non-zero, so a first-compile plan's preview is byte-for-byte unchanged.
     revision: int = 0
+    #: The scheduler's cleared-frontier set for THIS revision (FZ 35e2b3 P4.2) — the nodes the
+    #: router bound + cleared to dispatch this round (``FrontierProposal.compile_next`` /
+    #: ``propose_bindings`` DISPATCH nodes). READ-ONLY ADVISORY: it NEVER changes ``order`` /
+    #: ``entries`` / ``wiring`` (the topology is identical with or without it — the monotonic
+    #: superset is preserved), it merely RECORDS on the frozen plan which frontier the scheduler
+    #: cleared, closing the previously-dead ``compile_next`` channel. Empty by default -> ``to_dict``
+    #: byte-for-byte unchanged.
+    frontier: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Render the plan as a JSON-serializable dict (for a ``concursus plan`` preview).
 
         The compiled topology (``order`` / ``entries`` / ``wiring``) is always present; the
-        read-only ``precedents`` field is emitted ONLY when non-empty, so a plan compiled with no
-        retriever is byte-for-byte unchanged.
+        read-only ``precedents``/``frontier`` fields are emitted ONLY when non-empty, so a plan
+        compiled with no retriever and no scheduler frontier is byte-for-byte unchanged.
         """
         out = {
             "order": list(self.order),
@@ -85,6 +93,8 @@ class ProvisioningPlan:
             out["precedents"] = [dict(p) for p in self.precedents]
         if self.revision:
             out["revision"] = self.revision
+        if self.frontier:
+            out["frontier"] = list(self.frontier)
         return out
 
     def to_summary_dict(self) -> dict:
@@ -203,6 +213,7 @@ class OrchestrationAssembler:
         dag: Optional["AgentDAG"] = None,
         manifests: Optional[Dict[str, "AgentManifest"]] = None,
         max_revisions: int = DEFAULT_MAX_REVISIONS,
+        compile_next: Optional[Iterable[str]] = None,
     ) -> ProvisioningPlan:
         """Emit a FRESH, FROZEN, MONOTONIC-SUPERSET plan superseding ``prior_plan`` (AI-20).
 
@@ -231,6 +242,11 @@ class OrchestrationAssembler:
             dag: The (possibly extended) topology to re-compile. Required.
             manifests: The manifests to re-compile. Required.
             max_revisions: The revision ceiling (default :data:`DEFAULT_MAX_REVISIONS`).
+            compile_next: Optional cleared-frontier node ids from the scheduler
+                (``FrontierProposal.compile_next`` / ``propose_bindings`` DISPATCH nodes). When
+                supplied, recorded on the returned plan's read-only ``frontier`` (P4.2, closing the
+                previously-dead channel); filtered to nodes present in the compiled topology. It
+                NEVER changes ``order``/``entries``/``wiring`` — the monotonic superset is preserved.
 
         Raises:
             MonotonicityError: on a non-monotonic edit or once the revision cap is exceeded.
@@ -262,12 +278,23 @@ class OrchestrationAssembler:
             if node in prior_plan.wiring:
                 wiring[node] = list(prior_plan.wiring[node])
 
+        # P4.2: record the scheduler's cleared frontier (compile_next) as READ-ONLY advisory
+        # metadata on the frozen plan — it does NOT alter order/entries/wiring (the monotonic
+        # superset above is untouched), it merely closes the dead compile_next channel by carrying
+        # WHICH frontier nodes the scheduler cleared this revision. A cleared node must be a real
+        # node of the compiled topology (a spec-error guard, not a topology change).
+        frontier: List[str] = []
+        if compile_next is not None:
+            order_set = set(fresh.order)
+            frontier = [n for n in compile_next if n in order_set]
+
         return ProvisioningPlan(
             order=fresh.order,
             entries=entries,
             wiring=wiring,
             precedents=fresh.precedents,
             revision=revision,
+            frontier=frontier,
         )
 
     @staticmethod

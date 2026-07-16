@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pipeline gap-fill: planner-decompose → scheduler-bind → create → align → transfer (all opt-in).**
+  A set of additive, default-off capabilities that un-collapse *binding* from *authoring* so a goal
+  can be launched by instantiating the capacity it needs (design the roles, staff them — creating
+  new ones where the bench has no fit — align the staffed team, and transfer prior experience across
+  domains), while the compiler/freeze/replay identity is preserved. Every item defaults OFF, so the
+  shipped behavior is byte-for-byte unchanged:
+  - **Planner capability decomposer** — `plan_from_goal(..., decompose=True)` emits a deterministic,
+    offline multi-node **capability** DAG (agent-agnostic task labels, keyword-routed shapes with a
+    generic `ingest → analyze → synthesize → format` fallback) instead of the single-node fallback,
+    subject to a per-sub-task complexity contract (`max_nodes`/`max_depth`/`max_fanout`, author-time,
+    raising `PlanAuthorError`). An injected `plan_model_fn` still overrides the template. Default
+    `decompose=False` keeps the single-node fallback.
+  - **Scheduler as a binder** — a new `Binding` value plus `TrustLadderScheduler.decide_ranked()` /
+    `propose_bindings()` select an agent from the **full candidate set** (`registry.match_all`) by
+    **trust priority** (best-trust-first), with an optional `load_fn` availability tie-break — a
+    genuine task→agent binding, not just the first-match trust *gate* (`decide`/`propose_frontier`
+    are untouched).
+  - **`recompile(compile_next=…)` — closes the dead scheduler→compiler channel** by recording the
+    scheduler's cleared frontier on a new read-only `ProvisioningPlan.frontier` field. It never
+    changes `order`/`entries`/`wiring` (the monotonic superset is preserved); `frontier` is emitted
+    in `to_dict()` only when non-empty, so the default is byte-for-byte unchanged.
+  - **Net-new agent-manifest authoring** — a new `concursus.governor.authoring.author_manifest()`
+    authors a valid `AgentManifest` for a capability that has no matching manifest (a deterministic
+    low-trust skeleton by default, or an injected `manifest_author_fn` LLM seam), so a net-new role
+    can be *created*, not just provisioned from a declared manifest. A freshly authored agent enters
+    at `L0_SHADOW` and must earn autonomy.
+  - **Auto-Create on `UNMATCHED`** — `GovernorLoop(auto_create=True, create_fn=…)` turns an
+    unmatched frontier role into an on-demand spawn (default seam: the registry's
+    `ensure_task → provision_agent → CreateAgentRuntime`; an injected `create_fn` lets tests use a
+    fake with no AWS), then re-proposes so a now-standing agent binds. A failed/unconfirmed spawn
+    leaves the node held (safe degradation); spawns are surfaced on the cockpit and happen between
+    rounds (never a live-plan mutation). Default `auto_create=False`.
+  - **Cross-domain precedent transfer** — a built-in deterministic, dependency-free
+    `make_hashing_embed_fn()` makes the `PrecedentRetriever` dense rung usable (an injected semantic
+    embedder can retrieve a lexically-disjoint related precedent where the lexical rung misses),
+    enabling warm-starting a new domain from adjacent experience. Default `embed_fn=None` keeps the
+    dense rung off.
+
 - **`GovernorLoop(checkpoint_every=N)` — opt-in auto-checkpoint cadence.** Realizes the C-4
   checkpoint-compaction win *automatically*: every `N` completed rounds the loop calls
   `store.checkpoint()` so a long-running / standing loop's append-only log stays bounded for warm

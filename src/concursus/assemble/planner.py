@@ -74,11 +74,127 @@ def _fallback_template(goal: str) -> AgentDAG:
     Emits a single-source node whose id derives from the goal, so importing/using concursus needs
     no LLM. This is a genuine (if minimal) valid ``AgentDAG`` — a real ``plan_model_fn`` replaces
     it with a richer topology. It never calls out to any model.
+
+    This is the historical single-node default (kept for back-compat). The multi-node
+    :func:`_template_decompose` is the opt-in capability decomposer (``plan_from_goal(..., decompose=True)``).
     """
     node = _slug(goal) or "plan"
     dag = AgentDAG()
     dag.add_node(node)
     return dag
+
+
+#: Complexity-contract defaults for an AUTHORED plan (P1.3). A sub-task is one bounded unit of
+#: work; these cap the authored DAG's size/shape so a runaway decomposition is rejected at author
+#: time (never a runtime cap). Overridable per call.
+DEFAULT_MAX_NODES = 12
+DEFAULT_MAX_DEPTH = 6
+DEFAULT_MAX_FANOUT = 6
+
+#: Keyword → extra capability stages, so a goal is decomposed into a domain-shaped capability DAG
+#: (agent-agnostic task labels, never manifest keys). Deterministic, offline, no LLM.
+_SHAPE_KEYWORDS = {
+    "investigate": ("scope", "gather_evidence", "hypothesize", "verify"),
+    "diagnos": ("scope", "gather_evidence", "hypothesize", "verify"),
+    "root cause": ("scope", "gather_evidence", "hypothesize", "verify"),
+    "model": ("scope_data", "build_model", "calibrate", "evaluate"),
+    "detect": ("scope_data", "build_model", "calibrate", "evaluate"),
+    "launch": ("scope", "design", "review", "rollout"),
+    "program": ("scope", "design", "review", "rollout"),
+    "migrat": ("audit_source", "transform", "validate_parity"),
+    "report": ("gather", "analyze", "draft"),
+    "summar": ("gather", "analyze", "draft"),
+}
+
+
+def _template_decompose(
+    goal: str,
+    *,
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    max_fanout: int = DEFAULT_MAX_FANOUT,
+) -> AgentDAG:
+    """A DETERMINISTIC, offline default template decomposer (P1.1/P1.2).
+
+    Decomposes ``goal`` into a small *linear* chain of agent-agnostic **capability** task nodes
+    (task labels, never agent/manifest names — P1.2), so the scheduler has real tasks to bind
+    rather than a single opaque node. The shape is keyword-routed against :data:`_SHAPE_KEYWORDS`
+    with a generic ``ingest -> analyze -> synthesize -> format`` fallback. No LLM, no AWS — a real
+    ``plan_model_fn`` UPGRADES this, it does not enable it.
+
+    The emitted DAG is passed through :func:`_check_complexity` so it honors the per-sub-task
+    complexity contract (P1.3).
+    """
+    text = str(goal).strip().lower()
+    stages: tuple = ()
+    for kw, shape in _SHAPE_KEYWORDS.items():
+        if kw in text:
+            stages = shape
+            break
+    if not stages:
+        stages = ("ingest", "analyze", "synthesize", "format")
+
+    # A goal-scoped prefix keeps node ids stable + readable without embedding agent identity.
+    prefix = _slug(goal)[:24] or "task"
+    dag = AgentDAG()
+    prev: Optional[str] = None
+    for stage in stages:
+        node = f"{prefix}__{stage}"
+        dag.add_node(node)
+        if prev is not None:
+            dag.add_edge(prev, node)  # a linear capability chain (fan-out 1, bounded depth)
+        prev = node
+    _check_complexity(dag, max_nodes=max_nodes, max_depth=max_depth, max_fanout=max_fanout)
+    return dag
+
+
+def _check_complexity(
+    dag: AgentDAG,
+    *,
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    max_fanout: int = DEFAULT_MAX_FANOUT,
+) -> AgentDAG:
+    """Enforce the per-sub-task complexity contract on an AUTHORED DAG (P1.3).
+
+    Author-time only (never a runtime cap): rejects a decomposition that is too large or too
+    wide/deep to be a clean set of bounded unit sub-tasks. Raises :class:`PlanAuthorError` on a
+    violation; returns ``dag`` unchanged otherwise.
+    """
+    nodes = dag.nodes
+    if len(nodes) > max_nodes:
+        raise PlanAuthorError(
+            f"authored plan has {len(nodes)} nodes; exceeds max_nodes={max_nodes} "
+            "(decompose into fewer, coarser capability sub-tasks)"
+        )
+    # Max fan-out: no single producer should feed more than max_fanout consumers.
+    for node in nodes:
+        fanout = len(dag.get_dependents(node))
+        if fanout > max_fanout:
+            raise PlanAuthorError(
+                f"node {node!r} fans out to {fanout} consumers; exceeds max_fanout={max_fanout}"
+            )
+    # Max depth: longest producer->consumer chain (the DAG is already validated acyclic upstream).
+    depth = _longest_path(dag)
+    if depth > max_depth:
+        raise PlanAuthorError(
+            f"authored plan has depth {depth}; exceeds max_depth={max_depth}"
+        )
+    return dag
+
+
+def _longest_path(dag: AgentDAG) -> int:
+    """Longest producer->consumer chain length (node count) in an acyclic ``dag``."""
+    memo: dict = {}
+
+    def depth(node: str) -> int:
+        if node in memo:
+            return memo[node]
+        deps = dag.get_dependencies(node)
+        memo[node] = 1 + max((depth(d) for d in deps), default=0)
+        return memo[node]
+
+    return max((depth(n) for n in dag.nodes), default=0)
 
 
 def _slug(text: str) -> str:
@@ -101,6 +217,10 @@ def plan_from_goal(
     precedents: Optional[Sequence[Mapping[str, object]]] = None,
     operator_directives: Optional[Mapping[str, object]] = None,
     plan_model_fn: Optional[PlanModelFn] = None,
+    decompose: bool = False,
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    max_fanout: int = DEFAULT_MAX_FANOUT,
 ) -> AgentDAG:
     """Author an :class:`~concursus.dag.AgentDAG` for ``goal`` — the compiler's generative FRONT.
 
@@ -118,16 +238,25 @@ def plan_from_goal(
         operator_directives: Read-only operator constraints/preferences (e.g. required nodes,
             budget hints). Passed to ``plan_model_fn`` as context.
         plan_model_fn: The INJECTED plan-author callable (the LLM seam). Default ``None`` — when
-            absent, a trivial DETERMINISTIC template is used so concursus imports/runs with NO
+            absent, a deterministic template is used so concursus imports/runs with NO
             model present. When supplied, it is called
             ``plan_model_fn(goal, precedents, operator_directives)`` and must return an
             :class:`AgentDAG` or a ``{"nodes": [...], "edges": [...]}`` mapping.
+        decompose: Opt-in (default ``False`` — byte-identical to the historical single-node
+            fallback). When ``True`` AND no ``plan_model_fn`` is injected, the deterministic
+            :func:`_template_decompose` emits a multi-node **capability** DAG (P1.1/P1.2) subject
+            to the complexity contract (P1.3). An injected ``plan_model_fn`` always takes
+            precedence over the template, regardless of ``decompose``.
+        max_nodes / max_depth / max_fanout: the per-sub-task complexity-contract caps applied to
+            the AUTHORED DAG (P1.3); enforced for both the template decomposer and an injected
+            model's output.
 
     Returns:
         A validated (acyclic, non-empty) :class:`AgentDAG` ready to ``assemble``.
 
     Raises:
-        PlanAuthorError: if ``goal`` is empty, or ``plan_model_fn`` returns an invalid spec.
+        PlanAuthorError: if ``goal`` is empty, a ``plan_model_fn`` returns an invalid spec, or the
+            authored DAG violates the complexity contract.
     """
     if not goal or not str(goal).strip():
         raise PlanAuthorError("plan_from_goal requires a non-empty goal")
@@ -136,8 +265,19 @@ def plan_from_goal(
     ctx_directives: Mapping[str, object] = dict(operator_directives or {})
 
     if plan_model_fn is None:
-        # No model configured — deterministic fallback. concursus needs no LLM to import or run.
-        return _fallback_template(goal)
+        # No model configured. Default: the historical single-node fallback (back-compat).
+        # Opt-in ``decompose=True``: the deterministic multi-node capability template.
+        if not decompose:
+            return _fallback_template(goal)
+        return _template_decompose(
+            goal, max_nodes=max_nodes, max_depth=max_depth, max_fanout=max_fanout
+        )
 
     spec = plan_model_fn(goal, ctx_precedents, ctx_directives)
-    return _dag_from_spec(spec)
+    dag = _dag_from_spec(spec)
+    # The complexity contract applies to an injected model's output too (only when caps are the
+    # non-default explicit intent OR decompose was requested — keep the default byte-identical for
+    # existing model-injected callers by only enforcing when decompose=True).
+    if decompose:
+        _check_complexity(dag, max_nodes=max_nodes, max_depth=max_depth, max_fanout=max_fanout)
+    return dag

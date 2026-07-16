@@ -178,3 +178,63 @@ def test_assemble_with_retriever_but_empty_store_stays_unchanged(tmp_path):
 
     assert plan.precedents == []
     assert plan.to_dict() == baseline.to_dict()
+
+
+# -- FZ 35e2b3 Phase 5: cross-domain precedent transfer (dense rung usable) --
+
+def test_default_embed_fn_none_keeps_dense_off(tmp_path):
+    """Back-compat: default retriever has embed_fn=None, so the dense rung stays skipped."""
+    from concursus.state.precedent import PrecedentRetriever
+
+    _seed_two_runs(tmp_path)
+    r = PrecedentRetriever(tmp_path)
+    assert r.embed_fn is None
+    # a query sharing NO token with either precedent doc -> lexical misses -> [] (dense off)
+    assert r.retrieve(text="zzzqqq nonexistent vocabulary") == []
+
+
+def test_builtin_hashing_embed_fn_is_deterministic_and_usable():
+    """P5.1: the built-in hashing embedder is deterministic, offline, and non-trivial."""
+    from concursus.state.precedent import make_hashing_embed_fn, _cosine
+
+    embed = make_hashing_embed_fn(dim=64)
+    v1 = embed("ingest summarize document")
+    v2 = embed("ingest summarize document")
+    assert v1 == v2                      # deterministic (stable content hash, not salted hash())
+    assert len(v1) == 64
+    # a doc sharing tokens is more similar than a disjoint one
+    near = _cosine(embed("summarize document"), v1)
+    far = _cosine(embed("latitude geocode"), v1)
+    assert near > far
+
+
+def test_injected_semantic_embed_fn_bridges_cross_domain(tmp_path):
+    """P5.3: an injected semantic embed_fn transfers across a lexical gap where rung-2 misses.
+
+    The query shares NO exact token with the 'summary_run' precedent doc (so lexical rung-2 returns
+    nothing), but an injected embedder maps the related concept into the same vector, so the dense
+    rung-3 retrieves it — demonstrating cross-domain transfer offline."""
+    from concursus.state.precedent import PrecedentRetriever, _METHOD_DENSE
+
+    _seed_two_runs(tmp_path)  # 'summary_run' (ingest/summarize) + 'geocode_run' (fetch/geocode)
+
+    # A toy semantic embedder: map both the query's vocabulary AND the summary_run's vocabulary onto
+    # a shared 'condense' concept axis, and the geocode vocabulary onto a different axis. This stands
+    # in for a real embedder that knows "digest"~"summarize" without a shared surface token.
+    CONDENSE = {"digest", "condense", "ingest", "summarize", "document"}
+    LOCATE = {"fetch", "geocode", "latlon", "payload", "latitude"}
+
+    def semantic_embed(text):
+        toks = set(text.lower().split())
+        return [
+            float(len(toks & CONDENSE)),   # axis 0: "condensation" concept
+            float(len(toks & LOCATE)),     # axis 1: "location" concept
+        ]
+
+    r = PrecedentRetriever(tmp_path, embed_fn=semantic_embed)
+    # 'digest condense' shares no token with either precedent doc (lexical rung-2 -> nothing),
+    # but is semantically the summary_run.
+    hits = r.retrieve(text="digest condense")
+    assert hits, "dense rung should retrieve a cross-domain precedent"
+    assert hits[0].method == _METHOD_DENSE
+    assert hits[0].trail_id == "summary_run"

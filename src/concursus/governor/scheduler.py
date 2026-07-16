@@ -91,6 +91,40 @@ class FrontierProposal:
         }
 
 
+@dataclass(frozen=True)
+class Binding:
+    """A resolved task→agent binding (FZ 35e2b3 P2.4) — the scheduler's *binder* output.
+
+    Unlike :class:`ScheduleDecision` (a gate outcome: dispatch|escalate|unmatched of a *first-match*
+    agent), a ``Binding`` is the chosen ``(agent, version)`` for a task selected from the full
+    candidate set by trust-PRIORITY (then availability). It is a pure VALUE — the input a post-bind
+    compile (P4) consumes; the scheduler still never mutates a frozen plan.
+    """
+
+    node: str
+    action: str                                # DISPATCH | ESCALATE | UNMATCHED
+    agent: Optional[str] = None
+    version: Optional[int] = None
+    grade: Optional[TrustGrade] = None
+    bar: Optional[TrustGrade] = None
+    load: Optional[int] = None                 # in-flight/queued count for the chosen agent (P2.3)
+    candidates: Tuple[str, ...] = ()           # all capable agent names considered (P2.1)
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node": self.node,
+            "action": self.action,
+            "agent": self.agent,
+            "version": self.version,
+            "grade": self.grade.name if self.grade is not None else None,
+            "bar": self.bar.name if self.bar is not None else None,
+            "load": self.load,
+            "candidates": list(self.candidates),
+            "reason": self.reason,
+        }
+
+
 class TrustLadderScheduler:
     """The per-decision Trust-Ladder scheduler — the governor router's agent matcher.
 
@@ -108,12 +142,17 @@ class TrustLadderScheduler:
         min_autonomy: TrustGrade = TrustGrade.L1_CANARY,
         escalation_grade: TrustGrade = TrustGrade.L3_AUTONOMOUS,
         require_approval: bool = False,
+        load_fn: Optional[Any] = None,
     ) -> None:
         self._registry = registry
         self._manifests: Dict[str, Any] = dict(manifests or {})
         self._min_autonomy = TrustGrade.parse(min_autonomy)
         self._escalation_grade = TrustGrade.parse(escalation_grade)
         self._require_approval = bool(require_approval)
+        # P2.3: OPTIONAL availability/load signal — ``load_fn(agent_name) -> int`` (in-flight or
+        # queued count). Default ``None`` => no load info, so ranking is pure trust-priority and
+        # behaves deterministically. Read-only; never mutates anything.
+        self._load_fn = load_fn
         # The GOV-side EARNED trust ladder — the ONLY mutable trust store. build/trust stays the
         # create-time seed; this is (re)earned by update_trust and NEVER by the compiler.
         self._earned: Dict[str, TrustGrade] = {}
@@ -252,6 +291,82 @@ class TrustLadderScheduler:
         grade = TrustGrade(nxt)
         self._earned[name] = grade
         return grade
+
+    # -- P2: the BINDER (candidate set × trust-priority × availability) -----
+    def decide_ranked(self, node: str) -> Binding:
+        """Bind ONE task by candidate-set × trust-PRIORITY × availability (P2.1/2.2/2.3).
+
+        Unlike :meth:`decide` (first-match then gate), this pulls the FULL candidate set via
+        ``registry.match_all(node)``, keeps those clearing the bar, ranks them best-trust-first
+        (tie-break: least ``load_fn`` if supplied, then agent name for determinism), and returns a
+        :class:`Binding`. If every candidate is below bar → ``ESCALATE``; if none serve → ``UNMATCHED``.
+        A pure VALUE — reads the read-only registry + earned ladder, mutates nothing.
+        """
+        candidates = self._registry.match_all(node)
+        if not candidates:
+            return Binding(node=node, action=UNMATCHED,
+                           reason=f"no standing agent serves task {node!r}")
+        cand_names = tuple(c.name for c in candidates)
+        bar = self._required_bar_over(candidates)
+        # partition into cleared vs below-bar (each candidate judged against its own side-effecting bar)
+        cleared = []
+        for c in candidates:
+            grade = self.earned_grade(c.name)
+            c_bar = self._required_bar(c.name)
+            if self._require_approval and self._side_effecting(c.name):
+                continue
+            if grade >= c_bar:
+                cleared.append((c, grade, c_bar))
+        if not cleared:
+            return Binding(node=node, action=ESCALATE, bar=bar, candidates=cand_names,
+                           reason=f"all {len(candidates)} capable agents for {node!r} are below bar")
+        # rank: highest trust first; tie-break least load then name (deterministic)
+        def _load(name: str) -> int:
+            if self._load_fn is None:
+                return 0
+            try:
+                return int(self._load_fn(name))
+            except Exception:  # pragma: no cover - a bad load_fn must not break scheduling
+                return 0
+        cleared.sort(key=lambda t: (-int(t[1]), _load(t[0].name), t[0].name))
+        best, grade, c_bar = cleared[0]
+        return Binding(
+            node=node, action=DISPATCH, agent=best.name, version=best.version,
+            grade=grade, bar=c_bar, load=_load(best.name), candidates=cand_names,
+            reason=(f"bound {best.name!r} v{best.version} (trust {grade.name} clears {c_bar.name}); "
+                    f"best of {len(cleared)}/{len(candidates)} cleared candidates"),
+        )
+
+    def _required_bar_over(self, candidates: List[AgentVersion]) -> TrustGrade:
+        """The strictest bar among a candidate set (for reporting on an escalation)."""
+        bar = TrustGrade.L0_SHADOW
+        for c in candidates:
+            b = self._required_bar(c.name)
+            if int(b) > int(bar):
+                bar = b
+        return bar
+
+    def propose_bindings(
+        self,
+        plan: Any,
+        *,
+        completed: Iterable[str],
+        ready: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Binding]:
+        """Bind every ready frontier task → a chosen agent (P2.4) — a VALUE, never a plan mutation.
+
+        The binder analogue of :meth:`propose_frontier`: reads ``plan.order`` (never writes it), skips
+        ``completed`` nodes, and returns ``{node: Binding}`` for the frontier. This is the input a
+        post-bind compile (P4) consumes; the scheduler NEVER calls assemble/recompile and NEVER
+        mutates the frozen plan (INV-3/INV-4). ``UNMATCHED`` bindings are what a Create arrow (P3)
+        turns into an on-demand spawn.
+        """
+        done = set(completed)
+        if ready is not None:
+            frontier = [n for n in ready if n not in done]
+        else:
+            frontier = [n for n in list(getattr(plan, "order", [])) if n not in done]
+        return {node: self.decide_ranked(node) for node in frontier}
 
     # -- internals ----------------------------------------------------------
     @staticmethod

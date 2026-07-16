@@ -119,6 +119,34 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (na * nb)
 
 
+#: Default dimensionality for the built-in hashing embedder (FZ 35e2b3 P5.1).
+_HASH_DIM = 256
+
+
+def make_hashing_embed_fn(dim: int = _HASH_DIM) -> Callable[[str], List[float]]:
+    """A DETERMINISTIC, offline ``embed_fn`` for the dense rung (FZ 35e2b3 P5.1).
+
+    Returns a ``str -> vector`` embedder built on the hashing trick: each token is hashed into one
+    of ``dim`` buckets and counted (an L2-normalizable bag-of-words vector). This is NOT an ML model
+    — it is a stdlib, dependency-free, reproducible embedder that makes the dense rung *usable* so
+    CROSS-DOMAIN / cross-family transfer works offline and is testable (two payloads that share
+    concepts but not exact keys get a non-trivial cosine). A real semantic embedder can be injected
+    instead; this is the zero-dependency default. Kept OFF by default (``PrecedentRetriever`` still
+    defaults ``embed_fn=None``), so wiring it in is an explicit opt-in.
+    """
+    def embed(text: str) -> List[float]:
+        vec = [0.0] * dim
+        for tok in _tokenize(text):
+            # Python's hash() is salted per-process; use a stable content hash for reproducibility.
+            h = 0
+            for ch in tok:
+                h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+            vec[h % dim] += 1.0
+        return vec
+
+    return embed
+
+
 @dataclass
 class RetrievedPrecedent:
     """One retrieved prior run: the matched precedent payload plus retrieval provenance.

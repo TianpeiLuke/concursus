@@ -257,6 +257,7 @@ class GovernorLoop:
         backend: str = "auto",
         run_id: str = "governor",
         checkpoint_every: int = 0,
+        record_frontier: bool = False,
     ) -> None:
         if backend not in ("auto", "python", "langgraph"):
             raise GovernorLoopError(
@@ -337,6 +338,18 @@ class GovernorLoop:
         if int(checkpoint_every) < 0:
             raise GovernorLoopError("checkpoint_every must be >= 0 (0 disables auto-checkpoint)")
         self._checkpoint_every = int(checkpoint_every)
+        # -- OPT-IN scheduler->compiler frontier channel (FZ 35e2b3b A4) -----
+        # False (default) => today's behavior byte-for-byte: recompile is called WITHOUT compile_next,
+        # so ProvisioningPlan.frontier stays empty and to_dict() is unchanged. When True AND a
+        # scheduler is set, the ROUTER's cleared frontier (FrontierProposal.compile_next — the nodes
+        # trust-cleared to dispatch THIS round) is threaded into the NEXT round's ``recompile`` as its
+        # ``compile_next=`` argument, closing the previously-dead scheduler->compiler channel
+        # ([FZ 35e2b1a1] §3, [35e2b3a]). This RECORDS the cleared frontier onto the fresh frozen
+        # plan's read-only ``frontier`` field ONLY — assemble/recompile filter it to topology nodes
+        # and NEVER let it change order/entries/wiring (the monotonic superset is preserved), so it is
+        # a pure provenance annotation, not a plan mutation (INV-2/INV-3/INV-4). Requires a scheduler
+        # to produce a frontier; a no-op when ``scheduler is None``.
+        self._record_frontier = bool(record_frontier)
         # -- READ-ONLY cockpit/scope seam (I-3) -----------------------------
         # The CURRENT run's final frozen plan VALUE, stashed by run() so a caller can build a
         # DirectorCockpit / read the scope projections over the LIVE run WITHOUT re-assembling or
@@ -778,6 +791,10 @@ class GovernorLoop:
             # confines growth to the still-open frontier, so the executed slice replays verbatim.
             prior = state.current_frozen_plan
             completed, content_hashes = self._executed_prefix_from_log()
+            # A4 (opt-in): thread the ROUTER's cleared frontier from the PRIOR round into this
+            # recompile so it is recorded on the fresh plan's read-only ``frontier`` field. None when
+            # record_frontier is off or no scheduler ran => today's behavior byte-for-byte (INV-3/4).
+            compile_next = ctx.get("compile_next") if self._record_frontier else None
             plan = self._assembler.recompile(
                 prior,
                 completed=completed,
@@ -785,6 +802,7 @@ class GovernorLoop:
                 dag=ctx["dag"],
                 manifests=self._manifests,
                 max_revisions=self._max_revisions,
+                compile_next=compile_next,
             )
             state.advance(
                 plan,
@@ -859,6 +877,11 @@ class GovernorLoop:
             held = set(proposal.escalated) | set(proposal.unmatched)
             ctx["proposal"] = proposal
             ctx["held"] = held
+            # A4 (opt-in): stash the cleared frontier so the NEXT round's _planner recompile can
+            # thread it in as ``compile_next=`` (closing the scheduler->compiler channel). Recorded
+            # for the record_frontier path only; a pure VALUE handoff, never a plan mutation (INV-3).
+            if self._record_frontier:
+                ctx["compile_next"] = list(proposal.compile_next)
             # Accumulate the escalated (held) governance surface across rounds, de-duplicated and
             # sorted — the cockpit exception queue reads this off GovernorResult.escalated.
             seen = set(ctx.get("escalated") or [])

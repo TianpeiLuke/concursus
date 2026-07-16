@@ -1550,3 +1550,134 @@ def test_normal_no_progress_not_mislabeled():
     assert result.unmatched == []
     assert result.terminated_by == "no_progress"
     assert result.done is False
+
+
+# -- FZ 35e2b3b A4: wire the router's cleared frontier -> recompile(compile_next=) ----------
+
+class _PartialHeldSupervisor:
+    """A partial-progress supervisor that ALSO accepts the router's ``held=`` kwarg (needed when a
+    scheduler is wired). Completes exactly one new, non-held plan node per round (via COLLECT, like
+    ``_PartialSupervisor``), so a multi-node plan takes multiple rounds and the recompile branch
+    fires with a non-empty ``completed`` set."""
+
+    seen_plans = []
+    run_count = 0
+
+    def __init__(self, *, plan, manifests, store, invoke_fn, arns, session_id, held=None):
+        self._plan = plan
+        self._store = store
+        self._held = set(held or ())
+        type(self).seen_plans.append(plan)
+
+    def run(self, inputs):
+        type(self).run_count += 1
+        already = set(self._store.completed())
+        outputs = {}
+        for node in self._plan.order:  # one NEW non-held node this round, in dispatch order
+            if node in self._held:
+                continue
+            outputs[node] = {"doc": f"{node}-out"}
+            if node not in already:
+                break
+        return outputs
+
+
+def _fresh_partial_held():
+    _PartialHeldSupervisor.seen_plans = []
+    _PartialHeldSupervisor.run_count = 0
+    return _PartialHeldSupervisor
+
+
+def _all_dispatch_scheduler(tmp_path):
+    """A TrustLadderScheduler where BOTH plan nodes clear the bar (→ DISPATCH), so the router's
+    ``compile_next`` is non-empty and the loop makes progress across rounds (unlike the held-forever
+    fixtures). Both agents are non-side-effecting at/above the autonomy bar."""
+    from concursus import DeployLedger, TrustGrade
+    from concursus.governor.registry import AgentRegistry
+    from concursus.governor.scheduler import TrustLadderScheduler
+
+    ledger = DeployLedger(tmp_path / "ledger.json")
+    ledger.record(name="ingest", fingerprint="fp1", arn="arn:ingest", deployed_at="2026-07-01")
+    ledger.record(name="summarize", fingerprint="fp2", arn="arn:summarize", deployed_at="2026-07-01")
+    m_ingest = _sched_manifest("ingest", side_effecting=False)
+    m_sum = _sched_manifest("summarize", side_effecting=False)
+    registry = AgentRegistry(ledger)
+    registry.register_agent(m_ingest)
+    registry.register_agent(m_sum)
+    return TrustLadderScheduler(
+        registry,
+        manifests={"ingest": m_ingest, "summarize": m_sum},
+        min_autonomy=TrustGrade.L1_CANARY,   # both clear it → both DISPATCH → non-empty compile_next
+    )
+
+
+def test_record_frontier_threads_compile_next_into_recompile(tmp_path):
+    """A4: with ``record_frontier=True`` + a scheduler, round-1's ROUTER cleared frontier
+    (``FrontierProposal.compile_next``) is threaded into round-2's ``recompile(compile_next=)`` and
+    RECORDED on the fresh frozen plan's read-only ``frontier`` field — closing the previously-dead
+    scheduler→compiler channel WITHOUT changing order/entries/wiring (INV-3/4)."""
+    fake = _fresh_partial_held()  # one new non-held node per round → forces a 2nd round (a recompile fires)
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=_all_dispatch_scheduler(tmp_path),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=3,
+        backend="python",
+        record_frontier=True,
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    # Both nodes dispatch → the loop progresses one node/round and exhausts the frontier.
+    assert result.terminated_by == "frontier_exhaust"
+    assert result.rounds >= 2
+    history = result.state.plan_history
+
+    # Round-1 (revision 0) recorded NO frontier (no prior router ran before the first assemble).
+    assert history[0].revision == 0
+    assert history[0].frontier == []
+
+    # Round-2's plan (a recompile) RECORDED round-1's cleared frontier on its read-only field —
+    # filtered to topology nodes, a subset of plan.order, and it did NOT change order/entries/wiring.
+    plan1 = history[1]
+    assert plan1.revision == 1
+    assert plan1.frontier, "expected the cleared frontier recorded on the recompiled plan"
+    assert set(plan1.frontier) <= set(plan1.order)
+    # 'ingest' cleared to dispatch in round 1, so it is in round-2's recorded frontier.
+    assert "ingest" in plan1.frontier
+    # INV-3/4: the recorded frontier is advisory only — order/entries/wiring match round-1's plan
+    # for the pinned executed node.
+    assert plan1.entries["ingest"] is history[0].entries["ingest"]
+    assert plan1.wiring["ingest"] == history[0].wiring["ingest"]
+    # And it surfaces in the plan preview only when non-empty.
+    assert plan1.to_dict().get("frontier") == list(plan1.frontier)
+
+
+def test_record_frontier_default_off_leaves_frontier_empty(tmp_path):
+    """Back-compat: the DEFAULT (record_frontier=False) never records a frontier, even with a
+    scheduler + multi-round recompiles — every plan's ``frontier`` stays empty and ``to_dict`` omits
+    it (byte-for-byte unchanged)."""
+    fake = _fresh_partial_held()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=_all_dispatch_scheduler(tmp_path),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=3,
+        backend="python",
+        # record_frontier defaults False
+    )
+    result = loop.run({"uri": "s3://doc"})
+
+    assert result.rounds >= 2
+    for plan in result.state.plan_history:
+        assert plan.frontier == []
+        assert "frontier" not in plan.to_dict()  # emitted only when non-empty

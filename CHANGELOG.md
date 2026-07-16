@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`GovernorLoop(record_frontier=True)` — wire the scheduler→compiler channel onto the live path
+  (opt-in, default off).** Closes the previously-dead `compile_next` channel *in the loop* (the
+  mechanism shipped in 0.4.3; this connects it): when a `TrustLadderScheduler` is set and
+  `record_frontier=True`, the router's cleared frontier (`FrontierProposal.compile_next` — the nodes
+  trust-cleared to dispatch this round) is threaded into the next round's `recompile(compile_next=…)`
+  and recorded on the fresh frozen plan's read-only `ProvisioningPlan.frontier` field. It is a pure
+  provenance annotation: `assemble`/`recompile` filter it to topology nodes and never let it change
+  `order`/`entries`/`wiring` (the monotonic superset is preserved), and `frontier` is emitted in
+  `to_dict()` only when non-empty. Default `record_frontier=False` keeps the loop byte-for-byte
+  unchanged (recompile is called without `compile_next`). +2 tests.
+
 ## [0.4.3] - 2026-07-16
 
 ### Added

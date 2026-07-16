@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`governor.authoring.staff_capability_dag()` — staff a capability DAG into an assemblable
+  manifest set (the decompose→bind→relabel front).** Closes the hard middle that made a decomposed
+  plan un-runnable: a capability `AgentDAG` (from `plan_from_goal(..., decompose=True)`) has
+  agent-agnostic task nodes + edges but no manifests and no `depends_on` wiring, so `assemble` (which
+  requires a manifest per node and derives wiring from `depends_on`) could not freeze it. This
+  synthesizes, per node, a manifest keyed by the node id — bound to a standing agent via `bind_fn`
+  (the scheduler's job) or authored as a skeleton (`author_manifest`, the Create arrow for an
+  UNMATCHED capability) — plus its data-wiring from the DAG edges (one input per upstream producer,
+  fed by `<producer>.result`). The result is `{node: AgentManifest}` ready for
+  `OrchestrationAssembler.assemble(dag, …)`. **This makes the cold-start path work end-to-end** —
+  `decompose → staff → assemble` freezes a real multi-node plan with ZERO hand-authored manifests
+  (the plan's north-star). Pure + offline (INV-2); binds/authors VALUES, never dispatches, never
+  mutates a running plan. `bind_fn=None` (default) authors every node (zero-bench cold start). +4
+  tests. (Wiring it as the governor loop's *default* authoring path — retiring
+  `_reconcile_dag_with_manifests` — is a separate, larger loop change; this is the reusable core it
+  will call.)
+
 - **`make_trust_strictness()` + `strict_fn=` / `acceptance_fn=` — adaptive strictness dial (opt-in,
   default off).** The capstone of the Phase-6 compiler contract: turns the three global contract
   gates (B1 single-writer, B2 type-align, B3 output-QA) into a *per-agent* dial keyed on the Trust

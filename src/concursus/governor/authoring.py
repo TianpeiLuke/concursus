@@ -18,10 +18,13 @@ the skeleton with a synthesized prompt / SOPs / tools. This module imports no bo
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional
 
 from concursus.build.trust import TrustGrade
 from concursus.core.manifest import AgentManifest
+
+if TYPE_CHECKING:  # pragma: no cover - hints only
+    from concursus.core.dag import AgentDAG
 
 #: The injected manifest-author seam: ``(task, context) -> AgentManifest | dict``. Where an LLM
 #: would synthesize a role's prompt/SOPs/tools/schema. NEVER imported or constructed here.
@@ -133,4 +136,86 @@ def author_manifest(
     return manifest
 
 
-__all__ = ["ManifestAuthorFn", "ManifestAuthorError", "author_manifest"]
+#: The output field every staffed capability manifest emits (the skeleton's single output).
+_CAP_OUTPUT = "result"
+
+
+def staff_capability_dag(
+    dag: "AgentDAG",
+    *,
+    bind_fn: "Optional[Callable[[str], Optional[str]]]" = None,
+    manifest_author_fn: Optional[ManifestAuthorFn] = None,
+    trust_seed: TrustGrade = TrustGrade.L0_SHADOW,
+) -> Dict[str, AgentManifest]:
+    """Turn an agent-agnostic CAPABILITY ``AgentDAG`` into an assemblable manifest set (FZ 35e2b3b
+    A1–A3): the STAFFING step at the compiler front that un-collapses *binding* from *authoring*.
+
+    A capability DAG (from ``plan_from_goal(..., decompose=True)``) has agent-agnostic task nodes and
+    edges but NO manifests and NO ``depends_on`` wiring, so it cannot be assembled directly
+    (``assemble`` requires a manifest per node + derives wiring from ``depends_on``). This synthesizes,
+    for each node:
+
+    - a MANIFEST keyed by the node id — via ``bind_fn(node)`` if it returns a standing agent name to
+      bind (the SCHEDULER's job, A2/A3), else an authored skeleton (:func:`author_manifest`, the
+      CREATE arrow for an UNMATCHED capability). Either way the manifest is keyed by the node id so
+      the frozen ``plan.order`` stays the capability topology (the auditable artifact, [35e2b1a1a1a]).
+    - its DATA-WIRING from the DAG edges: one input per upstream producer (named after the producer
+      node) fed by ``<producer>.result``, plus the matching ``depends_on`` edge — so the staffed set
+      type-aligns and ``assemble`` freezes it exactly like a hand-authored one.
+
+    The result is a ``{node: AgentManifest}`` map ready for ``OrchestrationAssembler.assemble(dag,
+    …)``. Pure + offline (INV-2): binds/authors VALUES, never dispatches, never mutates a running
+    plan. ``bind_fn`` default ``None`` authors every node (the zero-bench cold-start path); a real
+    binder (e.g. wrapping ``scheduler.decide_ranked``) returns an agent name to reuse a standing one.
+
+    Note: this produces the assemblable ARTIFACT; wiring it as the governor loop's default authoring
+    path (retiring ``_reconcile_dag_with_manifests``) is a separate, larger loop change — this
+    function is the reusable core that change would call.
+    """
+    manifests: Dict[str, AgentManifest] = {}
+    for node in dag.nodes:
+        # One input per upstream producer, each receiving that producer's `result` output.
+        producers = list(dag.get_dependencies(node))
+        inputs = {p: {"type": "string"} for p in producers}
+        bound = bind_fn(node) if bind_fn is not None else None
+        if bound:
+            # Bind to a standing agent, but KEY the manifest by the node id + carry the synthesized
+            # wiring so the capability topology + edges survive into assemble. The bound agent name is
+            # recorded in the registry stub for provenance.
+            data = {
+                "name": node,
+                "registry": {
+                    "container_uri": f"<bound>/{_slug(bound)}:latest",
+                    "protocol": "HTTP",
+                    "entry": f"agents.{_slug(bound)}:run",
+                    "capabilities": [node],
+                    "bound_agent": bound,
+                },
+                "contract": {
+                    "inputs": inputs,
+                    "outputs": {_CAP_OUTPUT: {"type": "string", "required": True}},
+                },
+                "spec": {"depends_on": [{"from": f"{p}.{_CAP_OUTPUT}", "to": p} for p in producers]},
+                "trust_seed": trust_seed,
+                "side_effecting": False,
+            }
+            manifests[node] = AgentManifest.from_dict(data).validate()
+        else:
+            # UNMATCHED capability -> author a skeleton, then graft the wiring + pin the name to the
+            # node id. author_manifest slugs the name (collapsing "__"), but assemble REQUIRES
+            # manifest.name == node id, so force it back to the exact capability node id.
+            m = author_manifest(
+                node, inputs=inputs, manifest_author_fn=manifest_author_fn, trust_seed=trust_seed
+            )
+            m.name = node
+            m.spec["depends_on"] = [{"from": f"{p}.{_CAP_OUTPUT}", "to": p} for p in producers]
+            manifests[node] = m.validate()
+    return manifests
+
+
+__all__ = [
+    "ManifestAuthorFn",
+    "ManifestAuthorError",
+    "author_manifest",
+    "staff_capability_dag",
+]

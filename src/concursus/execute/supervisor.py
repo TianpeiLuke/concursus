@@ -104,6 +104,25 @@ def _acceptance_violation(value: Any, rules: Dict[str, Any]) -> Any:
     return None
 
 
+def check_hive_contract(obj: Any) -> None:
+    """The agent↔Hive-layer boundary gate (FZ 35e2b3b B2-remainder): an output must conform to what
+    the OS layer routes, stores, and content-addresses — i.e. be a JSON-SERIALIZABLE object.
+
+    ``validate_output`` checks dict-ness + required keys, but a dict carrying a non-JSON value (a
+    ``set``, a bespoke object, ...) passes it and then CRASHES the append-only log write at
+    :func:`~concursus.state.statestore.content_hash` (``json.dumps``). This turns that late, opaque
+    crash into an early, legible :class:`SchemaError` at dispatch, so it rides the same retry/record
+    path (a present-but-unstorable output does not complete and earns no trust). Raises on violation.
+    """
+    try:
+        json.dumps(obj, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise SchemaError(
+            f"agent output violates the Hive-layer contract — not JSON-serializable "
+            f"(the OS log/dedup cannot store it): {exc}"
+        ) from exc
+
+
 def check_acceptance(obj: Any, schema: Dict[str, Any]) -> None:
     """Post-run QA gate: every declared per-field ``acceptance`` rule must hold (FZ 35e2b3b B3).
 
@@ -395,6 +414,10 @@ class Supervisor:
                 if self._check_acceptance and (
                     self._acceptance_fn is None or self._acceptance_fn(node)
                 ):
+                    # B2-remainder: the agent<->Hive-layer boundary (output must be storable by the
+                    # OS log) is checked first — a legible dispatch-time error instead of a late,
+                    # opaque content_hash crash at log-write.
+                    check_hive_contract(result)
                     check_acceptance(result, manifest.output_schema if manifest else {})
             except Exception as exc:
                 if self._on_error != "record":

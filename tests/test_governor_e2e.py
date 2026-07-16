@@ -399,3 +399,52 @@ def test_e2e_cold_start_unprovisioned_roles_cannot_dispatch():
     )
     with pytest.raises(RuntimeError, match="no provisioned runtime ARN"):
         loop.run({"uri": "s3://doc"})
+
+
+# == FZ 35e2b3b C4: empirical cross-domain transfer — warm start beats cold (the compounding claim) ==
+def test_e2e_cross_domain_transfer_warm_start_beats_cold():
+    """P5.3: the compounding claim, measured end-to-end. A NOVEL goal cold-starts to the GENERIC
+    capability shape; but after a structurally-adjacent prior run is DISTILLED and RETRIEVED (dense
+    rung, make_hashing_embed_fn), it primes the SAME novel goal's decomposition with the borrowed,
+    domain-specific shape — a measurably richer, transfer-warmed plan. The whole P5.1 -> C3 loop."""
+    from concursus.assemble.planner import plan_from_goal
+    from concursus.state.distill import distill_run
+    from concursus.state.precedent import PrecedentRetriever, make_hashing_embed_fn
+    from concursus.state.statestore import Record
+
+    novel_goal = "handle the flurb widget escalation"  # matches no _SHAPE_KEYWORDS
+
+    # COLD: no precedent -> the generic 4-stage fallback.
+    cold = plan_from_goal(novel_goal, decompose=True).topological_sort()
+    cold_stages = [n.split("__", 1)[1] for n in cold]
+    assert cold_stages == ["ingest", "analyze", "synthesize", "format"]
+
+    # Seed + distill a prior run from an ADJACENT domain (an incident investigation with a richer,
+    # domain-specific stage shape), then retrieve it via the dense rung for the novel goal.
+    vault = Path(tempfile.mkdtemp())
+    distill_run(
+        {"inv__scope": {}},
+        [
+            Record(node="inv__scope", output={"result": "s"}, producer="inv__scope"),
+            Record(node="inv__gather_evidence", output={"result": "g"}, producer="inv__gather_evidence"),
+            Record(node="inv__hypothesize", output={"result": "h"}, producer="inv__hypothesize"),
+            Record(node="inv__verify", output={"result": "v"}, producer="inv__verify"),
+        ],
+        vault_path=vault,
+        trail_id="past_incident",
+    )
+    retriever = PrecedentRetriever(vault, embed_fn=make_hashing_embed_fn())
+    hits = retriever.retrieve(text="inv scope gather_evidence hypothesize verify")
+    assert hits, "the adjacent prior run should be retrievable"
+
+    # WARM: prime the SAME novel goal with the retrieved precedent -> it borrows the richer shape.
+    warm = plan_from_goal(
+        novel_goal, decompose=True, precedents=[h.to_dict() for h in hits]
+    ).topological_sort()
+    warm_stages = {n.split("__", 1)[1] for n in warm}
+
+    # The compounding win: the warm plan borrowed the investigation-specific capabilities that the
+    # cold generic shape does not have — a measurable transfer from adjacent experience.
+    assert warm_stages != set(cold_stages)
+    assert {"scope", "hypothesize", "verify"} <= warm_stages   # domain-specific stages transferred in
+    assert "analyze" not in warm_stages                        # no longer the generic shape

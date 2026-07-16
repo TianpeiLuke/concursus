@@ -19,6 +19,7 @@ from concursus.execute.supervisor import (
     SchemaError,
     Supervisor,
     check_acceptance,
+    check_hive_contract,
     validate_output,
 )
 
@@ -790,3 +791,44 @@ def test_supervisor_acceptance_miss_records_not_raises_under_on_error_record():
     out = sup.run({})  # must NOT raise
     assert "summarize" not in store.completed()  # QA miss => not admitted, not trusted
     assert out == {}
+
+
+# -- FZ 35e2b3b B2-remainder: agent<->Hive-layer boundary (JSON-storable output) ------------
+def test_check_hive_contract_rejects_non_json_output():
+    """A dict carrying a non-JSON value passes validate_output but violates the Hive-layer contract
+    (the OS log/content_hash cannot store it) — check_hive_contract catches it."""
+    from concursus.state.statestore import content_hash
+
+    bad = {"result": {"a", "b"}}  # a set inside -> not JSON-serializable
+    validate_output(bad, {"result": {"type": "object", "required": True}})  # shape gate: passes
+    # But the OS log write (content_hash) would crash on it...
+    with pytest.raises(TypeError):
+        content_hash(bad)
+    # ...so the boundary gate turns that late crash into a legible dispatch-time SchemaError.
+    with pytest.raises(SchemaError, match="Hive-layer contract"):
+        check_hive_contract(bad)
+    # A plain JSON-serializable output passes.
+    check_hive_contract({"result": "ok", "n": 3, "items": [1, 2]})
+
+
+def test_supervisor_hive_contract_gate_rejects_unstorable_output():
+    """check_acceptance=True also enforces the Hive-layer boundary: a present, shape-valid but
+    UNSTORABLE output fails at dispatch (legible) rather than crashing the log write later."""
+    dag = AgentDAG()
+    dag.add_node("emit")
+    manifests = {
+        "emit": AgentManifest.from_dict({
+            "name": "emit",
+            "registry": {"container_uri": "x", "protocol": "HTTP"},
+            "contract": {"inputs": {}, "outputs": {"result": {"type": "object", "required": True}}},
+        }),
+    }
+
+    class _BadInvoke:
+        def __call__(self, arn, qualifier, session_id, payload_bytes):
+            return {"result": {1, 2, 3}}  # a set -> not JSON-serializable
+
+    sup = Supervisor(_plan(dag, manifests), manifests, invoke_fn=_BadInvoke(),
+                     arns={"emit": "arn:emit"}, check_acceptance=True)
+    with pytest.raises(SchemaError, match="Hive-layer contract"):
+        sup.run({})

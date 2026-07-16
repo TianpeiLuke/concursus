@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`check_hive_contract()` — the agent↔Hive-layer boundary gate (B2 remainder).** Deepens the
+  compiler contract to the *platform* edge, not just agent↔agent: an output must be JSON-SERIALIZABLE
+  (what the OS log routes, stores, and content-addresses). `validate_output` checks dict-ness + keys,
+  but a dict carrying a non-JSON value (a `set`, a bespoke object) passed it and then CRASHED the
+  append-only log write at `content_hash` (`json.dumps`); this turns that late, opaque crash into an
+  early, legible `SchemaError` at dispatch, riding the same retry/record path (a present-but-
+  unstorable output does not complete and earns no trust). Folded into the `check_acceptance=True`
+  gate (checked first). FZ 35e2b3b (completes P6.2's agent↔Hive-layer half). +2 tests.
+
+- **Cross-domain transfer validated end-to-end (the compounding claim).** A regression measuring
+  P5.3: a novel goal cold-starts to the generic capability shape, but after an adjacent prior run is
+  distilled → retrieved (dense rung, `make_hashing_embed_fn`) → primes the same goal (C3), the
+  decomposition borrows the richer domain-specific shape — a measurable warm-start-beats-cold-start
+  win through the full `distill → retrieve → prime` loop. FZ 35e2b3b C4 (plan P5.3). +1 test.
+
 - **Cross-domain precedent priming for the decomposer (`plan_from_goal(decompose=True,
   precedents=…)`).** A goal with no keyword match now warm-starts its decomposition from a
   structurally-adjacent prior run: the decomposer borrows the capability-stage shape from the

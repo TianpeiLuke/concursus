@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-07-16
+
+The post-run note-capture front + the compile-time payload contract (FZ 35e4a3a1b); full
+suite green (509 passed, 3 skipped). All opt-in; the default forward pass is byte-for-byte unchanged.
+
+### Added
+
+- **Post-run note-capture front (`state/capture.py`) — persist a run's plan + payloads as slipbox
+  notes into concursus's OWN memory store.** A thin, source-agnostic dispatcher: `capture_run(run_dir,
+  plan=…, payloads=…, trust_tiers=…)` maps a frozen `CaptureEnvelope` (`adapt_plan` / `adapt_payload`)
+  onto the already-shipped `filevault` writers, writing `_plan.md` + per-node `<node>__payload.md`
+  notes under `run_dir` (concursus's run memory — NOT a curated knowledge vault). It is pure post-run
+  and INV-safe: it writes *notes*, never run records (a payload note is stamped `concursus_note_kind:
+  payload` so replay refuses it via `_note_to_record`); `redact()` masks PII (default deny-keys
+  `pii`/`secret`/`credentials`/`customer_id`/`case_data`/`raw_input`) before writing;
+  `add_reciprocal_backlinks` projects a `## Consumed By` section onto producer notes over the
+  already-recorded `consumes` edges (closing the forward-only-link gap); and `gate_run_dir` re-reads
+  the run dir to flag a missing frontmatter block or a dangling same-dir link. `load_payload_tiers`
+  reads persisted tiers back into `{node: tier}` (a FUTURE warm-load/retrieval hook). When `payloads`
+  is omitted, `capture_run` derives them from the frozen `ProvisioningPlan.payload_contract`. All
+  opt-in, default byte-for-byte unchanged. FZ 35e4a3a1b (Phases 0/1/3). +12 tests (`test_capture.py`).
+
+- **Compile-time payload contract + trust-tiered context (`ProvisioningPlan.payload_contract`).** The
+  compiler can author, per node, a `{trust_tier, static_context}` entry when an opt-in
+  `OrchestrationAssembler(payload_tier_fn=…)` is wired — emit-when-non-empty (`to_dict` unchanged when
+  absent, so the default plan is byte-for-byte identical). `make_payload_tier(scheduler)` maps earned
+  trust to a `Tier` (`L3→HIGH` lean · `L2→GUARDED` guardrails-only · `L0/L1/unknown→LOW` fully-coached ·
+  programmatic-orthogonal `→PROGRAMMATIC`); `project_context` is the pure monotone lattice
+  (`LOW`=all context, `GUARDED`={guardrails}, `HIGH`={}, `PROGRAMMATIC`={tool_calls});
+  `manifest_is_programmatic` reads `registry.programmatic`. The `Supervisor` overlays a node's frozen
+  `static_context` *under* the caller inputs (external inputs always win), preferring the frozen
+  contract else an injected live `payload_tier_fn`. `recompile` re-tiers freshly but PINS an
+  already-executed node's contract (INV-3/4 safe). `AgentManifest.context` exposes `contract.context`;
+  `check_alignment(full_input_cover=True)` adds an opt-in gate that every declared input has a supplier
+  (a `depends_on` edge or a context key). All opt-in, default off. FZ 35e4a3a1b (Phases 0/2). +7 tests
+  (`test_payload_contract.py`) + tier tests in `test_governor_scheduler.py`.
+
 ## [0.4.4] - 2026-07-16
 
 ### Added

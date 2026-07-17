@@ -49,8 +49,12 @@ from concursus.governor.scheduler import (
     FrontierProposal,
     ScheduleDecision,
     SchedulerError,
+    Tier,
     TrustLadderScheduler,
+    make_payload_tier,
     make_trust_strictness,
+    manifest_is_programmatic,
+    project_context,
 )
 from concursus.governor.scope import (
     SCOPE_LEVELS,
@@ -79,6 +83,10 @@ __all__ = [
     "RegistryError",
     "TrustLadderScheduler",
     "make_trust_strictness",
+    "make_payload_tier",
+    "manifest_is_programmatic",
+    "project_context",
+    "Tier",
     "ScheduleDecision",
     "FrontierProposal",
     "SchedulerError",

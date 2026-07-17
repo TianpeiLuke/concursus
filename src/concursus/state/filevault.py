@@ -30,7 +30,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 from .statestore import (
     Record,
@@ -70,6 +70,12 @@ _SLIPBOX_STATUS = {"validated": "active", "failed": "draft", "superseded": "supe
 _PLAN_NOTE_NAME = "_plan.md"
 _PLAN_NOTE_MARKER = "concursus_note_kind"
 _PLAN_NOTE_KIND = "run_plan"
+
+# The durable per-agent PAYLOAD-contract note (FZ 35e4a3a1b Phase 1 T3): the frozen invoke payload
+# a node was dispatched with (the b2 contract — wired inputs + tiered static context + tool_calls +
+# trust_tier). Like the plan snapshot it is NOT a run record — stamped ``concursus_note_kind:
+# payload`` so :func:`_note_to_record` REFUSES it (same guard) and the record loaders skip it.
+_PAYLOAD_NOTE_KIND = "payload"
 
 # Machine-finding keys a renderer surfaces IF THEY HAPPEN to be present in an agent's output dict.
 # Purely reflective: the renderer copies whatever the agent emitted — it NEVER derives, judges, or
@@ -622,6 +628,179 @@ def capture_run_output_note(
         date=date,
         related=related,
     )
+
+
+def redact(payload: Mapping[str, Any], *, deny: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Return a shallow-redacted copy of a payload for durable capture (FZ 35e4a3a1b T3, PII gate).
+
+    A payload can carry sensitive run inputs (case data). Before a payload is written to a durable
+    note, drop any top-level key in ``deny`` (default :data:`_DEFAULT_REDACT_KEYS`) and mask its
+    presence with a ``"<redacted>"`` sentinel so the note records THAT an input existed without its
+    value. Deterministic + pure (no I/O). Nested redaction is intentionally out of scope for the
+    spike — a caller with structured PII passes an explicit ``deny`` list. This is the prerequisite
+    the counter + FZ 35e5a flagged for persisting payloads.
+    """
+    denied = set(deny if deny is not None else _DEFAULT_REDACT_KEYS)
+    out: Dict[str, Any] = {}
+    for key, value in dict(payload).items():
+        out[key] = "<redacted>" if key in denied else value
+    return out
+
+
+#: Default top-level payload keys masked by :func:`redact` (common PII / secret carriers).
+_DEFAULT_REDACT_KEYS = ("pii", "secret", "credentials", "customer_id", "case_data", "raw_input")
+
+
+def capture_payload_note(
+    node: str,
+    payload: Mapping[str, Any],
+    run_dir,
+    *,
+    trust_tier: str = "",
+    trail_id: str = "run",
+    date: str = "",
+    related: Optional[List[str]] = None,
+    redact_keys: Optional[List[str]] = None,
+    slipbox_form: bool = True,
+) -> str:
+    """**FZ 35e4a3a1b T3.** Persist a node's frozen invoke PAYLOAD as a durable audit note; return
+    its path (``<run_dir>/<node>__payload.md``).
+
+    Renders the b2 payload contract — the (redacted) invoke payload the node was dispatched with
+    plus the ``trust_tier`` the compiler selected — as a slipbox note. Like the plan snapshot it is
+    NOT a run record: it is stamped ``concursus_note_kind: payload`` so :func:`_note_to_record`
+    REFUSES to parse it (the record loaders skip it) — it can never leak into a resume/replay. PII
+    is masked via :func:`redact` BEFORE the note is written. Pure post-run write; mutates nothing.
+    """
+    safe = redact(payload, deny=redact_keys)
+    lines: List[str] = []
+    if slipbox_form:
+        fm = {
+            "tags": ["resource", "concursus", "run_state", "payload"],
+            "keywords": ["concursus payload", "invoke payload contract", "trust tier"],
+            "topics": _SLIPBOX_TOPICS,
+            "language": "markdown",
+            "date of note": date,
+            "status": "active",
+            "building_block": "empirical_observation",  # an audit record of what was asked
+            "folgezettel": "1",
+            "lineage": [f"{trail_id}:1"],
+            _PLAN_NOTE_MARKER: _PAYLOAD_NOTE_KIND,  # non-record stamp: never parsed as a Record
+            "access_control_group": ["general"],
+        }
+        lines.append("---")
+        for key, value in fm.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                lines.extend(f"  - {json.dumps(v)}" for v in value)
+            else:
+                lines.append(f"{key}: {json.dumps(value)}")
+        lines.append("---")
+        lines.append("")
+    else:
+        lines += ["---", f"{_PLAN_NOTE_MARKER}: {json.dumps(_PAYLOAD_NOTE_KIND)}", "---", ""]
+
+    lines.append(f"# Invoke Payload: {node}")
+    lines.append("")
+    tier_note = f" (trust tier: `{trust_tier}`)" if trust_tier else ""
+    lines.append(
+        f"The frozen invoke payload `{node}` was dispatched with{tier_note} — a redacted audit "
+        "snapshot of the b2 payload contract (wired inputs + tiered static context + tool_calls). "
+        "This is a read-only projection: it drove no dispatch and mutates nothing."
+    )
+    lines.append("")
+    if trust_tier:
+        lines.append(f"## Trust Tier")
+        lines.append("")
+        lines.append(f"- `{trust_tier}`")
+        lines.append("")
+    lines.append("## Payload (redacted)")
+    lines.append("")
+    lines.append("```json")
+    lines.append(json.dumps(safe, indent=2, sort_keys=True, default=str))
+    lines.append("```")
+    lines.append("")
+    if related:
+        lines.append("## Related Notes")
+        lines.append("")
+        lines.extend(f"- {link}" for link in related)
+        lines.append("")
+
+    path = Path(run_dir) / f"{_slug(node)}__payload.md"
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    FileVaultStateStore._atomic_write(path, "\n".join(lines))
+    return str(path)
+
+
+#: The heading a reciprocal-backlink post-pass appends under each producer note (FZ 35e4a3a1b T6).
+_CONSUMED_BY_HEADING = "## Consumed By"
+
+
+def add_reciprocal_backlinks(run_dir) -> int:
+    """**FZ 35e4a3a1b T6.** Add reciprocal "consumed by" backlinks over a finished run's notes.
+
+    ``filevault``'s ``_related_for`` links a note FORWARD to each producer it ``consumes`` — but a
+    producer note is a dead-end w.r.t. WHO consumed it. This post-pass closes that gap: it reads
+    every record note under ``run_dir``, derives the producer→consumers relation from the recorded
+    ``consumes`` edges (already on disk — a projection, not new data), and appends a ``## Consumed
+    By`` section to each producer's note listing links to its downstream consumers. Returns the
+    number of producer notes amended. Idempotent — a re-run replaces the section rather than
+    duplicating it. Pure post-run write over ``run_dir``; mutates no live plan, writes no Record
+    (the amended notes stay their same round-trip-exact records — the added section is display-only,
+    ignored by ``_note_to_record`` which reads only the ``meta``/``payload`` blobs).
+    """
+    run = Path(run_dir)
+    if not run.exists():
+        return 0
+    # Reconstruct records from disk (skip navigation / stamped non-record notes).
+    records: List[Record] = []
+    for note in sorted(run.glob("*.md")):
+        if note.name == "_run.md":
+            continue
+        try:
+            records.append(_note_to_record(note.read_text(encoding="utf-8")))
+        except (ValueError, json.JSONDecodeError, OSError):
+            continue  # a stamped non-record (plan/payload) or malformed file — skip
+    if not records:
+        return 0
+    _, latest_validated, attempts = _index_records(records)
+
+    # Build producer -> [consumer, ...] from the consumes edges.
+    consumers_of: Dict[str, List[str]] = {}
+    for r in records:
+        for edge in r.consumes:
+            producer = edge.partition(":")[0]
+            consumers_of.setdefault(producer, [])
+            if r.node not in consumers_of[producer]:
+                consumers_of[producer].append(r.node)
+
+    amended = 0
+    for producer, consumers in consumers_of.items():
+        attempt = attempts.get(producer)
+        if attempt is None:
+            continue  # producer never validated on disk — nothing to amend
+        pnote = run / f"{_slug(producer)}__a{attempt}.md"
+        if not pnote.exists():
+            continue
+        links = []
+        for consumer in sorted(consumers):
+            c_attempt = attempts.get(consumer)
+            if c_attempt is None:
+                continue
+            links.append(f"- [consumed by {consumer}]({_slug(consumer)}__a{c_attempt}.md)")
+        if not links:
+            continue
+        text = pnote.read_text(encoding="utf-8")
+        section = _CONSUMED_BY_HEADING + "\n\n" + "\n".join(links) + "\n"
+        # Idempotent: replace an existing ## Consumed By section rather than duplicating it.
+        idx = text.find(_CONSUMED_BY_HEADING)
+        if idx != -1:
+            new_text = text[:idx].rstrip() + "\n\n" + section
+        else:
+            new_text = text.rstrip() + "\n\n" + section
+        FileVaultStateStore._atomic_write(pnote, new_text)
+        amended += 1
+    return amended
 
 
 class FileVaultStateStore:

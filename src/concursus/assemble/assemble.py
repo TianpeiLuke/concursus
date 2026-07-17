@@ -11,7 +11,7 @@ resulting :class:`ProvisioningPlan` is a pure, JSON-serializable preview (a ``co
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Set
 
 from ..core import resolve
 from ..build.build import BuildPlanEntry, RuntimeBuilderFactory
@@ -74,6 +74,14 @@ class ProvisioningPlan:
     #: cleared, closing the previously-dead ``compile_next`` channel. Empty by default -> ``to_dict``
     #: byte-for-byte unchanged.
     frontier: List[str] = field(default_factory=list)
+    #: The per-node frozen PAYLOAD contract (FZ 35e4a3a1b F1) — ``{node: {static_context,
+    #: trust_tier}}``, authored by ``assemble`` when a ``payload_tier_fn`` is wired (opt-in). This
+    #: is *dimension 2/3* of the payload contract (the tiered coaching context + trust tier); it
+    #: NEVER changes ``order`` / ``entries`` / ``wiring`` (the topology is identical with or without
+    #: it — a pure additive annotation on the frozen plan). Empty by default -> ``to_dict`` /
+    #: ``to_summary_dict`` byte-for-byte unchanged. The Supervisor may read it (F3) to build the
+    #: invoke payload; the capture session persists it (Phase 3 I1).
+    payload_contract: Dict[str, dict] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """Render the plan as a JSON-serializable dict (for a ``concursus plan`` preview).
@@ -95,6 +103,8 @@ class ProvisioningPlan:
             out["revision"] = self.revision
         if self.frontier:
             out["frontier"] = list(self.frontier)
+        if self.payload_contract:
+            out["payload_contract"] = {n: dict(c) for n, c in self.payload_contract.items()}
         return out
 
     def to_summary_dict(self) -> dict:
@@ -109,7 +119,7 @@ class ProvisioningPlan:
         edges) is preserved verbatim so a note can render the DAG. This is a read-only projection
         of the *frozen* plan — it influences no dispatch and mutates nothing.
         """
-        return {
+        out = {
             "order": list(self.order),
             "wiring": {
                 node: [
@@ -131,6 +141,9 @@ class ProvisioningPlan:
                 for name, entry in self.entries.items()
             },
         }
+        if self.payload_contract:
+            out["payload_contract"] = {n: dict(c) for n, c in self.payload_contract.items()}
+        return out
 
 
 class OrchestrationAssembler:
@@ -151,6 +164,8 @@ class OrchestrationAssembler:
         strict_types: bool = False,
         single_writer: bool = False,
         strict_fn: Optional[Callable[[str], bool]] = None,
+        payload_tier_fn: Optional[Callable[[str], Any]] = None,
+        full_input_cover: bool = False,
     ) -> None:
         self.account = account
         self.region = region
@@ -178,6 +193,20 @@ class OrchestrationAssembler:
         #: :func:`~concursus.governor.make_trust_strictness` so WEAK/low-trust agents get the strict
         #: contract and STRONG/high-trust ones get the lean path. Author/compile-time only (INV-2).
         self.strict_fn = strict_fn
+        #: OPT-IN payload-tier authoring dial (FZ 35e4a3a1b F1/F4). ``None`` (default) => no
+        #: ``payload_contract`` is authored and the plan is byte-for-byte unchanged. When set, a
+        #: ``node -> Tier`` selector (wire :func:`~concursus.governor.make_payload_tier`);
+        #: ``assemble`` authors, per node with a declared ``contract.context``, the tiered static
+        #: context (via :func:`~concursus.governor.project_context`) + the ``trust_tier`` into the
+        #: frozen ``ProvisioningPlan.payload_contract``. Author/compile-time only; it NEVER changes
+        #: ``order`` / ``entries`` / ``wiring`` (a pure additive annotation, INV-2/3 preserved).
+        self.payload_tier_fn = payload_tier_fn
+        #: OPT-IN full-input-cover gate (FZ 35e4a3a1b F2). Default ``False`` keeps ``check_alignment``
+        #: at its name+edge gate (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile``
+        #: ALSO require every declared consumer input to have a compile-visible supplier (a
+        #: ``depends_on`` edge or a static ``contract.context`` key) — the b2 dimension-1
+        #: completeness quantifier. Compile-time only (INV-2).
+        self.full_input_cover = bool(full_input_cover)
 
     def assemble(
         self, dag: "AgentDAG", manifests: Dict[str, "AgentManifest"]
@@ -197,6 +226,7 @@ class OrchestrationAssembler:
         resolve.check_alignment(
             dag, manifests, strict_types=self.strict_types,
             single_writer=self.single_writer, strict_fn=self.strict_fn,
+            full_input_cover=self.full_input_cover,
         )
         wiring = resolve.resolve_edges(dag, manifests)
 
@@ -223,9 +253,44 @@ class OrchestrationAssembler:
                 for p in self.precedent_retriever.retrieve(nodes=order)
             ]
 
+        # F1/F4: author the per-node payload contract when a tier dial is wired. For each node with
+        # a declared ``contract.context``, record the TIERED static context (projected per the
+        # node's trust tier) + the tier name. Default (no tier_fn) => empty => byte-for-byte
+        # unchanged. Pure/additive: it reads manifests + the tier fn, never touches order/wiring.
+        payload_contract = self._author_payload_contract(order, manifests)
+
         return ProvisioningPlan(
-            order=order, entries=entries, wiring=wiring, precedents=precedents
+            order=order, entries=entries, wiring=wiring, precedents=precedents,
+            payload_contract=payload_contract,
         )
+
+    def _author_payload_contract(
+        self, order: List[str], manifests: Dict[str, "AgentManifest"]
+    ) -> Dict[str, dict]:
+        """Author the per-node payload contract (F1/F4). Empty when no ``payload_tier_fn`` is wired.
+
+        For each node whose manifest declares a non-empty ``contract.context``, project that context
+        down to the node's trust tier and record ``{node: {trust_tier, static_context}}``. Pure +
+        compile-time; wired via :func:`~concursus.governor.make_payload_tier`. A node with no
+        declared context contributes nothing (so a plan of un-annotated agents stays empty)."""
+        if self.payload_tier_fn is None:
+            return {}
+        from concursus.governor.scheduler import project_context
+
+        contract: Dict[str, dict] = {}
+        for node in order:
+            manifest = manifests.get(node)
+            context = getattr(manifest, "context", None) if manifest is not None else None
+            if not context:
+                continue
+            try:
+                tier = self.payload_tier_fn(node)
+                projected = project_context(context, tier)
+            except Exception:  # noqa: BLE001 - a bad dial must not break a compile
+                continue
+            tier_name = getattr(tier, "name", str(tier))
+            contract[node] = {"trust_tier": tier_name, "static_context": projected}
+        return contract
 
     # -- AI-20: bounded, monotonic re-compile -------------------------------
     def recompile(
@@ -312,6 +377,15 @@ class OrchestrationAssembler:
             order_set = set(fresh.order)
             frontier = [n for n in compile_next if n in order_set]
 
+        # F5 re-tiering: the fresh compile re-authored payload_contract by re-reading the live tier
+        # dial (a promotion thins / a demotion thickens the not-yet-run nodes). But an already-EXECUTED
+        # node keeps the tier it actually ran with — pin its prior contract so the frozen executed
+        # slice is unchanged (INV-3). Not-yet-executed nodes carry the freshly re-tiered contract.
+        payload_contract: Dict[str, dict] = dict(fresh.payload_contract)
+        for node in completed_set:
+            if node in prior_plan.payload_contract:
+                payload_contract[node] = prior_plan.payload_contract[node]
+
         return ProvisioningPlan(
             order=fresh.order,
             entries=entries,
@@ -319,6 +393,7 @@ class OrchestrationAssembler:
             precedents=fresh.precedents,
             revision=revision,
             frontier=frontier,
+            payload_contract=payload_contract,
         )
 
     @staticmethod

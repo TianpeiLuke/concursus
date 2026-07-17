@@ -26,6 +26,7 @@ IDENTITY INVARIANTS (non-negotiable):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from concursus.build.trust import GateDecision, TrustGrade, evaluate_deploy_gate
@@ -420,3 +421,104 @@ def make_trust_strictness(
         return int(grade) < int(bar)
 
     return is_strict
+
+
+# -- FZ 35e4a3a1b SPIKE B: the trust-tiered PAYLOAD dial (make_payload_tier) -----------------
+class Tier(Enum):
+    """The payload-detail tier for a node (FZ 35e2b1a1b2a1). Payload detail ∝ 1/trust:
+
+    * ``HIGH`` — lean: goal + precise I/O + acceptance only (a proven agent chooses its method).
+    * ``GUARDED`` — I/O + guardrails only (no full SOP/examples).
+    * ``LOW`` — full context: SOP + tools + guardrails + examples (a weak/unproven agent coached).
+    * ``PROGRAMMATIC`` — a fixed tool-call interface (orthogonal to trust; matched, not coached).
+    """
+
+    HIGH = "high"
+    GUARDED = "guarded"
+    LOW = "low"
+    PROGRAMMATIC = "programmatic"
+
+
+#: The monotone context-lattice: which ``contract.context`` keys survive at each tier (FZ
+#: 35e2b1a1b2a1 §3). ``dimension 1`` (I/O + acceptance) lives in ``contract`` itself and is
+#: invariant — this projects only ``dimension 2`` (the coaching context) + ``dimension 3``
+#: (``tool_calls``, programmatic only). A tier's set is a subset of the LOWER (weaker) tier's.
+_TIER_CONTEXT_KEYS: Dict[Tier, Optional[frozenset]] = {
+    Tier.HIGH: frozenset(),                                                  # lean: nothing
+    Tier.GUARDED: frozenset({"guardrails"}),                                 # guardrails only
+    Tier.LOW: None,                                                          # None => keep all
+    Tier.PROGRAMMATIC: frozenset({"tool_calls"}),                            # the fixed interface
+}
+
+
+def project_context(full_context: Mapping[str, Any], tier: Tier) -> Dict[str, Any]:
+    """Project a node's declared ``contract.context`` down to the subset its ``tier`` keeps (B2).
+
+    Pure function (no scheduler / no I/O). ``LOW`` keeps everything (a weak agent is fully coached);
+    ``GUARDED`` keeps only ``guardrails``; ``HIGH`` keeps nothing (a proven agent runs lean);
+    ``PROGRAMMATIC`` keeps only ``tool_calls`` (the fixed interface). Absent/empty context or an
+    unknown tier returns ``{}``. This realizes the monotone lattice: a higher tier's kept-set is a
+    subset of a lower tier's, so a promotion only ever REMOVES context and a demotion only ADDS it.
+    """
+    if not isinstance(full_context, Mapping) or not full_context:
+        return {}
+    keep = _TIER_CONTEXT_KEYS.get(tier, frozenset())
+    if keep is None:  # LOW — keep the whole declared context
+        return dict(full_context)
+    return {k: full_context[k] for k in keep if k in full_context}
+
+
+def manifest_is_programmatic(manifests: Mapping[str, Any]) -> Callable[[str], bool]:
+    """A ``node -> bool`` predicate reading the ``registry.programmatic`` manifest flag (FZ
+    35e4a3a1b F4). A node whose manifest sets ``registry.programmatic: true`` is a script-like
+    tool-agent — :func:`make_payload_tier` gives it the fixed ``PROGRAMMATIC`` tier regardless of
+    earned trust (matched, not coached). Default (flag absent/false) => ``False``, so a normal
+    agent is tiered by trust. Pure read; wire as ``make_payload_tier(sched, manifest_is_programmatic(m))``."""
+    def is_prog(node: str) -> bool:
+        manifest = manifests.get(node)
+        registry = getattr(manifest, "registry", None) if manifest is not None else None
+        return bool(registry.get("programmatic")) if isinstance(registry, Mapping) else False
+
+    return is_prog
+
+
+def make_payload_tier(
+    scheduler: "TrustLadderScheduler",
+    is_programmatic: Optional[Callable[[str], bool]] = None,
+    *,
+    strict_below: TrustGrade = TrustGrade.L2_GUARDED,
+) -> Callable[[str], Tier]:
+    """A ``node -> Tier`` selector — the 4-value generalization of :func:`make_trust_strictness`
+    (FZ 35e2b1a1b2a1 §2). A 2-D decision: (earned trust grade) × (is the agent script-like?).
+
+    * ``is_programmatic(node)`` truthy -> :attr:`Tier.PROGRAMMATIC` (ORTHOGONAL to trust — a
+      script-like tool-agent gets the fixed tool-call interface regardless of grade).
+    * else by earned trust: ``>= strict_below`` (default ``L2_GUARDED``) -> :attr:`Tier.HIGH` when
+      strictly above the bar, :attr:`Tier.GUARDED` at the bar; below -> :attr:`Tier.LOW`; an
+      UNKNOWN / never-seeded node -> :attr:`Tier.LOW` (conservative, matching
+      :func:`make_trust_strictness`'s weak-until-proven default).
+
+    Read live via ``scheduler.earned_grade(node)`` (author/compile-time, GOV-side). Wire the result
+    into a payload-context overlay (SPIKE B) and, once the full contract lands, as the single dial
+    that also drives verification depth (§6), so payload tier and QA strictness never drift.
+    """
+    bar = TrustGrade.coerce(strict_below) if not isinstance(strict_below, TrustGrade) else strict_below
+
+    def tier_of(node: str) -> Tier:
+        if is_programmatic is not None:
+            try:
+                if is_programmatic(node):
+                    return Tier.PROGRAMMATIC
+            except Exception:  # noqa: BLE001 - a bad predicate must not break tiering
+                pass
+        try:
+            grade = scheduler.earned_grade(node)
+        except Exception:  # noqa: BLE001 - unknown/unresolvable node => conservative LOW (weak)
+            return Tier.LOW
+        if int(grade) > int(bar):
+            return Tier.HIGH
+        if int(grade) == int(bar):
+            return Tier.GUARDED
+        return Tier.LOW
+
+    return tier_of

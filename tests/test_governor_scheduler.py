@@ -10,6 +10,7 @@ mutates a frozen plan; ``update_trust`` lives GOV-side ONLY and the create-time
 
 from __future__ import annotations
 
+import json
 import types
 
 import concursus.build.trust as trust_mod
@@ -22,8 +23,11 @@ from concursus.governor.scheduler import (
     Binding,
     FrontierProposal,
     ScheduleDecision,
+    Tier,
     TrustLadderScheduler,
+    make_payload_tier,
     make_trust_strictness,
+    project_context,
 )
 
 
@@ -339,3 +343,111 @@ def test_trust_dial_end_to_end_with_assembler(tmp_path):
     strong_dial = _dial_for(TrustGrade.L3_AUTONOMOUS)
     plan = OrchestrationAssembler(strict_types=True, strict_fn=strong_dial).assemble(dag, plan_manifests)
     assert plan.order == ["ingest", "summarize"]
+
+
+# -- FZ 35e2b1a1b2a1 SPIKE B: the trust-tiered payload dial (make_payload_tier / project_context) --
+def _tier_sched(tmp_path, **name_to_seed):
+    ledger = DeployLedger(tmp_path / "lt.json")
+    manifests = {}
+    for name, seed in name_to_seed.items():
+        ledger.record(name=name, fingerprint=f"f_{name}", arn=f"arn:{name}", deployed_at="2026-07-01")
+        manifests[name] = _manifest(name, trust_seed=seed)
+    reg = _registry_with(ledger, *manifests.values())
+    return TrustLadderScheduler(reg, manifests=manifests)
+
+
+def test_make_payload_tier_maps_grade_to_tier(tmp_path):
+    """L3 -> HIGH (lean), L2 -> GUARDED, L0/L1 -> LOW (full), unknown -> LOW (conservative)."""
+    sched = _tier_sched(
+        tmp_path,
+        strong=TrustGrade.L3_AUTONOMOUS,
+        mid=TrustGrade.L2_GUARDED,
+        weak=TrustGrade.L1_CANARY,
+        shadow=TrustGrade.L0_SHADOW,
+    )
+    tier = make_payload_tier(sched, strict_below=TrustGrade.L2_GUARDED)
+    assert tier("strong") is Tier.HIGH
+    assert tier("mid") is Tier.GUARDED
+    assert tier("weak") is Tier.LOW
+    assert tier("shadow") is Tier.LOW
+    assert tier("never_seen") is Tier.LOW  # unknown/unproven => conservative LOW
+
+
+def test_make_payload_tier_programmatic_is_orthogonal_to_trust(tmp_path):
+    """A script-like agent is PROGRAMMATIC regardless of its earned grade (matched, not coached)."""
+    sched = _tier_sched(tmp_path, prog=TrustGrade.L3_AUTONOMOUS)  # even a high grade
+    tier = make_payload_tier(sched, is_programmatic=lambda n: n == "prog")
+    assert tier("prog") is Tier.PROGRAMMATIC
+
+
+def test_project_context_is_a_monotone_lattice():
+    """dim-2/3 context shrinks as trust rises: LOW keeps all, GUARDED only guardrails, HIGH none,
+    PROGRAMMATIC only tool_calls. A higher tier's kept-set is a subset of a lower tier's."""
+    ctx = {
+        "sop": ["1. read", "2. extract"],
+        "tools_available": ["doc_reader"],
+        "guardrails": ["do not fabricate ids"],
+        "examples": ["ex1"],
+        "tool_calls": [{"tool": "doc_reader", "args": {}}],
+    }
+    assert project_context(ctx, Tier.LOW) == ctx                       # full coaching
+    assert project_context(ctx, Tier.GUARDED) == {"guardrails": ctx["guardrails"]}
+    assert project_context(ctx, Tier.HIGH) == {}                        # lean
+    assert project_context(ctx, Tier.PROGRAMMATIC) == {"tool_calls": ctx["tool_calls"]}
+    # monotone: HIGH ⊆ GUARDED ⊆ LOW (by kept keys)
+    assert set(project_context(ctx, Tier.HIGH)) <= set(project_context(ctx, Tier.GUARDED))
+    assert set(project_context(ctx, Tier.GUARDED)) <= set(project_context(ctx, Tier.LOW))
+    # empty/absent context => {}
+    assert project_context({}, Tier.LOW) == {}
+
+
+def test_supervisor_payload_overlay_tiers_by_trust(tmp_path):
+    """SPIKE B end-to-end: the SAME role gets a FULL context payload for a WEAK agent and a LEAN
+    one for a STRONG agent — the invoke payload differs only by the tiered coaching context."""
+    from concursus import AgentDAG, AgentManifest, OrchestrationAssembler
+    from concursus.execute.supervisor import Supervisor
+    from concursus.state.statestore import InProcessStateStore
+
+    context = {"sop": ["read", "summarize"], "guardrails": ["cite sources"], "examples": ["ex"]}
+    m = AgentManifest.from_dict({
+        "name": "summarize",
+        "registry": {"container_uri": "img", "protocol": "HTTP", "entry": "a.summarize:run"},
+        "contract": {
+            "inputs": {"doc": {"type": "string"}},
+            "outputs": {"summary": {"type": "string", "required": True}},
+            "context": context,
+        },
+    })
+    dag = AgentDAG()
+    dag.add_node("summarize")
+    manifests = {"summarize": m}
+    plan = OrchestrationAssembler().assemble(dag, manifests)
+    arns = {"summarize": "arn:aws:bedrock-agentcore:us-east-1:1:runtime/x"}
+
+    seen = {}
+
+    def _spy(arn, qualifier, session_id, payload_bytes):
+        seen.clear()
+        seen.update(json.loads(payload_bytes))
+        return {"summary": "ok"}
+
+    def _run(tier_fn):
+        sup = Supervisor(
+            plan, manifests, invoke_fn=_spy, arns=arns,
+            state_store=InProcessStateStore(), payload_tier_fn=tier_fn,
+        )
+        sup.run({"summarize": {"doc": "d"}})
+        return dict(seen)
+
+    weak_payload = _run(lambda node: Tier.LOW)
+    strong_payload = _run(lambda node: Tier.HIGH)
+    # dimension 1 (the declared input) is invariant across tiers.
+    assert weak_payload["doc"] == "d" and strong_payload["doc"] == "d"
+    # dimension 2 (coaching context) is present for the WEAK tier, absent for the STRONG one.
+    assert weak_payload.get("sop") == context["sop"]
+    assert weak_payload.get("guardrails") == context["guardrails"]
+    assert "sop" not in strong_payload and "guardrails" not in strong_payload
+    # default (no tier_fn) is byte-for-byte unchanged: no context overlaid.
+    sup0 = Supervisor(plan, manifests, invoke_fn=_spy, arns=arns, state_store=InProcessStateStore())
+    sup0.run({"summarize": {"doc": "d"}})
+    assert "sop" not in seen and "guardrails" not in seen

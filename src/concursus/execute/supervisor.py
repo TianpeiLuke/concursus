@@ -206,6 +206,7 @@ class Supervisor:
         held: Optional[Set[str]] = None,
         check_acceptance: bool = False,
         acceptance_fn: Optional[Callable[[str], bool]] = None,
+        payload_tier_fn: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
@@ -244,6 +245,15 @@ class Supervisor:
         # QA gate to the nodes it returns truthy for — wire a trust-derived predicate so a WEAK agent
         # is QA-checked while a proven STRONG one runs lean. No effect when check_acceptance is off.
         self._acceptance_fn = acceptance_fn
+        # FZ 35e2b1a1b2a1 SPIKE B (B3): OPT-IN trust-tiered payload overlay. None (default) =>
+        # the invoke payload is byte-for-byte unchanged. When set, a ``node -> Tier`` selector
+        # (wire ``governor.make_payload_tier(sched)``); a node whose manifest declares
+        # ``contract.context`` gets ``project_context(context, tier_fn(node))`` overlaid into its
+        # external inputs BEFORE the wired upstream outputs — so a WEAK agent receives the full
+        # coaching context and a proven one runs lean. Author/dispatch-time only; it never mutates
+        # a frozen plan (INV-3) and adds no compiler loop (INV-2). The A/B evidence gate that
+        # decides whether the full payload contract is worth building rides on this seam.
+        self._payload_tier_fn = payload_tier_fn
 
         supplied = dict(arns or {})
         self._arns: Dict[str, str] = {}
@@ -290,13 +300,57 @@ class Supervisor:
         self, node: str, inputs: Dict[str, Any], wiring: List["AgentRef"]
     ) -> Dict[str, Any]:
         """External inputs for ``node``: its ``inputs[node]`` block, or — for a source node
-        (no inbound wiring) — the top-level ``inputs`` mapping."""
+        (no inbound wiring) — the top-level ``inputs`` mapping. When an opt-in payload-tier
+        selector is wired (SPIKE B), the node's tiered ``contract.context`` is overlaid underneath
+        the caller-supplied inputs (which win on any key collision)."""
         explicit = inputs.get(node)
         if isinstance(explicit, dict):
-            return dict(explicit)
-        if not wiring:
-            return dict(inputs)
-        return {}
+            base = dict(explicit)
+        elif not wiring:
+            base = dict(inputs)
+        else:
+            base = {}
+        return self._overlay_tiered_context(node, base)
+
+    def _overlay_tiered_context(self, node: str, base: Dict[str, Any]) -> Dict[str, Any]:
+        """Overlay the node's trust-tiered static context UNDER ``base`` (SPIKE B B3 / F3).
+
+        Two sources, in precedence order:
+
+        * **F3 — the FROZEN plan's ``payload_contract``**: when the compiled plan carries
+          ``payload_contract[node]["static_context"]``, use it verbatim — the compiler already
+          projected it to the node's tier at author time (a self-contained frozen payload; no live
+          scheduler needed at dispatch).
+        * **B3 — the live ``payload_tier_fn``**: else, when a ``node -> Tier`` selector was injected
+          AND the manifest declares ``contract.context``, project it live at dispatch.
+
+        Both are opt-in: with neither a frozen contract nor a ``payload_tier_fn``, this returns
+        ``base`` unchanged (default payload byte-for-byte). The projected context is placed UNDER
+        ``base`` so caller-supplied / wired inputs always win a key collision. Any error degrades to
+        ``base`` (tiering is best-effort — never break a dispatch)."""
+        projected: Dict[str, Any] = {}
+        # F3: prefer the frozen, compiler-authored contract if the plan carries one for this node.
+        frozen = getattr(self._plan, "payload_contract", None)
+        if isinstance(frozen, dict) and node in frozen:
+            ctx = frozen[node].get("static_context") if isinstance(frozen[node], dict) else None
+            if isinstance(ctx, dict) and ctx:
+                projected = dict(ctx)
+        # B3: else project live via the injected tier fn.
+        if not projected and self._payload_tier_fn is not None:
+            manifest = self._manifests.get(node)
+            context = getattr(manifest, "context", None) if manifest is not None else None
+            if context:
+                try:
+                    from concursus.governor.scheduler import project_context
+
+                    projected = project_context(context, self._payload_tier_fn(node))
+                except Exception:  # noqa: BLE001 - best-effort; never break a dispatch
+                    projected = {}
+        if not projected:
+            return base
+        merged = dict(projected)
+        merged.update(base)  # caller-supplied / wired inputs win on collision
+        return merged
 
     def run(self, inputs: Dict[str, Any]) -> Dict[str, Dict]:
         """Invoke every agent in topological order; return ``{node_id: output_dict}``.

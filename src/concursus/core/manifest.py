@@ -69,6 +69,19 @@ class AgentManifest:
         return dict(self.contract.get("outputs", {}))
 
     @property
+    def context(self) -> Dict[str, Any]:
+        """Optional trust-tiered coaching context (FZ 35e2b1a1b2a1, SPIKE B ``B1``).
+
+        A free-form ``contract.context`` block — ``{sop?, tools_available?, guardrails?,
+        examples?, tool_calls?}`` — that a payload-tier overlay projects down per the bound agent's
+        earned trust (:func:`~concursus.governor.scheduler.project_context`). Absent (the
+        default) => an empty dict, so the invoke payload is byte-for-byte unchanged. This is
+        *dimension 2/3* of the payload contract; *dimension 1* (I/O + acceptance) lives in
+        ``inputs``/``outputs`` and is never tiered.
+        """
+        return dict(self.contract.get("context", {}))
+
+    @property
     def depends_on(self) -> List[Dict[str, str]]:
         return list(self.spec.get("depends_on", []))
 

@@ -163,6 +163,7 @@ def check_alignment(
     strict_types: bool = False,
     single_writer: bool = False,
     strict_fn: "Optional[Callable[[str], bool]]" = None,
+    full_input_cover: bool = False,
 ) -> None:
     """Type-gate every ``depends_on`` edge; raise :class:`AlignmentError` on any violation.
 
@@ -192,6 +193,13 @@ def check_alignment(
     contract while a STRONG/high-trust one gets the lean path — the compiler-contract read of the
     Trust Ladder. It never RELAXES the name-level gate (a → d always run for every edge); it only
     gates the OPT-IN deep checks. Author/compile-time only.
+
+    ``full_input_cover`` (default ``False``, FZ 35e4a3a1b F2 — the b2 dimension-1 COMPLETENESS
+    quantifier) adds the input-COVER gate: every declared ``contract.inputs`` key of every node must
+    have a compile-visible supplier — a ``depends_on`` edge OR a declared static ``contract.context``
+    key of the same name. An input with NEITHER has no compile-visible source (it would silently
+    rely on a run input that may never arrive); this flags it. Conservative + opt-in: default off
+    keeps the name+edge gate byte-for-byte unchanged. Author/compile-time only.
     """
     for node, manifest in manifests.items():
         consumer_inputs = manifest.inputs
@@ -200,9 +208,11 @@ def check_alignment(
         node_strict_types = strict_types and node_strict
         node_single_writer = single_writer and node_strict
         writers_of: Dict[str, str] = {}  # B1: consumer input_name -> the producer already wiring it
+        wired_inputs: Set[str] = set()   # F2: consumer inputs supplied by a depends_on edge
         for edge in manifest.depends_on:
             producer, _, rest = str(edge["from"]).partition(".")
             input_name = edge["to"]
+            wired_inputs.add(input_name)
 
             producer_manifest = manifests.get(producer)
             if producer_manifest is None:
@@ -257,3 +267,19 @@ def check_alignment(
                         node=node,
                         producer=producer,
                     )
+
+        # F2 (opt-in): full-input-cover — every declared input must have a compile-visible supplier
+        # (a depends_on edge OR a static contract.context key of the same name). An uncovered input
+        # would silently rely on a run input that may never arrive. Conservative: only fires when
+        # explicitly enabled, and a wired/context-supplied input always passes.
+        if full_input_cover:
+            static_keys = set(getattr(manifest, "context", {}) or {})
+            for input_name in consumer_inputs:
+                if input_name in wired_inputs or input_name in static_keys:
+                    continue
+                raise AlignmentError(
+                    f"{node}: input {input_name!r} has no compile-visible supplier — it is neither "
+                    f"a depends_on edge target nor a declared contract.context key (a full-input-"
+                    f"cover violation: it would silently rely on a run input)",
+                    node=node,
+                )

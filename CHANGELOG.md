@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-16
+
 ### Added
 
 - **`check_hive_contract()` — the agent↔Hive-layer boundary gate (B2 remainder).** Deepens the

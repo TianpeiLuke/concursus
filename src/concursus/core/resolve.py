@@ -96,6 +96,30 @@ def extract(obj: Any, path: str) -> Any:
     return cursor
 
 
+# -- content-reuse policy resolution ----------------------------------------
+def resolve_context_mode(manifest: Any, team_default: str = "isolation") -> str:
+    """Resolve a node's effective content-reuse policy via a strict precedence cascade.
+
+    Applies ``per-agent -> team/group default -> hardcoded "isolation"`` in order, returning one of
+    ``"reuse"`` | ``"isolation"``:
+
+    1. The manifest's own ``context_mode`` when it is a concrete policy (``"reuse"`` / ``"isolation"``);
+    2. otherwise ``team_default`` when it is a concrete policy (the group-level fallback);
+    3. otherwise the hardcoded ``"isolation"`` floor.
+
+    An empty/absent/unrecognized value at any level (``""``, ``None``, a typo) is treated as INHERIT
+    — it defers to the next level rather than being honored — so a manifest that never sets
+    ``context_mode`` and a caller that passes the default ``team_default`` both resolve to
+    ``"isolation"``. Pure: no I/O, no AWS, no mutation — a total function of its two inputs.
+    """
+    per_agent = getattr(manifest, "context_mode", "") or ""
+    if per_agent in ("reuse", "isolation"):
+        return per_agent
+    if team_default in ("reuse", "isolation"):
+        return team_default
+    return "isolation"
+
+
 # -- edge compilation -------------------------------------------------------
 def _split_from(spec: str) -> tuple:
     """Split a ``from`` spec on the FIRST dot into ``(producer, "$."+rest)``."""

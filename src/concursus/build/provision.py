@@ -271,6 +271,7 @@ def provision_agent(
     ledger: Optional["DeployLedger"] = None,
     now: Optional[Union[str, int, float]] = None,
     sleep: Optional[Callable[[float], None]] = None,
+    two_phase: bool = False,
 ) -> Dict[str, Any]:
     """Provision one agent; return ``{"node", "arn", "action", "role_arn", "image_uri"}``.
 
@@ -300,6 +301,14 @@ def provision_agent(
     grade is deployed to a **non-default (shadow) qualifier** instead of ``DEFAULT``. It is never a
     per-invocation check, never re-earns trust from an outcome, and never picks among agents.
     With no manifest/policy the gate is a no-op and today's deploy is byte-for-byte unchanged.
+
+    Two-phase crash-safe actuation (opt-in, AI-15): pass ``two_phase=True`` **with** a ``ledger``.
+    Before ``CreateAgentRuntime`` a ``status="reserving"`` reservation is appended to the ledger
+    (durable intent, keyed by ``(name, fingerprint)`` and carrying the deterministic runtime name);
+    after the create + readiness wait succeed it is superseded by a ``status="confirmed"`` entry
+    carrying the real ARN. A crash between those phases leaves a dangling ``reserving`` entry that
+    :func:`reconcile_reservations` recovers on the next deploy. With ``two_phase=False`` (the default)
+    or no ledger this is a no-op and the deploy is byte-for-byte unchanged.
     """
     run = run or _default_run
     req = copy.deepcopy(entry.create_agent_runtime)
@@ -370,6 +379,19 @@ def provision_agent(
             req["agentRuntimeArtifact"]["containerConfiguration"]["containerUri"] = image_uri
             result["image_uri"] = image_uri
 
+    # 2a) Two-phase RESERVE (opt-in) — durably record intent BEFORE the actuator is called, so a
+    #     crash between here and the confirm leaves a dangling 'reserving' entry that
+    #     reconcile_reservations recovers on the next deploy. No-op unless two_phase + a ledger + a
+    #     fingerprint (the reservation key) are all present, so today's deploy is unchanged.
+    two_phasing = two_phase and ledger is not None and bool(entry.fingerprint)
+    if two_phasing:
+        ledger.reserve(
+            node=entry.name,
+            fingerprint=entry.fingerprint,
+            runtime_name=req.get("agentRuntimeName"),
+            at=now if now is not None else _utc_now_iso(),
+        )
+
     # 3) Register the runtime. (A SHADOW decision surfaces its non-DEFAULT qualifier in the
     #    result; the create request itself stays a clean CreateAgentRuntime — the shadow
     #    endpoint is a separate, downstream concern, not an unknown param smuggled into boto3.)
@@ -389,6 +411,18 @@ def provision_agent(
         failure_reason=created.get("failureReason"),
         sleep=sleep or time.sleep,
     )
+
+    # 3b) Two-phase CONFIRM (opt-in) — the actuate + readiness wait both succeeded, so supersede the
+    #     'reserving' entry with a 'confirmed' one carrying the real ARN. (If step 3/3a raised, the
+    #     reserving entry is deliberately left dangling for the reconciler.)
+    if two_phasing:
+        ledger.confirm_reservation(
+            node=entry.name,
+            fingerprint=entry.fingerprint,
+            arn=result.get("arn"),
+            runtime_name=req.get("agentRuntimeName"),
+            at=now if now is not None else _utc_now_iso(),
+        )
 
     # 4) Persisted reuse-by-content (opt-in) — append this outcome to the ledger for audit +
     #    cross-invocation dedup. ``deployed_at`` is caller-injected (``now``), never a clock read
@@ -415,6 +449,96 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _find_runtime_by_name(control: Any, runtime_name: str) -> Optional[str]:
+    """Best-effort adoption probe: the ARN of an existing runtime named ``runtime_name``, else ``None``.
+
+    ``CreateAgentRuntime`` is deterministically named (see :func:`concursus.build.build`),
+    so a crash *after* the create landed leaves a real runtime discoverable by that name. This walks
+    the control plane's ``list_agent_runtimes`` pages (duck-typed; a fake need only implement it) and
+    returns the matching ARN. A control plane without ``list_agent_runtimes`` (a minimal fake) yields
+    ``None`` — the reconciler then compensates, which is the safe direction (never re-adopts a runtime
+    it cannot prove exists).
+    """
+    lister = getattr(control, "list_agent_runtimes", None)
+    if lister is None:
+        return None
+    token: Optional[str] = None
+    while True:
+        kw = {"nextToken": token} if token else {}
+        page = lister(**kw) or {}
+        for rt in page.get("agentRuntimes", []) or []:
+            if rt.get("agentRuntimeName") == runtime_name:
+                return rt.get("agentRuntimeArn")
+        token = page.get("nextToken")
+        if not token:
+            return None
+
+
+def reconcile_reservations(
+    ledger: "DeployLedger",
+    *,
+    clients: Optional[Clients] = None,
+    control: Any = None,
+    find_runtime: Optional[Callable[[str], Optional[str]]] = None,
+    now: Optional[Union[str, int, float]] = None,
+) -> List[Dict[str, Any]]:
+    """Recover the dangling two-phase reservations a crash left behind; return one result per reservation.
+
+    Called at the *start* of a deploy (before provisioning), this is the stale-resource reconciler for
+    :func:`provision_agent`'s ``two_phase`` actuation. For each still-``reserving`` entry the ledger
+    surfaces (:meth:`DeployLedger.pending_reservations` — the newest entry for a ``(node, fingerprint)``
+    key is ``reserving``, i.e. no ``confirmed``/``compensated`` ever followed), it decides:
+
+    * **adopt** — a runtime already exists under the reservation's deterministic ``runtime_name`` (the
+      pre-crash actuator's create *did* land). Its ARN is discovered and a ``confirmed`` entry is
+      appended, so the reservation is resolved and the runtime is reused, not re-created.
+    * **compensate** — no such runtime is found (the crash was *before* the create landed, or it never
+      will). A ``compensated`` entry is appended, clearing the dangling reservation so the next
+      :func:`provision_agent` re-provisions the node cleanly.
+
+    The adoption probe is injectable: pass ``find_runtime(runtime_name) -> arn | None`` (a fake in
+    tests), or a ``control``/``clients`` control plane whose ``list_agent_runtimes`` is walked by
+    :func:`_find_runtime_by_name`. With none of those, adoption is impossible and every dangling
+    reservation is compensated (the safe direction). ``now`` supplies the appended entry's timestamp
+    (caller-injected; falls back to a call-time UTC stamp). Offline + unit-testable: no AWS is required
+    when ``find_runtime`` is injected. An empty/None ledger has nothing pending, so this is a no-op —
+    the default deploy path never calls it.
+    """
+    if find_runtime is None:
+        probe_control = control if control is not None else (clients.control if clients else None)
+        if probe_control is not None:
+            find_runtime = lambda name: _find_runtime_by_name(probe_control, name)  # noqa: E731
+
+    results: List[Dict[str, Any]] = []
+    for res in ledger.pending_reservations():
+        stamp = now if now is not None else _utc_now_iso()
+        adopted_arn = (
+            find_runtime(res.runtime_name)
+            if (find_runtime is not None and res.runtime_name)
+            else None
+        )
+        if adopted_arn is not None:
+            ledger.confirm_reservation(
+                node=res.node,
+                fingerprint=res.fingerprint,
+                arn=adopted_arn,
+                runtime_name=res.runtime_name,
+                at=stamp,
+            )
+            results.append(
+                {"node": res.node, "action": "adopted", "arn": adopted_arn}
+            )
+        else:
+            ledger.compensate_reservation(
+                node=res.node,
+                fingerprint=res.fingerprint,
+                runtime_name=res.runtime_name,
+                at=stamp,
+            )
+            results.append({"node": res.node, "action": "compensated", "arn": None})
+    return results
+
+
 def provision_plan(
     plan: "ProvisioningPlan",
     *,
@@ -432,6 +556,7 @@ def provision_plan(
     ledger: Optional["DeployLedger"] = None,
     now: Optional[Union[str, int, float]] = None,
     sleep: Optional[Callable[[float], None]] = None,
+    two_phase: bool = False,
 ) -> List[Dict[str, Any]]:
     """Provision every agent in ``plan.order``; return one result dict per node (in order).
 
@@ -452,11 +577,21 @@ def provision_plan(
     so the create-time trust gate can fire; ``min_autonomy``/``require_approval`` are the caller
     policy. ``ledger`` (opt-in, AI-14) enables persisted reuse-by-content across invocations, and
     ``now`` injects its ``deployed_at`` timestamp. All default to no-ops.
+
+    ``two_phase`` (opt-in, AI-15) enables crash-safe two-phase actuation via the ``ledger``: any
+    dangling reservation a previous crashed deploy left behind is reconciled (adopted or compensated)
+    via :func:`reconcile_reservations` **before** this walk begins, and each :func:`provision_agent`
+    call reserves-then-confirms its create. With ``two_phase=False`` (the default) or no ledger this is
+    a no-op and the deploy is byte-for-byte unchanged.
     """
     clients = clients or Clients.default(region)
     run = run or _default_run
     source_dirs = source_dirs or {}
     manifests = manifests or {}
+    # Two-phase recovery — reconcile any crash-dangling reservations from a prior deploy before we
+    # provision. No-op unless two_phase + a ledger are both present, so today's deploy is unchanged.
+    if two_phase and ledger is not None:
+        reconcile_reservations(ledger, clients=clients, now=now)
     results: List[Dict[str, Any]] = []
     for node in plan.order:
         entry = plan.entries[node]
@@ -475,6 +610,7 @@ def provision_plan(
                     ledger=ledger,
                     now=now,
                     sleep=sleep,
+                    two_phase=two_phase,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - convert AWS/provision failures to a per-node result

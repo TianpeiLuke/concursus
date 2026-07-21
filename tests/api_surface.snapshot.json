@@ -1,6 +1,7 @@
 {
   "AgentManifest_fields": [
     "capabilities",
+    "context_mode",
     "contract",
     "contract_version",
     "escalate_boundary",
@@ -76,9 +77,13 @@
     "ProvenanceGuard",
     "ProvisionError",
     "ProvisioningPlan",
+    "RUN_EVENT_KINDS",
     "Record",
     "RegistryError",
     "RetrievedPrecedent",
+    "RunEvent",
+    "RunEventContractError",
+    "RunEventKind",
     "RunGraph",
     "RunGraphError",
     "RunIndex",
@@ -111,6 +116,7 @@
     "capture_run_output_note",
     "capture_run_plan_note",
     "check_alignment",
+    "check_run_event_alignment",
     "compile_inner_graph",
     "compute_ccs",
     "content_hash",
@@ -132,6 +138,7 @@
     "render_precedent_hub",
     "render_programs_index",
     "require_resolved",
+    "resolve_context_mode",
     "resolve_edges",
     "route_by_confidence",
     "seed"

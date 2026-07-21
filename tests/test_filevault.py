@@ -500,3 +500,121 @@ def test_heartbeat_lock_is_not_engaged_by_default_store_path(tmp_path):
     fv.put("a", {"x": 1})
     FileVaultStateStore(run).completed()  # a resume
     assert not (run / _fv._HEARTBEAT_NAME).exists()
+
+
+# -- OPT-IN append-only note version timeline ---------------------
+def test_default_store_never_creates_a_versions_dir(tmp_path):
+    """The DEFAULT store (``versioned=False``) is byte-identical to before: re-writing a note (the
+    ``_run.md`` entry point on every put; a re-put) creates NO ``versions/`` timeline."""
+    run = tmp_path / "run"
+    fv = FileVaultStateStore(run)  # no versioned kwarg -> default OFF
+    assert fv._versioned is False
+    fv.put("a", {"x": 1})
+    fv.put("a", {"x": 2})  # re-writes _run.md and adds a second record note
+    assert not (run / _fv._VERSIONS_DIR_NAME).exists()
+
+
+def test_versioned_store_appends_a_version_when_content_changes(tmp_path):
+    """``versioned=True`` snapshots the ``_run.md`` entry point into the append-only timeline each
+    time it is re-written with different content — newest version last, distinct content hashes."""
+    run = tmp_path / "run"
+    fv = FileVaultStateStore(run, versioned=True)
+    fv.put("a", {"x": 1})
+    fv.put("b", {"y": 2})  # _run.md re-written with a second row -> a new version
+
+    versions = _fv.read_note_versions(run, "_run.md")
+    assert [v["version"] for v in versions] == [1, 2]
+    assert len({v["content_hash"] for v in versions}) == 2  # genuinely different content
+    # the second version's content is exactly the current live _run.md bytes
+    assert versions[-1]["content"] == (run / "_run.md").read_text()
+
+
+def test_append_note_version_dedups_unchanged_content(tmp_path):
+    """Appending the SAME content as the head is a no-op (returns ``None``) — only a changed note
+    grows the timeline (append-only, content-hash de-duped)."""
+    run = tmp_path / "run"
+    run.mkdir()
+    first = _fv.append_note_version(run, "note.md", "hello v1")
+    assert first is not None
+    again = _fv.append_note_version(run, "note.md", "hello v1")  # identical
+    assert again is None
+    changed = _fv.append_note_version(run, "note.md", "hello v2")  # different
+    assert changed is not None
+    assert [v["version"] for v in _fv.read_note_versions(run, "note.md")] == [1, 2]
+
+
+def test_version_snapshot_roundtrips_yaml_hostile_content(tmp_path):
+    """A version snapshot embeds the full note text in an authoritative ``b64:`` blob, so arbitrary
+    content (frontmatter delimiters, code fences, links) round-trips byte-exact."""
+    run = tmp_path / "run"
+    run.mkdir()
+    hostile = "---\nkey: value\n---\n# H1\n\n```markdown\nnested ``` fence\n```\n[x](../y.md)\n"
+    _fv.append_note_version(run, "n.md", hostile)
+    versions = _fv.read_note_versions(run, "n.md")
+    assert len(versions) == 1
+    assert versions[0]["content"] == hostile  # exact — the whole point
+
+
+def test_version_notes_are_not_records_and_never_leak_into_resume(tmp_path):
+    """A version snapshot is stamped a non-record: ``_note_to_record`` refuses it, and the record
+    loaders (non-recursive ``*.md`` glob) never descend into ``versions/`` — so resume is unaffected."""
+    run = tmp_path / "run"
+    fv = FileVaultStateStore(run, versioned=True)
+    fv.put("a", {"x": 1})
+    fv.put("a", {"x": 2})
+
+    vfiles = list((run / _fv._VERSIONS_DIR_NAME).rglob("v*.md"))
+    assert vfiles  # the timeline exists
+    for vf in vfiles:
+        with pytest.raises(ValueError):
+            _note_to_record(vf.read_text())
+
+    # a fresh (also-versioned) store over the same dir resumes exactly, ignoring versions/
+    resumed = FileVaultStateStore(run, versioned=True)
+    assert resumed.completed() == {"a"}
+    assert resumed.get("a") == {"x": 2}
+    assert len([r for r in resumed.records() if r.node == "a"]) == 2  # only the 2 real records
+
+
+def test_revert_note_writes_a_prior_version_forward(tmp_path):
+    """``revert_note`` writes a prior version's content FORWARD as a new latest version (stamped
+    ``reverted_from``) and restores the live note — never rewriting history: the version we reverted
+    away from is still on the timeline."""
+    run = tmp_path / "run"
+    run.mkdir()
+    _fv.append_note_version(run, "doc.md", "content-A")   # v1
+    _fv.append_note_version(run, "doc.md", "content-B")   # v2
+    (run / "doc.md").write_text("content-B")              # live head is B
+
+    new_path = _fv.revert_note(run, "doc.md", 1)          # revert to A -> appended as v3
+    assert new_path.endswith("v003.md")
+
+    versions = _fv.read_note_versions(run, "doc.md")
+    assert [v["version"] for v in versions] == [1, 2, 3]
+    assert versions[-1]["reverted_from"] == 1             # typed forward-revert provenance
+    assert versions[-1]["content"] == "content-A"         # the reverted-to content, forward
+    assert versions[1]["reverted_from"] is None           # history intact: v2 (=B) untouched
+    assert versions[1]["content"] == "content-B"
+    assert (run / "doc.md").read_text() == "content-A"    # live note restored to A
+
+
+def test_revert_note_rejects_unknown_version(tmp_path):
+    """Reverting to a version not on the timeline raises rather than fabricating one."""
+    run = tmp_path / "run"
+    run.mkdir()
+    _fv.append_note_version(run, "doc.md", "only-v1")
+    with pytest.raises(ValueError):
+        _fv.revert_note(run, "doc.md", 99)
+
+
+def test_revert_note_can_skip_restoring_the_live_note(tmp_path):
+    """``restore_live=False`` still appends the forward-revert version but leaves the live head as-is
+    (a pure history annotation)."""
+    run = tmp_path / "run"
+    run.mkdir()
+    _fv.append_note_version(run, "doc.md", "A")
+    _fv.append_note_version(run, "doc.md", "B")
+    (run / "doc.md").write_text("B")
+    _fv.revert_note(run, "doc.md", 1, restore_live=False)
+    assert (run / "doc.md").read_text() == "B"  # live head untouched
+    assert _fv.read_note_versions(run, "doc.md")[-1]["content"] == "A"  # but timeline records A

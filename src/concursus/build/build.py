@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - hints only; keeps the runtime import graph pure
     from ..core.manifest import AgentManifest
@@ -524,6 +524,79 @@ _TEMPLATE_BY_PROTOCOL: Dict[str, type] = {
 }
 
 
+# -- pluggable per-runtime-kind builder registry (opt-in Strategy/Registry seam) ----------
+#: A runtime builder is a UNIFORM ``(m, *, account, region) -> BuildPlanEntry`` callable — the
+#: Strategy generalization of today's single compile path. :data:`_DEFAULT_RUNTIME_KIND` maps to
+#: :func:`_default_runtime_builder`, which is today's EXACT synthesize body (prebuilt-registrar or
+#: protocol-template dispatch). A manifest can OPT IN to a custom builder via ``registry.runtime_kind``;
+#: an absent or unregistered kind falls back to the default builder, so the default compile is
+#: byte-for-byte unchanged.
+RuntimeBuilder = Callable[..., BuildPlanEntry]  # (m, *, account=None, region=None) -> BuildPlanEntry
+
+#: The default runtime-kind key: today's one and only compile path.
+_DEFAULT_RUNTIME_KIND = "default"
+
+
+def _default_runtime_builder(
+    m: "AgentManifest",
+    *,
+    account: Optional[str] = None,
+    region: Optional[str] = None,
+) -> BuildPlanEntry:
+    """The DEFAULT runtime-kind builder: today's exact compile path.
+
+    An existing ``agent_runtime_arn`` or a prebuilt ``container_uri`` (``build_mode == "prebuilt"``)
+    routes to :class:`PreBuiltRegistrar`; otherwise the ``protocol`` selects an HTTP/MCP/A2A template
+    and ``build_mode`` (default ``"container"``) decides whether a ``Dockerfile`` is emitted.
+    """
+    reg = m.registry
+    build_mode = str(reg.get("build_mode", "container")).lower()
+    protocol = m.protocol
+
+    if reg.get("agent_runtime_arn") or (
+        reg.get("container_uri") and build_mode == "prebuilt"
+    ):
+        return PreBuiltRegistrar().synthesize(m, account=account, region=region)
+
+    template_cls = _TEMPLATE_BY_PROTOCOL.get(protocol)
+    if template_cls is None:
+        raise BuildError(
+            f"{m.name}: unsupported protocol {protocol!r} (expected HTTP, MCP, or A2A)"
+        )
+    template = template_cls()
+
+    wrapper = template.render_wrapper(m)
+    dockerfile = template.render_packaging(m) if build_mode == "container" else None
+    create_req = template.create_runtime_request(m, image_uri=None)
+    invoke = {
+        "protocol": template.protocol,
+        "qualifier": reg.get("qualifier", "DEFAULT"),
+        "port": template.port,
+    }
+    if reg.get("role_arn"):
+        execution_role: Optional[dict] = None
+    else:
+        execution_role = render_execution_role(
+            m, account, region, container=(build_mode == "container")
+        )
+    return BuildPlanEntry(
+        name=m.name,
+        build_mode=build_mode,
+        wrapper=wrapper,
+        dockerfile=dockerfile,
+        execution_role=execution_role,
+        create_agent_runtime=create_req,
+        invoke=invoke,
+        ecr_repo=reg.get("ecr_repo"),
+        fingerprint=fingerprint(m, account=account, region=region),
+    )
+
+
+#: The shipped registry seeded with the single default kind. ``synthesize`` copies this per call and
+#: layers any caller-supplied kinds atop it, so no shared global state is mutated.
+RUNTIME_BUILDERS: Dict[str, RuntimeBuilder] = {_DEFAULT_RUNTIME_KIND: _default_runtime_builder}
+
+
 class RuntimeBuilderFactory:
     """Dispatch a manifest to the template/registrar that compiles it into a build plan entry."""
 
@@ -533,52 +606,21 @@ class RuntimeBuilderFactory:
         *,
         account: Optional[str] = None,
         region: Optional[str] = None,
+        runtime_builders: Optional[Dict[str, RuntimeBuilder]] = None,
     ) -> BuildPlanEntry:
         """Compile one agent manifest into a :class:`BuildPlanEntry`.
 
-        An existing ``agent_runtime_arn`` or a prebuilt ``container_uri`` (``build_mode ==
-        "prebuilt"``) routes to :class:`PreBuiltRegistrar`; otherwise the ``protocol`` selects
-        an HTTP/MCP/A2A template and ``build_mode`` (default ``"container"``) decides whether a
-        ``Dockerfile`` is emitted.
+        Routes through the per-runtime-kind builder registry (Strategy/Registry seam): the kind is
+        ``registry.runtime_kind`` (opt-in; absent => :data:`_DEFAULT_RUNTIME_KIND`), and the builder is
+        ``registry.get(kind, <default builder>)``. With no ``runtime_kind`` declared and no custom
+        ``runtime_builders`` supplied (the default), this is EXACTLY :func:`_default_runtime_builder` —
+        byte-for-byte today's compile path (prebuilt-registrar or protocol-template dispatch). A
+        manifest that declares a registered custom ``runtime_kind`` routes to that builder instead; an
+        unregistered kind falls back to the default builder.
         """
-        reg = m.registry
-        build_mode = str(reg.get("build_mode", "container")).lower()
-        protocol = m.protocol
-
-        if reg.get("agent_runtime_arn") or (
-            reg.get("container_uri") and build_mode == "prebuilt"
-        ):
-            return PreBuiltRegistrar().synthesize(m, account=account, region=region)
-
-        template_cls = _TEMPLATE_BY_PROTOCOL.get(protocol)
-        if template_cls is None:
-            raise BuildError(
-                f"{m.name}: unsupported protocol {protocol!r} (expected HTTP, MCP, or A2A)"
-            )
-        template = template_cls()
-
-        wrapper = template.render_wrapper(m)
-        dockerfile = template.render_packaging(m) if build_mode == "container" else None
-        create_req = template.create_runtime_request(m, image_uri=None)
-        invoke = {
-            "protocol": template.protocol,
-            "qualifier": reg.get("qualifier", "DEFAULT"),
-            "port": template.port,
-        }
-        if reg.get("role_arn"):
-            execution_role: Optional[dict] = None
-        else:
-            execution_role = render_execution_role(
-                m, account, region, container=(build_mode == "container")
-            )
-        return BuildPlanEntry(
-            name=m.name,
-            build_mode=build_mode,
-            wrapper=wrapper,
-            dockerfile=dockerfile,
-            execution_role=execution_role,
-            create_agent_runtime=create_req,
-            invoke=invoke,
-            ecr_repo=reg.get("ecr_repo"),
-            fingerprint=fingerprint(m, account=account, region=region),
-        )
+        registry: Dict[str, RuntimeBuilder] = dict(RUNTIME_BUILDERS)
+        if runtime_builders:
+            registry.update(runtime_builders)
+        kind = str(m.registry.get("runtime_kind") or _DEFAULT_RUNTIME_KIND)
+        builder = registry.get(kind, _default_runtime_builder)
+        return builder(m, account=account, region=region)

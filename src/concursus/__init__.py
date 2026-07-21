@@ -86,7 +86,13 @@ from .core.manifest import (
 )
 from .build.ledger import DeployLedger, DeployRow
 from .build.provision import Clients, ProvisionError, provision_agent, provision_plan
-from .core.resolve import AgentRef, AlignmentError, check_alignment, resolve_edges
+from .core.resolve import (
+    AgentRef,
+    AlignmentError,
+    check_alignment,
+    resolve_context_mode,
+    resolve_edges,
+)
 from .build.trust import GateDecision, TrustGrade, evaluate_deploy_gate
 from .state.distill import (
     build_precedent_payload,
@@ -101,10 +107,15 @@ from .state.rundb import build_precedent_db, build_run_db
 from .state.rungraph import RunGraph, RunGraphError
 from .state.runindex import PrecedentIndex, RunIndex
 from .state.statestore import (
+    RUN_EVENT_KINDS,
     InProcessStateStore,
     MemoryStateStore,
     Record,
+    RunEvent,
+    RunEventContractError,
+    RunEventKind,
     StateStore,
+    check_run_event_alignment,
     content_hash,
 )
 from .execute.supervisor import (
@@ -203,6 +214,7 @@ __all__ = [
     "AgentRef",
     "AlignmentError",
     "resolve_edges",
+    "resolve_context_mode",
     "check_alignment",
     "RuntimeBuilderFactory",
     "BuildPlanEntry",
@@ -271,6 +283,11 @@ __all__ = [
     "capture_run_output_note",
     "Record",
     "content_hash",
+    "RunEvent",
+    "RunEventKind",
+    "RUN_EVENT_KINDS",
+    "RunEventContractError",
+    "check_run_event_alignment",
     "RunGraph",
     "RunGraphError",
     "RunIndex",

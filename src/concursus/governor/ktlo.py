@@ -42,7 +42,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Set, Tuple
 
 from concursus.assemble.assemble import (
     DEFAULT_MAX_REVISIONS,
@@ -462,6 +462,126 @@ class EpisodeAdmissionGate:
             for key in self._items_fn(signal):
                 seen[key] = 1
         self._store.put(self._node, {"seen": seen})
+
+
+# =============================================================================
+# OPT-IN idle-runtime culler (PURE; computes-only — teardown is the caller's).
+#
+# A standing fleet accretes idle runtimes (a woken episode stands one up, the
+# work drains, the runtime lingers). This gate answers ONE question, PURELY:
+# given {runtime -> last_active_ts}, the wall clock ``now_ts``, the set of
+# in-flight runtimes, and a per-runtime tier, WHICH idle runtimes are eligible
+# to reclaim? It returns only the SET; it performs NO teardown and holds no
+# runtime handles — the caller tears the returned set down (and re-provisions on
+# the next invoke from the durable :class:`~concursus.build.ledger.DeployLedger`
+# row, since identity is content-keyed and persisted there, not here). Nothing
+# in the DEFAULT path constructs one, so the daemon is byte-for-byte unchanged
+# unless a caller opts in. It is emphatically NOT wired into ``Supervisor.run``
+# (INV-3): the supervisor stays a single static pass over a frozen plan.order;
+# culling is a strictly-outer, between-episode housekeeping decision.
+#
+# The defenses are copied EXACTLY from KiRoom's idle-session reaper:
+#   1. NEVER cull an active (in-flight) runtime — no matter how its ``last_active``
+#      reads, an in-flight runtime is untouchable.
+#   2. Validate WALL-CLOCK elapsed >= floor before culling; if ``elapsed < floor``
+#      RESCHEDULE (keep it, re-check next sweep). This is drift-safe: a negative
+#      elapsed (clock skew — a ``last_active`` stamped in the future) is below any
+#      non-negative floor, so it KEEPS rather than reclaims.
+# =============================================================================
+
+# Cull tiers — which idle floor a runtime is held to before it is eligible to reclaim.
+CULL_TIER_STANDING = "standing"    # standing / most-recently-active — held to the LONG idle floor
+CULL_TIER_EPHEMERAL = "ephemeral"  # everything else — held to the SHORT idle floor
+
+
+class IdleRuntimeCuller:
+    """A PURE, opt-in idle-runtime culler: computes the SET of idle runtimes to reclaim.
+
+    :meth:`cull` is a TOTAL, DETERMINISTIC function of its inputs with NO I/O — it reads no
+    registry, no ledger, no plan, and mutates nothing (it holds only the two floors as config).
+    Given ``{runtime -> last_active_ts}``, the wall clock ``now_ts``, the in-flight ``active`` set,
+    and a per-runtime ``tiers`` map, it returns the ``Set[str]`` of runtimes eligible for teardown.
+
+    It COMPUTES ONLY — teardown is the caller's, and a reclaimed runtime's identity persists in the
+    durable :class:`~concursus.build.ledger.DeployLedger` (content-keyed), so a culled
+    runtime re-provisions on its next invoke. It is default-OFF (nothing in the standard daemon path
+    constructs one) and is NEVER consulted inside ``Supervisor.run`` (INV-3) — culling is a
+    strictly-outer, between-episode housekeeping decision, never an in-episode plan mutation.
+
+    Two idle floors, mirroring KiRoom's reaper: a runtime whose tier is ``standing`` (or that is the
+    single most-recently-active runtime, when ``protect_most_recent``) is held to the LONG floor;
+    every other runtime is held to the SHORT floor. The defenses are copied EXACTLY:
+
+    * NEVER cull an ``active`` (in-flight) runtime, regardless of its ``last_active``.
+    * Validate WALL-CLOCK ``elapsed = now_ts - last_active_ts >= floor`` before culling; if
+      ``elapsed < floor`` RESCHEDULE (keep, re-check next sweep). Drift-safe: a negative elapsed
+      (a ``last_active`` in the future from clock skew) is below any non-negative floor, so it keeps.
+    """
+
+    def __init__(
+        self,
+        long_floor_s: float,
+        short_floor_s: float,
+        *,
+        standing_tier: str = CULL_TIER_STANDING,
+        protect_most_recent: bool = True,
+    ) -> None:
+        if long_floor_s < 0 or short_floor_s < 0:
+            raise KTLODaemonError("idle floors must be >= 0 (wall-clock seconds)")
+        self._long_floor_s = float(long_floor_s)
+        self._short_floor_s = float(short_floor_s)
+        self._standing_tier = str(standing_tier)
+        self._protect_most_recent = bool(protect_most_recent)
+
+    def floor_for(
+        self,
+        runtime: str,
+        tiers: Optional[Mapping[str, str]] = None,
+        *,
+        most_recent: Optional[str] = None,
+    ) -> float:
+        """The idle floor (wall-clock seconds) ``runtime`` is held to: LONG for a standing-tier or
+        most-recently-active runtime, SHORT otherwise (a PURE read)."""
+        tier = (tiers or {}).get(runtime)
+        if tier == self._standing_tier or runtime == most_recent:
+            return self._long_floor_s
+        return self._short_floor_s
+
+    def cull(
+        self,
+        last_active: Mapping[str, float],
+        now_ts: float,
+        *,
+        active: Iterable[str] = (),
+        tiers: Optional[Mapping[str, str]] = None,
+    ) -> Set[str]:
+        """PURE: the SET of idle runtimes eligible to reclaim (computes only — no teardown).
+
+        For each ``(runtime, last_active_ts)``: an ``active`` (in-flight) runtime is NEVER culled;
+        otherwise the WALL-CLOCK ``elapsed = now_ts - last_active_ts`` is compared against the
+        runtime's tier floor (LONG for standing / most-recently-active, SHORT for the rest). A
+        runtime is culled iff ``elapsed >= floor``; ``elapsed < floor`` (including a drift-induced
+        negative elapsed) RESCHEDULES it (kept, re-checked next sweep). Returns a plain ``set`` —
+        the caller performs teardown; identity survives in the ledger for re-provision on next invoke.
+        """
+        active_set = {str(a) for a in active}
+        tier_map = dict(tiers or {})
+        # The single most-recently-active runtime is always held to the LONG floor (a KiRoom
+        # defense: never reclaim the freshest standing crew on a short idle blip). Read-only.
+        most_recent: Optional[str] = None
+        if self._protect_most_recent and last_active:
+            most_recent = max(last_active, key=lambda r: last_active[r])
+        to_cull: Set[str] = set()
+        for runtime, last_ts in last_active.items():
+            # DEFENSE 1: an in-flight runtime is untouchable, whatever its last_active reads.
+            if runtime in active_set:
+                continue
+            floor = self.floor_for(runtime, tier_map, most_recent=most_recent)
+            # DEFENSE 2 (drift-safe): only reclaim once WALL-CLOCK elapsed clears the floor; a
+            # short or negative (skewed) elapsed reschedules (keep), never culls.
+            if (now_ts - last_ts) >= floor:
+                to_cull.add(runtime)
+        return to_cull
 
 
 class KTLODaemon:

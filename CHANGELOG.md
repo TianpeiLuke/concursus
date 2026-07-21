@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-21
+
+Completes the flexibility & robustness roadmap — the remaining nine **opt-in, default-off**
+items. Default `plan → deploy → run` stays byte-for-byte unchanged; concursus remains a
+compiler, not a runtime governor. Full suite green (766 passed, 2 skipped — up from 654).
+
+### Added — compiler / core
+- `AgentManifest.context_mode` (`reuse` | `isolation` | inherit) + a pure `resolve_context_mode`
+  cascade (per-agent → team default → `isolation`); the deploy ledger refuses content-reuse for
+  `isolation`-resolved nodes.
+- `unroll_static_fanout` — an opt-in compile-time helper that unrolls a node with a declared
+  static bound N into N frozen parallel branches (`base__fe{i}`) + a synthetic gather join,
+  yielding a still-frozen assemblable plan (default-off = plan byte-identical).
+
+### Added — executor
+- `min(pref, capacity)` clamp shape for every fan-out ceiling (`resolve_ceiling` + a hard
+  `MAX_FANOUT_CAP` floor; `Supervisor.run` clamps its `parallel` kwarg the same way).
+- A default-off Strategy/Registry dispatch seam (`NODE_EXECUTORS` in the supervisor + a
+  per-runtime-kind builder registry) — the default kind reproduces today's dispatch exactly.
+
+### Added — state / durability
+- Two-phase crash-safe actuation (RESERVE → ACTUATE → CONFIRM) + a stale-resource reconciler
+  in the provisioning + ledger layer (opt-in; offline-testable via an injected actuator).
+- Opt-in append-only note **version timeline** + `revert`-forward in the FileVault store
+  (durable version blobs; derived diff index) — default single-write path unchanged.
+- Opt-in append-only **coordination notices** (append + staleness-filtered read) consumed at
+  governor episode start; keyed under a sentinel node so recompile monotonicity is preserved.
+
+### Added — governor / cockpit
+- A pure opt-in idle-runtime culler (tiered floors + active-invocation guard + wall-clock
+  elapsed validation with drift-safe reschedule).
+- An opt-in agent-facing `ControlSurface` over the SSOT: read verbs always on; actuating verbs
+  gated by non-registration from the compiled scope + explicit activation + a monotonic trust
+  clamp, routed through the existing actuators (cannot mutate the frozen plan).
+- `get_run_snapshot(run_id, *, agent=None, step=None)` — a pure windowed read over the run
+  records + an optional egress redaction helper.
+
 ## [0.5.0] - 2026-07-21
 
 Flexibility & robustness roadmap — five phases of **opt-in, default-off** additions.

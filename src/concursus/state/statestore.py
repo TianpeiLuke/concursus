@@ -24,7 +24,7 @@ import threading
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Protocol, Set, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Set, Tuple, TypedDict
 
 
 # -- typed run-state vocabulary ---------------------------------------------
@@ -51,9 +51,87 @@ class RecordType(str, Enum):
     AGENT_OUTPUT = "agent_output"
     DEDUP = "dedup"
     CHECKPOINT = "checkpoint"
+    COORDINATION = "coordination"  # opt-in cross-node coordination notice (append-only; never dispatched)
 
     def __str__(self) -> str:  # keep f-string / str() output == the bare value (Py3.11+ change)
         return self.value
+
+
+# -- run-event contract (P4.3 EventSink) ------------------------------------
+class RunEventKind(str, Enum):
+    """The CLOSED vocabulary of governor episode-BOUNDARY event kinds, shared by the emitter
+    (the :class:`~concursus.governor.loop.GovernorLoop`'s opt-in ``EventSink``) and its readers.
+
+    A ``str`` subclass so ``event["type"] == "episode_start"`` and JSON serialization keep working
+    untouched (mirrors :class:`RecordStatus`/:class:`RecordType`). Readers switch on these members;
+    :func:`check_run_event_alignment` asserts the emitter never sends a kind outside this set, so an
+    emitter/reader drift fails at test/build time instead of silently at runtime.
+    """
+
+    EPISODE_START = "episode_start"  # before a Supervisor episode is dispatched
+    EPISODE_END = "episode_end"      # after ``collect`` folds the episode's outputs into the log
+    DECISION = "decision"            # the bounded routing verdict after ``collect``
+
+    def __str__(self) -> str:  # keep f-string / str() output == the bare value (Py3.11+ change)
+        return self.value
+
+
+#: The closed set of emitter event-``type`` values (the :class:`RunEventKind` members as bare
+#: strings), for a membership check that never needs the enum type in hand.
+RUN_EVENT_KINDS: frozenset = frozenset(k.value for k in RunEventKind)
+
+
+class RunEvent(TypedDict, total=False):
+    """The frozen typed SHAPE of one governor episode-boundary event (the ``EventSink.emit`` payload).
+
+    A plain-dict VALUE — never a live ctx/plan handle — so an observer can never reach inside a
+    running Supervisor or mutate a frozen plan. ``total=False`` because the boundary-invariant keys
+    (``type``/``run_id``/``round``/``completed``/``frontier``) always ride, while the per-kind extras
+    are added only where meaningful: ``done``/``progressed`` on ``episode_end``, and
+    ``route``/``terminated_by`` on ``decision``.
+
+    Attributes:
+        type: A :class:`RunEventKind` value (one of :data:`RUN_EVENT_KINDS`).
+        run_id: The outer run id.
+        round: Completed-episode count at this boundary.
+        completed: Sorted completed node ids, re-derived from the append-only log.
+        frontier: The still-open frontier at this boundary.
+        done: (episode_end) whether the plan's frontier is exhausted.
+        progressed: (episode_end) whether the round advanced the completed frontier.
+        route: (decision) the routing verdict (``planner`` | ``synthesize``).
+        terminated_by: (decision) the terminal label, when the loop stopped this round.
+    """
+
+    type: str
+    run_id: str
+    round: int
+    completed: List[str]
+    frontier: List[str]
+    done: bool
+    progressed: bool
+    route: str
+    terminated_by: Optional[str]
+
+
+class RunEventContractError(ValueError):
+    """Raised when an emitter's run-event kinds drift from the closed :class:`RunEventKind` set."""
+
+
+def check_run_event_alignment(emitted_kinds: Any) -> None:
+    """Build-time drift guard: assert every emitter kind is a :class:`RunEventKind` member.
+
+    The governor's ``EventSink`` emitter and its readers share ONE closed vocabulary
+    (:class:`RunEventKind`). If the emitter ever emits a kind the readers don't know, this raises
+    :class:`RunEventContractError` so the mismatch fails at test/build time rather than reaching a
+    reader as an unhandled event at runtime. Mirrors the ``check_alignment`` seam the compiler uses
+    to type-gate manifest edges.
+    """
+    unknown = sorted({str(k) for k in emitted_kinds} - RUN_EVENT_KINDS)
+    if unknown:
+        raise RunEventContractError(
+            f"emitter run-event kinds {unknown} are not in the closed RunEventKind vocabulary "
+            f"{sorted(RUN_EVENT_KINDS)}"
+        )
 
 
 def _coerce_status(value: Any) -> str:
@@ -275,6 +353,73 @@ def _index_records(
         if r.status == "validated" and _is_newer(r, latest_validated.get(r.node)):
             latest_validated[r.node] = r
     return latest_overall, latest_validated, attempts
+
+
+# -- coordination notices (opt-in, append-only) -----------------------------
+#: The ``record_type`` of an opt-in cross-node coordination notice.
+_COORDINATION_RECORD_TYPE = "coordination"
+
+#: The sentinel log ``node`` every coordination notice is keyed under. A DEDICATED name (never a
+#: real DAG node) plus a non-``validated`` status keeps a notice OUT of ``completed()`` / ``get()`` /
+#: the projection, so it can NEVER contaminate the executed prefix that ``recompile`` pins
+#: (INV-3/INV-5) — its ``_check_monotonic`` guard would otherwise reject an off-plan completed node.
+_COORDINATION_NODE = "__coordination__"
+
+
+def append_coordination_notice(store: "StateStore", node: str, payload: dict) -> None:
+    """Append one opt-in coordination NOTICE about ``node`` to ``store`` (pure, append-only).
+
+    A notice is a plain :class:`Record` on the SAME append-only log (the sole SSOT) — never a new
+    :class:`StateStore` Protocol method and never mutable state. It is keyed under the
+    :data:`_COORDINATION_NODE` sentinel (NOT ``node`` itself, which would flip that node's
+    latest-overall record and corrupt ``completed()`` / ``get()``) with ``record_type=coordination``
+    and a non-``validated`` status, so it never enters the validated projection and can never perturb
+    the executed prefix ``recompile`` pins. The REFERENCED ``node`` rides in the record's ``producer``
+    field (and the payload) so :func:`list_pending_notices` can staleness-filter on it. "Marking a
+    notice consumed" is itself just appending a follow-up notice — there is deliberately no mutable
+    consume flag.
+    """
+    body = dict(payload or {})
+    body.setdefault("node", node)
+    store.put(
+        _COORDINATION_NODE,
+        body,
+        meta={
+            "record_type": _COORDINATION_RECORD_TYPE,
+            "status": RecordStatus.SUPERSEDED,
+            "producer": node,
+        },
+    )
+
+
+def _notice_target(record: "Record") -> Optional[str]:
+    """The DAG node a coordination ``record`` references (its ``producer``, else its payload ``node``)."""
+    if record.producer:
+        return record.producer
+    output = record.output if isinstance(record.output, dict) else {}
+    target = output.get("node")
+    return target if isinstance(target, str) else None
+
+
+def list_pending_notices(records: List["Record"], terminal_nodes: Any) -> List["Record"]:
+    """Return the coordination notices whose referenced node is NOT terminal (pure staleness read).
+
+    A PURE reader over the append-only log: it selects the ``record_type=coordination`` records and
+    drops any whose referenced node is already terminal (present in ``terminal_nodes`` — e.g. the
+    governor's ``store.completed()`` set), since a notice about a finished node is stale. It mutates
+    nothing and marks nothing consumed (that is a separate follow-up append), so calling it leaves
+    the log byte-identical. Notices are returned in append (log) order.
+    """
+    terminal = set(terminal_nodes or ())
+    pending: List["Record"] = []
+    for record in records:
+        if record.record_type != _COORDINATION_RECORD_TYPE:
+            continue
+        target = _notice_target(record)
+        if target is not None and target in terminal:
+            continue
+        pending.append(record)
+    return pending
 
 
 # -- protocol ---------------------------------------------------------------

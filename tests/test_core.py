@@ -348,3 +348,35 @@ def test_from_yaml_parses_new_fields_and_absent_defaults(tmp_path):
     m2 = AgentManifest.from_yaml(str(plain)).validate()
     assert bool(m2.capabilities) is False
     assert m2.contract_version == MAX_SUPPORTED_CONTRACT_VERSION
+
+
+# -- context_mode (optional per-agent content-reuse policy) -----------------
+def test_manifest_context_mode_defaults_to_empty_inherit():
+    m = AgentManifest.from_dict(_valid_manifest_dict()).validate()
+    assert m.context_mode == ""
+
+
+def test_manifest_accepts_valid_context_modes():
+    for mode in ("", "reuse", "isolation"):
+        m = AgentManifest.from_dict(_valid_manifest_dict(context_mode=mode)).validate()
+        assert m.context_mode == mode
+
+
+def test_manifest_rejects_invalid_context_mode():
+    with pytest.raises(ManifestError):
+        AgentManifest.from_dict(_valid_manifest_dict(context_mode="recycle")).validate()
+
+
+def test_from_yaml_parses_context_mode(tmp_path):
+    p = tmp_path / "ctx.agent.yaml"
+    p.write_text(
+        "registry:\n"
+        "  container_uri: img\n"
+        "contract:\n"
+        "  outputs:\n"
+        "    o:\n"
+        "      type: string\n"
+        "context_mode: isolation\n"
+    )
+    m = AgentManifest.from_yaml(str(p)).validate()
+    assert m.context_mode == "isolation"

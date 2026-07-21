@@ -245,3 +245,42 @@ def test_healthy_incremental_path_is_unchanged(tmp_path):
     )
     con.close()
     assert after == before
+
+
+# -- derived note_versions index over the opt-in timeline ---------
+def test_note_versions_table_empty_for_unversioned_run(tmp_path):
+    """A run that never opted into versioning has an EMPTY note_versions table (default path
+    unchanged) — the table exists but the run's other read-models are unaffected."""
+    run_dir = _run(tmp_path, "concursus-" + "i" * 40)  # default store, no versions/
+    db_path = build_run_db(run_dir, str(tmp_path / "run.sqlite"), incremental=True)
+    con = sqlite3.connect(db_path)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM note_versions").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_note_versions_index_mirrors_the_timeline(tmp_path):
+    """With a versioned store, the derived note_versions index has one row per append-only snapshot,
+    carries the typed provenance, and a forward-revert row stamps ``reverted_from``."""
+    from concursus.state.filevault import revert_note
+
+    run_dir = tmp_path / "run"
+    store = FileVaultStateStore(run_dir, versioned=True)
+    store.put("a", {"x": 1})
+    store.put("b", {"y": 2})  # _run.md now has 2 versions
+    revert_note(run_dir, "_run.md", 1)  # forward revert -> a 3rd version stamped reverted_from=1
+
+    db_path = build_run_db(run_dir, str(tmp_path / "run.sqlite"), incremental=True)
+    con = sqlite3.connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT version, reverted_from FROM note_versions WHERE note = '_run' ORDER BY version"
+        ).fetchall()
+        assert rows == [(1, None), (2, None), (3, 1)]
+        # every snapshot row points at an on-disk file
+        paths = [r[0] for r in con.execute("SELECT file_path FROM note_versions")]
+        assert all(p and os.path.exists(p) for p in paths)
+    finally:
+        con.close()

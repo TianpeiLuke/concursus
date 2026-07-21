@@ -25,7 +25,9 @@ import pytest
 #: them); when it is installed a prior test may have imported it, so those assertions are gated.
 LANGGRAPH_INSTALLED = importlib.util.find_spec("langgraph") is not None
 
+from concursus.reasoning import inner_graph as ig
 from concursus.reasoning.inner_graph import (
+    MAX_FANOUT_CAP,
     InnerGraph,
     InnerGraphDigest,
     InnerGraphError,
@@ -33,6 +35,7 @@ from concursus.reasoning.inner_graph import (
     compile_inner_graph,
     dispatch_frontier,
     partition_frontier,
+    resolve_ceiling,
 )
 from concursus.reasoning.trailstore import HypothesisTrail
 
@@ -63,6 +66,61 @@ def test_partition_frontier_rejects_nonpositive_ceiling():
         partition_frontier(["a"], 0)
     with pytest.raises(InnerGraphError):
         partition_frontier(["a"], -1)
+
+
+# -- resolve_ceiling: the min(pref, cap) clamp SHAPE ------------------------
+def test_resolve_ceiling_clamps_pref_by_cap():
+    # A soft preference can only TIGHTEN below the capacity, never rise above it.
+    assert resolve_ceiling(2, 8) == 2  # pref under cap → pref wins
+    assert resolve_ceiling(100, 8) == 8  # pref over cap → clamped to cap
+    assert resolve_ceiling(8, 8) == 8  # equal → unchanged
+    # The default ceiling of 4 is preserved on any host with >= 4 usable cores (cap >= 4).
+    assert resolve_ceiling(4, 4) == 4
+    assert resolve_ceiling(4, 14) == 4
+
+
+def test_resolve_ceiling_floors_at_one():
+    # max(1, ...) keeps the fan-out bounded and making progress for degenerate pref/cap.
+    assert resolve_ceiling(0, 8) == 1
+    assert resolve_ceiling(-5, 8) == 1
+    assert resolve_ceiling(4, 0) == 1
+
+
+def test_max_fanout_cap_is_the_hard_preference_independent_ceiling():
+    # The hard cap sits above the default ceiling, so the default (4) is never touched by it,
+    # yet it is the absolute upper bound that a soft config can only tighten below.
+    assert MAX_FANOUT_CAP > ig._DEFAULT_CEILING
+    # A CPU-derived capacity is itself floored at 1 and hard-capped by MAX_FANOUT_CAP.
+    assert 1 <= ig._cpu_capacity() <= MAX_FANOUT_CAP
+
+
+def test_cpu_capacity_hard_caps_a_many_core_host(monkeypatch):
+    # Even a host reporting far more cores than the hard cap is bounded to MAX_FANOUT_CAP.
+    monkeypatch.setattr(ig.os, "cpu_count", lambda: 100_000)
+    assert ig._cpu_capacity() == MAX_FANOUT_CAP
+    # A None cpu_count (unknowable) degrades safely to 1, never 0 or a crash.
+    monkeypatch.setattr(ig.os, "cpu_count", lambda: None)
+    assert ig._cpu_capacity() == 1
+
+
+def test_compile_inner_graph_clamps_ceiling_by_cpu_capacity(tmp_path, monkeypatch):
+    # A caller ceiling ABOVE the host capacity is tightened to the capacity (never explodes).
+    monkeypatch.setattr(ig, "_cpu_capacity", lambda: 2)
+    trail, root = _trail_with_open_frontier(tmp_path, n=6)
+    graph = compile_inner_graph(trail, root, concurrency_ceiling=100)
+    assert graph.ceiling == 2  # clamped by capacity, not the caller's soft request
+    assert all(len(b) <= 2 for b in graph.batches)
+    assert len(graph) == 6  # still one per open hypothesis — the frontier is unchanged
+
+
+def test_compile_inner_graph_default_ceiling_unchanged_under_capacity(tmp_path, monkeypatch):
+    # DEFAULT PATH byte-for-byte: with the default ceiling 4 and a host with >= 4 cores, the
+    # effective ceiling stays exactly 4 (today's behavior).
+    monkeypatch.setattr(ig, "_cpu_capacity", lambda: 14)
+    trail, root = _trail_with_open_frontier(tmp_path, n=5)
+    graph = compile_inner_graph(trail, root)  # default concurrency_ceiling=4
+    assert graph.ceiling == 4
+    assert [len(b) for b in graph.batches] == [4, 1]
 
 
 def test_compile_inner_graph_partitions_open_frontier(tmp_path):

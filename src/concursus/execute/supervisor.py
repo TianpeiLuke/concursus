@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 from ..core.resolve import extract
+from ..reasoning.inner_graph import _cpu_capacity, resolve_ceiling
 from ..state.rungraph import RunGraph
 from ..state.runindex import RunIndex
 from ..state.statestore import InProcessStateStore, StateStore, content_hash
@@ -233,6 +234,32 @@ def _new_session_id() -> str:
     return uuid.uuid4().hex + uuid.uuid4().hex
 
 
+# -- pluggable per-node-kind executor registry (opt-in Strategy/Registry seam) ------------
+#: A node executor is a UNIFORM ``(supervisor, node, inputs, wiring) -> None`` handler — the
+#: Strategy generalization of today's single, uniform node dispatch (one kind today). The
+#: :data:`_DEFAULT_NODE_KIND` maps to :func:`_default_node_executor`, which delegates verbatim to
+#: :meth:`Supervisor._dispatch` — so with NO custom kind selected (the default) a run behaves
+#: byte-for-byte as before. A caller can register a custom node-kind handler (constructor
+#: ``node_executors=``) and select it per node (constructor ``node_kind_fn=``); a kind key with no
+#: registered handler falls back to the default handler.
+NodeExecutor = Callable[["Supervisor", str, Dict[str, Any], List["AgentRef"]], None]
+
+#: The default node-kind key: today's one and only dispatch path.
+_DEFAULT_NODE_KIND = "default"
+
+
+def _default_node_executor(
+    supervisor: "Supervisor", node: str, inputs: Dict[str, Any], wiring: List["AgentRef"]
+) -> None:
+    """The DEFAULT node-kind handler: today's exact dispatch (delegates to :meth:`Supervisor._dispatch`)."""
+    supervisor._dispatch(node, inputs, wiring)
+
+
+#: The shipped registry seeded with the single default kind. Instances copy this at construction
+#: (and may layer custom kinds atop it), so no test mutates shared global state.
+NODE_EXECUTORS: Dict[str, NodeExecutor] = {_DEFAULT_NODE_KIND: _default_node_executor}
+
+
 # -- supervisor -------------------------------------------------------------
 class Supervisor:
     """Drive a :class:`~concursus.assemble.ProvisioningPlan` to completion, offline or live.
@@ -260,6 +287,8 @@ class Supervisor:
         acceptance_fn: Optional[Callable[[str], bool]] = None,
         payload_tier_fn: Optional[Callable[[str], Any]] = None,
         verify_plan_identity: bool = False,
+        node_executors: Optional[Dict[str, NodeExecutor]] = None,
+        node_kind_fn: Optional[Callable[[str], str]] = None,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
@@ -316,6 +345,17 @@ class Supervisor:
         # DAG node, so run()'s {node: output} return is unchanged. This is a verification, never a
         # rebind: it never mutates plan.order (INV-3) and adds no compiler loop (INV-2).
         self._verify_plan_identity = bool(verify_plan_identity)
+        # Strategy/Registry dispatch (opt-in). The registry maps a node-kind key -> a uniform
+        # ``(supervisor, node, inputs, wiring) -> None`` handler. Instances start from the shipped
+        # NODE_EXECUTORS (which carries only the DEFAULT kind, delegating to _dispatch) and layer any
+        # caller-supplied kinds atop it; ``node_kind_fn`` selects a kind per node. With neither
+        # supplied (the default), EVERY node routes to _DEFAULT_NODE_KIND -> _dispatch, so the run is
+        # byte-for-byte unchanged. A node whose selected kind has no registered handler also falls
+        # back to the default handler (registry.get(kind, default_handler)).
+        self._node_executors: Dict[str, NodeExecutor] = dict(NODE_EXECUTORS)
+        if node_executors:
+            self._node_executors.update(node_executors)
+        self._node_kind_fn = node_kind_fn
 
         supplied = dict(arns or {})
         self._arns: Dict[str, str] = {}
@@ -484,6 +524,14 @@ class Supervisor:
         come only from completed producers — making the run order-independent (same store contents
         for any ``parallel``). It is still a single static pass over the frozen plan: no cyclic
         replan, resume=replay, on_error semantics unchanged.
+
+        The requested ``parallel`` is CLAMPED by the host CPU capacity via the SAME
+        ``max(1, min(pref, cap))`` shape the inner graph's fan-out uses
+        (:func:`~concursus.reasoning.inner_graph.resolve_ceiling`): a soft ``parallel``
+        request can only TIGHTEN the pool below the host's capacity, never spawn more workers than
+        the host (hard-capped by ``MAX_FANOUT_CAP``) can serve. It only ever shrinks the worker
+        pool, never the set of nodes dispatched, so the store contents stay byte-for-byte identical
+        to the serial pass — determinism is untouched, this bounds only pool width.
         """
         if parallel < 1:
             raise ValueError(f"parallel must be >= 1, got {parallel}")
@@ -491,6 +539,11 @@ class Supervisor:
         # pass and, on any resume, ASSERT it still matches BEFORE any completed-node skip below.
         # No-op unless verify_plan_identity=True, so the default pass is byte-for-byte unchanged.
         self._verify_or_persist_plan_identity()
+        if parallel > 1:
+            # Clamp the soft request by host CPU capacity (same min(pref, cap) shape as the inner
+            # graph). Only tightens the pool WIDTH; the dispatched node set is unchanged, so the
+            # store stays byte-for-byte identical to the serial pass.
+            parallel = resolve_ceiling(parallel, _cpu_capacity())
         if parallel > 1:
             return self._run_parallel(inputs, parallel)
         for node in self._plan.order:
@@ -525,7 +578,7 @@ class Supervisor:
                 )
                 continue
 
-            self._dispatch(node, inputs, wiring)
+            self._route_dispatch(node, inputs, wiring)
         return {node: self._store.get(node) for node in self._plan.order if node in self._store.completed()}
 
     def _run_parallel(self, inputs: Dict[str, Any], parallel: int) -> Dict[str, Dict]:
@@ -576,7 +629,7 @@ class Supervisor:
                     break  # no dispatchable node: the rest are blocked (a producer failed/was held)
                 dispatched.update(wave)
                 futures = [
-                    pool.submit(self._dispatch, node, inputs, wiring_by_node[node])
+                    pool.submit(self._route_dispatch, node, inputs, wiring_by_node[node])
                     for node in wave
                 ]
                 wait(futures)
@@ -608,6 +661,22 @@ class Supervisor:
                     },
                 )
         return {node: self._store.get(node) for node in order if node in self._store.completed()}
+
+    def _route_dispatch(
+        self, node: str, inputs: Dict[str, Any], wiring: List["AgentRef"]
+    ) -> None:
+        """Route ``node`` to its node-kind handler (Strategy/Registry seam), defaulting to :meth:`_dispatch`.
+
+        The kind is ``node_kind_fn(node)`` when a selector was injected, else :data:`_DEFAULT_NODE_KIND`;
+        the handler is ``self._node_executors.get(kind, <default handler>)``. With no custom selector
+        or registered kind (the default), this is exactly ``self._dispatch(node, inputs, wiring)`` —
+        byte-for-byte the original single dispatch path. Every handler shares the same uniform
+        ``(supervisor, node, inputs, wiring) -> None`` interface, so a custom kind rides the identical
+        store/on_error path; it never mutates the frozen ``plan.order`` (INV-3) and adds no loop (INV-2).
+        """
+        kind = self._node_kind_fn(node) if self._node_kind_fn is not None else _DEFAULT_NODE_KIND
+        handler = self._node_executors.get(kind, _default_node_executor)
+        handler(self, node, inputs, wiring)
 
     def _dispatch(
         self, node: str, inputs: Dict[str, Any], wiring: List["AgentRef"]

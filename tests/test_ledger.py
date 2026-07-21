@@ -265,3 +265,144 @@ def test_corrupt_file_ignores_rejections_too(tmp_path):
     # And a subsequent rejection still persists over the garbage.
     led.record_rejection(node="x", code=REJECT_INVALID, confirmed_at=1)
     assert DeployLedger(path).why_rejected("x").code == REJECT_INVALID
+
+
+# -- content_reuse_allowed + context_mode reuse gate (opt-in, default-off) ---
+def test_content_reuse_allowed_only_isolation_refuses():
+    from concursus.build.ledger import content_reuse_allowed
+
+    assert content_reuse_allowed("") is True          # empty default => reuse permitted (unchanged)
+    assert content_reuse_allowed("reuse") is True
+    assert content_reuse_allowed("isolation") is False  # only explicit isolation refuses
+
+
+def test_lookup_default_reuses_matching_row(tmp_path):
+    """Byte-for-byte unchanged: no context_mode passed => a matching row is still reused."""
+    path = tmp_path / "deploy.json"
+    led = DeployLedger(path)
+    led.record(name="a", fingerprint="fp1", deployed_at=1, arn="arn-1", action="created")
+    assert led.lookup("a", "fp1") is not None
+    assert led.has("a", "fp1") is True
+
+
+def test_lookup_reuse_mode_still_reuses(tmp_path):
+    path = tmp_path / "deploy.json"
+    led = DeployLedger(path)
+    led.record(name="a", fingerprint="fp1", deployed_at=1, arn="arn-1", action="created")
+    assert led.lookup("a", "fp1", context_mode="reuse") is not None
+    assert led.has("a", "fp1", context_mode="reuse") is True
+
+
+def test_lookup_isolation_refuses_reuse_even_with_matching_row(tmp_path):
+    """An explicit isolation policy forces re-provision: lookup returns None despite a match."""
+    path = tmp_path / "deploy.json"
+    led = DeployLedger(path)
+    led.record(name="a", fingerprint="fp1", deployed_at=1, arn="arn-1", action="created")
+    assert led.lookup("a", "fp1", context_mode="isolation") is None
+    assert led.has("a", "fp1", context_mode="isolation") is False
+    # The row still exists for audit — isolation refuses reuse, it does not erase history.
+    assert led.lookup("a", "fp1") is not None
+
+
+# -- two-phase reservations (crash-safe actuation, opt-in, default-off) ------
+def test_reserve_then_confirm_resolves_the_key(tmp_path):
+    from concursus.build.ledger import (
+        DeployReservation,
+        RESERVE_CONFIRMED,
+        RESERVE_RESERVING,
+    )
+
+    path = tmp_path / "deploy.json"
+    led = DeployLedger(path)
+    led.reserve(node="a", fingerprint="fp1", runtime_name="a_rt", at=1)
+    # A dangling reserving entry is pending until confirmed.
+    pending = led.pending_reservations()
+    assert [p.node for p in pending] == ["a"]
+    assert pending[0].status == RESERVE_RESERVING
+    assert pending[0].runtime_name == "a_rt"
+    # Confirming supersedes it — the key is no longer pending, and the confirm carries the ARN.
+    led.confirm_reservation(node="a", fingerprint="fp1", arn="arn-a", at=2)
+    reloaded = DeployLedger(path)
+    assert reloaded.pending_reservations() == []
+    entries = reloaded.reservations()
+    assert [e.status for e in entries] == [RESERVE_RESERVING, RESERVE_CONFIRMED]  # both retained
+    assert entries[-1].arn == "arn-a"
+
+
+def test_compensate_clears_a_dangling_reservation(tmp_path):
+    from concursus.build.ledger import RESERVE_COMPENSATED
+
+    path = tmp_path / "deploy.json"
+    led = DeployLedger(path)
+    led.reserve(node="a", fingerprint="fp1", runtime_name="a_rt", at=1)
+    led.compensate_reservation(node="a", fingerprint="fp1", at=2)
+    reloaded = DeployLedger(path)
+    assert reloaded.pending_reservations() == []  # compensated => resolved, no longer pending
+    assert reloaded.reservations()[-1].status == RESERVE_COMPENSATED
+
+
+def test_pending_is_newest_status_per_key(tmp_path):
+    # A key reserved -> confirmed -> reserved AGAIN (a later redeploy that crashed) is pending on the
+    # newest reserving; a different key that only ever confirmed is not pending.
+    path = tmp_path / "deploy.json"
+    led = DeployLedger(path)
+    led.reserve(node="a", fingerprint="fp1", runtime_name="a_rt", at=1)
+    led.confirm_reservation(node="a", fingerprint="fp1", arn="arn-a", at=2)
+    led.reserve(node="a", fingerprint="fp1", runtime_name="a_rt", at=3)  # crashed redeploy
+    led.reserve(node="b", fingerprint="fp2", runtime_name="b_rt", at=4)
+    led.confirm_reservation(node="b", fingerprint="fp2", arn="arn-b", at=5)
+    pending = {p.node for p in DeployLedger(path).pending_reservations()}
+    assert pending == {"a"}  # a's newest is reserving again; b resolved
+
+
+def test_reservations_key_absent_by_default_byte_for_byte(tmp_path):
+    # A ledger that never reserves is byte-for-byte the pre-feature format: no "reservations" key.
+    path = tmp_path / "deploy.json"
+    led = DeployLedger(path)
+    led.record(name="a", fingerprint="fp1", deployed_at=1)
+    data = json.loads(path.read_text())
+    assert "reservations" not in data
+    assert set(data) == {"version", "rows"}
+
+
+def test_reservation_coerces_unknown_status(tmp_path):
+    from concursus.build.ledger import DeployReservation, RESERVE_RESERVING
+
+    r = DeployReservation(node="n", fingerprint="fp", status="bogus")
+    assert r.status == RESERVE_RESERVING  # unknown status coerced to the non-terminal default
+
+
+def test_deploy_reservation_to_from_dict_round_trip():
+    from concursus.build.ledger import DeployReservation, RESERVE_CONFIRMED
+
+    r = DeployReservation(
+        node="n", fingerprint="fp", runtime_name="n_rt", status=RESERVE_CONFIRMED, arn="arn", at=7
+    )
+    assert DeployReservation.from_dict(r.to_dict()) == r
+
+
+def test_reservations_coexist_with_rows_and_rejections(tmp_path):
+    path = tmp_path / "deploy.json"
+    led = DeployLedger(path)
+    led.record(name="a", fingerprint="fp1", deployed_at=1, arn="arn-a")
+    led.record_rejection(node="b", code=REJECT_TIMEOUT, confirmed_at=2, reason="slow")
+    led.reserve(node="c", fingerprint="fp3", runtime_name="c_rt", at=3)
+    final = DeployLedger(path)
+    assert final.has("a", "fp1") is True
+    assert final.why_rejected("b").code == REJECT_TIMEOUT
+    assert [p.node for p in final.pending_reservations()] == ["c"]
+    data = json.loads(path.read_text())
+    assert data["rows"][0]["name"] == "a"
+    assert data["rejections"][0]["node"] == "b"
+    assert data["reservations"][0]["node"] == "c"
+
+
+def test_corrupt_file_ignores_reservations_too(tmp_path):
+    path = tmp_path / "deploy.json"
+    path.write_text("{ not valid json", encoding="utf-8")
+    led = DeployLedger(path)
+    assert led.reservations() == []
+    assert led.pending_reservations() == []
+    # And a subsequent reservation still persists over the garbage.
+    led.reserve(node="x", fingerprint="fp", runtime_name="x_rt", at=1)
+    assert [p.node for p in DeployLedger(path).pending_reservations()] == ["x"]

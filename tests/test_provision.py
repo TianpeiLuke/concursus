@@ -748,3 +748,223 @@ def test_provision_plan_reraises_non_aws_bug(tmp_path):
     clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_BuggyControl())
     with pytest.raises(KeyError):
         provision_plan(plan, default_source_dir=str(tmp_path), clients=clients, run=FakeRun(), halt_on_error=False)
+
+
+# -- AI-15: two-phase crash-safe actuation ----------------------------------
+class _CrashingControl(FakeControl):
+    """A control plane whose create_agent_runtime raises — simulating a crash mid-actuation, AFTER
+    the reservation was written but BEFORE the confirm."""
+
+    def __init__(self, created_it=False):
+        super().__init__()
+        self.created_it = created_it  # whether a runtime nevertheless landed under the det. name
+
+    def create_agent_runtime(self, **kw):
+        self.calls.append(kw)
+        raise ProvisionError("simulated crash between reserve and confirm")
+
+
+def test_two_phase_happy_path_reserves_then_confirms(tmp_path):
+    from concursus.build.ledger import DeployLedger, RESERVE_CONFIRMED, RESERVE_RESERVING
+
+    path = tmp_path / "ledger.json"
+    entry = _container_entry()
+    clients, run = _fakes()
+    led = DeployLedger(path)
+    res = provision_agent(
+        entry,
+        clients=clients,
+        source_dir=str(tmp_path),
+        run=run,
+        ledger=led,
+        now="2026-07-21T00:00:00Z",
+        two_phase=True,
+    )
+    assert res["action"] == "created"
+    # A reserving entry then a confirmed entry (carrying the ARN); no dangling reservation remains.
+    entries = DeployLedger(path).reservations()
+    assert [e.status for e in entries] == [RESERVE_RESERVING, RESERVE_CONFIRMED]
+    assert entries[-1].arn == res["arn"]
+    assert DeployLedger(path).pending_reservations() == []
+
+
+def test_two_phase_crash_leaves_dangling_reservation(tmp_path):
+    from concursus.build.ledger import DeployLedger, RESERVE_RESERVING
+
+    path = tmp_path / "ledger.json"
+    entry = _container_entry()
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_CrashingControl())
+    led = DeployLedger(path)
+    with pytest.raises(ProvisionError, match="simulated crash"):
+        provision_agent(
+            entry,
+            clients=clients,
+            source_dir=str(tmp_path),
+            run=FakeRun(),
+            ledger=led,
+            now="2026-07-21T00:00:00Z",
+            two_phase=True,
+        )
+    # The reservation was written before the crash; no confirm ⇒ it is left dangling/pending.
+    pending = DeployLedger(path).pending_reservations()
+    assert [p.node for p in pending] == [entry.name]
+    assert pending[0].status == RESERVE_RESERVING
+    assert pending[0].runtime_name  # the deterministic runtime name was recorded for adoption
+
+
+def test_reconciler_adopts_a_runtime_created_before_the_crash(tmp_path):
+    # After a crash left a dangling reservation, the runtime DID land under the deterministic name.
+    # The reconciler discovers it (injected find_runtime) and confirms — adopting, not re-creating.
+    from concursus.build.ledger import DeployLedger
+    from concursus.build.provision import reconcile_reservations
+
+    path = tmp_path / "ledger.json"
+    entry = _container_entry()
+    led = DeployLedger(path)
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_CrashingControl())
+    with pytest.raises(ProvisionError):
+        provision_agent(
+            entry, clients=clients, source_dir=str(tmp_path), run=FakeRun(),
+            ledger=led, now="2026-07-21T00:00:00Z", two_phase=True,
+        )
+    pending = DeployLedger(path).pending_reservations()
+    runtime_name = pending[0].runtime_name
+
+    # Next deploy: the runtime is discoverable under that name ⇒ adopt it.
+    def _find(name):
+        return "arn:adopted:runtime" if name == runtime_name else None
+
+    led2 = DeployLedger(path)
+    results = reconcile_reservations(led2, find_runtime=_find, now="2026-07-21T00:05:00Z")
+    assert results == [{"node": entry.name, "action": "adopted", "arn": "arn:adopted:runtime"}]
+    # The reservation is resolved (no longer pending) and the adopted ARN is recorded.
+    fresh = DeployLedger(path)
+    assert fresh.pending_reservations() == []
+    assert fresh.reservations()[-1].arn == "arn:adopted:runtime"
+
+
+def test_reconciler_compensates_when_no_runtime_exists(tmp_path):
+    # The crash was BEFORE the runtime landed: no runtime under the deterministic name ⇒ compensate.
+    from concursus.build.ledger import DeployLedger, RESERVE_COMPENSATED
+    from concursus.build.provision import reconcile_reservations
+
+    path = tmp_path / "ledger.json"
+    entry = _container_entry()
+    led = DeployLedger(path)
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_CrashingControl())
+    with pytest.raises(ProvisionError):
+        provision_agent(
+            entry, clients=clients, source_dir=str(tmp_path), run=FakeRun(),
+            ledger=led, now="2026-07-21T00:00:00Z", two_phase=True,
+        )
+
+    # Nothing was ever created — find_runtime always returns None ⇒ compensate the dangling entry.
+    results = reconcile_reservations(
+        DeployLedger(path), find_runtime=lambda name: None, now="2026-07-21T00:05:00Z"
+    )
+    assert results == [{"node": entry.name, "action": "compensated", "arn": None}]
+    fresh = DeployLedger(path)
+    assert fresh.pending_reservations() == []  # cleared
+    assert fresh.reservations()[-1].status == RESERVE_COMPENSATED
+
+
+def test_reconciler_uses_control_plane_list_agent_runtimes(tmp_path):
+    # With no injected find_runtime, the reconciler walks the control plane's list_agent_runtimes.
+    from concursus.build.ledger import DeployLedger
+    from concursus.build.provision import reconcile_reservations
+
+    path = tmp_path / "ledger.json"
+    entry = _container_entry()
+    led = DeployLedger(path)
+    with pytest.raises(ProvisionError):
+        provision_agent(
+            entry, clients=Clients(iam=FakeIam(), ecr=FakeEcr(), control=_CrashingControl()),
+            source_dir=str(tmp_path), run=FakeRun(), ledger=led,
+            now="2026-07-21T00:00:00Z", two_phase=True,
+        )
+    runtime_name = DeployLedger(path).pending_reservations()[0].runtime_name
+
+    class _ListingControl:
+        def list_agent_runtimes(self, **kw):
+            # Paginated: the match is on the second page (exercise the nextToken walk).
+            if not kw.get("nextToken"):
+                return {"agentRuntimes": [{"agentRuntimeName": "other", "agentRuntimeArn": "arn:x"}],
+                        "nextToken": "p2"}
+            return {"agentRuntimes": [
+                {"agentRuntimeName": runtime_name, "agentRuntimeArn": "arn:listed:rt"}]}
+
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_ListingControl())
+    results = reconcile_reservations(DeployLedger(path), clients=clients, now="2026-07-21T00:05:00Z")
+    assert results == [{"node": entry.name, "action": "adopted", "arn": "arn:listed:rt"}]
+    assert DeployLedger(path).pending_reservations() == []
+
+
+def test_reconciler_compensates_when_control_plane_cannot_list(tmp_path):
+    # A minimal control plane without list_agent_runtimes ⇒ adoption impossible ⇒ compensate (safe).
+    from concursus.build.ledger import DeployLedger
+    from concursus.build.provision import reconcile_reservations
+
+    path = tmp_path / "ledger.json"
+    entry = _container_entry()
+    led = DeployLedger(path)
+    with pytest.raises(ProvisionError):
+        provision_agent(
+            entry, clients=Clients(iam=FakeIam(), ecr=FakeEcr(), control=_CrashingControl()),
+            source_dir=str(tmp_path), run=FakeRun(), ledger=led,
+            now="2026-07-21T00:00:00Z", two_phase=True,
+        )
+    clients, _ = _fakes()  # FakeControl has no list_agent_runtimes
+    results = reconcile_reservations(DeployLedger(path), clients=clients, now="2026-07-21T00:05:00Z")
+    assert results[0]["action"] == "compensated"
+
+
+def test_two_phase_default_off_is_byte_for_byte_unchanged(tmp_path):
+    # A ledger WITHOUT two_phase records the deploy exactly as before — and writes NO reservations.
+    from concursus.build.ledger import DeployLedger
+
+    path = tmp_path / "ledger.json"
+    entry = _container_entry()
+    clients, run = _fakes()
+    led = DeployLedger(path)
+    res = provision_agent(
+        entry, clients=clients, source_dir=str(tmp_path), run=run,
+        ledger=led, now="2026-07-21T00:00:00Z",  # two_phase defaults to False
+    )
+    assert res["action"] == "created"
+    fresh = DeployLedger(path)
+    assert fresh.reservations() == []  # no reservation log at all
+    assert fresh.lookup(entry.name, entry.fingerprint) is not None  # normal ledger row still written
+    import json as _json
+    assert "reservations" not in _json.loads(path.read_text())
+
+
+def test_reconcile_reservations_noop_on_empty_ledger(tmp_path):
+    from concursus.build.ledger import DeployLedger
+    from concursus.build.provision import reconcile_reservations
+
+    led = DeployLedger(tmp_path / "ledger.json")
+    assert reconcile_reservations(led, find_runtime=lambda n: None) == []
+
+
+def test_provision_plan_two_phase_reconciles_before_walk(tmp_path):
+    # provision_plan(two_phase=True) reconciles a pre-existing dangling reservation before deploying.
+    from concursus.build.ledger import DeployLedger
+
+    path = tmp_path / "ledger.json"
+    led = DeployLedger(path)
+    # Seed a dangling reservation whose runtime is discoverable ⇒ plan-start reconcile adopts it.
+    led.reserve(node="pre", fingerprint="fp-pre", runtime_name="pre_rt", at=1)
+
+    class _ListingControl(FakeControl):
+        def list_agent_runtimes(self, **kw):
+            return {"agentRuntimes": [{"agentRuntimeName": "pre_rt", "agentRuntimeArn": "arn:pre"}]}
+
+    plan = _linear_plan(["n0", "n1"])
+    clients = Clients(iam=FakeIam(), ecr=FakeEcr(), control=_ListingControl())
+    results = provision_plan(
+        plan, default_source_dir=str(tmp_path), clients=clients, run=FakeRun(),
+        ledger=DeployLedger(path), now="2026-07-21T00:00:00Z", two_phase=True,
+    )
+    assert [r["node"] for r in results] == ["n0", "n1"]
+    # The seeded dangling reservation was adopted at plan start (no longer pending).
+    assert DeployLedger(path).pending_reservations() == []

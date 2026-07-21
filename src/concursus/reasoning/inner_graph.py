@@ -38,6 +38,7 @@ NOR any LLM installed:
 from __future__ import annotations
 
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -63,6 +64,33 @@ _KIND_ACTION = "action"  # the ACTION-marker record kind on a worker-log lane
 
 # The default bounded fan-out width — a small, safe concurrency ceiling.
 _DEFAULT_CEILING = 4
+
+# The HARD, preference-INDEPENDENT fan-out cap: an absolute upper bound on concurrent investigators
+# that a caller's soft ``concurrency_ceiling`` config can only TIGHTEN below, never raise above. It
+# also bounds the CPU-derived capacity, so neither a runaway ceiling nor a many-core host can ever
+# explode the fan-out past it. Kept well above ``_DEFAULT_CEILING`` so the default (4) is untouched.
+MAX_FANOUT_CAP = 64
+
+
+def _cpu_capacity() -> int:
+    """The host's usable fan-out capacity: the CPU count, hard-capped by :data:`MAX_FANOUT_CAP`.
+
+    Always ``>= 1`` (a ``None`` :func:`os.cpu_count` degrades to ``1``). Since it is ``>= 4`` on any
+    host with ``>= 4`` usable cores, the default ceiling of ``4`` is preserved unchanged there.
+    """
+    return max(1, min(os.cpu_count() or 1, MAX_FANOUT_CAP))
+
+
+def resolve_ceiling(pref: int, cap: int) -> int:
+    """Clamp a caller's preferred fan-out ``pref`` by a capacity ``cap`` — ``max(1, min(pref, cap))``.
+
+    Pure and preference-independent on the upper side: the soft ``pref`` (a caller's
+    ``concurrency_ceiling``) can only TIGHTEN the effective fan-out below ``cap``; it can NEVER raise
+    it above. The ``max(1, …)`` floor keeps the fan-out bounded and making progress even for a
+    degenerate ``pref``/``cap``. Defaults reproduce today exactly: with the default ceiling ``4`` and
+    any ``cap >= 4`` this returns ``4``, so the default dispatch path is byte-for-byte unchanged.
+    """
+    return max(1, min(pref, cap))
 
 
 class InnerGraphError(ValueError):
@@ -188,15 +216,21 @@ def compile_inner_graph(
     the frontier into a bounded fan-out via :func:`partition_frontier`. The result is meant to be
     rebuilt every round and discarded — it holds NO reference to the durable trail or the committed
     plan, so it can never become a cyclic executor. Purely plan-formation; it mutates nothing.
+
+    The caller's soft ``concurrency_ceiling`` is CLAMPED by the host CPU capacity via
+    :func:`resolve_ceiling` (``max(1, min(pref, cap))``) — so soft config can only TIGHTEN the
+    fan-out below the host's capacity, never explode it past :data:`MAX_FANOUT_CAP`. The default
+    ceiling of ``4`` is preserved unchanged on any host with ``>= 4`` usable cores (``cap >= 4``).
     """
     frontier = trail.open_frontier(
         root, depth_cap=depth_cap, confidence_floor=confidence_floor
     )
     model = trail.hypotheses(root)
     projection = {hid: model[hid] for hid in frontier if hid in model}
-    batches = partition_frontier(frontier, concurrency_ceiling)
+    ceiling = resolve_ceiling(concurrency_ceiling, _cpu_capacity())
+    batches = partition_frontier(frontier, ceiling)
     return InnerGraph(
-        root=root, batches=batches, ceiling=concurrency_ceiling, projection=projection
+        root=root, batches=batches, ceiling=ceiling, projection=projection
     )
 
 

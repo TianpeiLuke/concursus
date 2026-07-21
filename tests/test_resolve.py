@@ -8,6 +8,7 @@ from concursus.core.resolve import (
     AlignmentError,
     check_alignment,
     extract,
+    resolve_context_mode,
     resolve_edges,
 )
 
@@ -475,3 +476,42 @@ def test_require_capabilities_gates_egress_hosts():
     with pytest.raises(AlignmentError, match="requires egress_hosts") as ei:
         check_alignment(dag, manifests, require_capabilities=True)
     assert ei.value.field == "egress_hosts"
+
+
+# -- resolve_context_mode (per-agent -> team default -> "isolation" cascade) --
+class _CtxManifest:
+    """A minimal stand-in carrying just a context_mode attribute for the pure resolver."""
+
+    def __init__(self, context_mode=""):
+        self.context_mode = context_mode
+
+
+def test_resolve_context_mode_per_agent_wins():
+    assert resolve_context_mode(_CtxManifest("reuse"), team_default="isolation") == "reuse"
+    assert resolve_context_mode(_CtxManifest("isolation"), team_default="reuse") == "isolation"
+
+
+def test_resolve_context_mode_inherits_team_default_when_agent_empty():
+    assert resolve_context_mode(_CtxManifest(""), team_default="reuse") == "reuse"
+    assert resolve_context_mode(_CtxManifest(""), team_default="isolation") == "isolation"
+
+
+def test_resolve_context_mode_falls_back_to_isolation_floor():
+    # Neither the agent nor the team default names a concrete policy => hardcoded isolation.
+    assert resolve_context_mode(_CtxManifest(""), team_default="") == "isolation"
+    assert resolve_context_mode(_CtxManifest("bogus"), team_default="also-bogus") == "isolation"
+
+
+def test_resolve_context_mode_defaults_to_isolation():
+    # The documented default team_default is "isolation"; an un-annotated agent resolves to it.
+    assert resolve_context_mode(_CtxManifest()) == "isolation"
+
+
+def test_resolve_context_mode_accepts_real_manifest():
+    m = AgentManifest(
+        name="a",
+        registry={"container_uri": "img"},
+        contract={"outputs": {"o": {"type": "string"}}},
+        context_mode="reuse",
+    )
+    assert resolve_context_mode(m, team_default="isolation") == "reuse"

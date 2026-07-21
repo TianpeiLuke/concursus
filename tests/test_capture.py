@@ -234,3 +234,47 @@ def test_load_payload_tiers_reads_back(tmp_path):
     capture_run(str(run), plan=_tiered_plan(tmp_path), trail_id="run_x")
     tiers = load_payload_tiers(str(run))
     assert tiers.get("summarize") == "LOW"
+
+
+# --: opt-in note version timeline from the post-run trigger --------
+def test_capture_run_does_not_version_by_default(tmp_path):
+    """``capture_run`` default (``version_notes=False``) creates NO ``versions/`` timeline and keeps
+    the legacy result shape (no ``versioned`` key)."""
+    from concursus.state.capture import capture_run
+    from concursus.state.filevault import FileVaultStateStore, _VERSIONS_DIR_NAME
+
+    run = tmp_path / "run"
+    fv = FileVaultStateStore(run)
+    fv.put("ingest", {"document": "d"}, meta={"producer": "ingest"})
+    fv.put("summarize", {"summary": "s"},
+           meta={"producer": "summarize", "consumes": ["ingest:$.document"]})
+
+    result = capture_run(str(run), plan=_frozen_plan(), trail_id="run_x")
+    assert "versioned" not in result
+    assert not (run / _VERSIONS_DIR_NAME).exists()
+
+
+def test_capture_run_versions_notes_when_opted_in(tmp_path):
+    """``version_notes=True`` snapshots the run's current top-level notes (including the plan note
+    and the backlink-amended producer note) into the append-only timeline; each is a non-record."""
+    from concursus.state.capture import capture_run
+    from concursus.state.filevault import (
+        FileVaultStateStore,
+        _VERSIONS_DIR_NAME,
+        _note_to_record,
+        read_note_versions,
+    )
+
+    run = tmp_path / "run"
+    fv = FileVaultStateStore(run)
+    fv.put("ingest", {"document": "d"}, meta={"producer": "ingest"})
+    fv.put("summarize", {"summary": "s"},
+           meta={"producer": "summarize", "consumes": ["ingest:$.document"]})
+
+    result = capture_run(str(run), plan=_frozen_plan(), trail_id="run_x", version_notes=True)
+    assert result["versioned"] >= 3  # _run.md, _plan.md, and the record notes
+    # the plan note gained a timeline snapshot, stored as a non-record
+    assert read_note_versions(run, "_plan.md")
+    for vf in (run / _VERSIONS_DIR_NAME).rglob("v*.md"):
+        with pytest.raises(ValueError):
+            _note_to_record(vf.read_text())

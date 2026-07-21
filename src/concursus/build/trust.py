@@ -132,3 +132,24 @@ def evaluate_deploy_gate(
             "deploying to the shadow endpoint",
         )
     return GateDecision(LIVE, DEFAULT_QUALIFIER)
+
+
+def clamp_trust_grade(
+    compiled: Union["TrustGrade", int, str],
+    requested: Union["TrustGrade", int, str],
+) -> "TrustGrade":
+    """Clamp a REQUESTED autonomy grade **down** to the ``compiled`` ceiling — never above it.
+
+    The compile-time :class:`TrustGrade` a manifest author declared (or an operator floor pinned)
+    is a MONOTONIC ceiling: at runtime an agent-facing control surface may voluntarily opt DOWN to a
+    more cautious grade (e.g. run an ``L3_AUTONOMOUS`` node in ``L1_CANARY`` mode for one session),
+    but it can NEVER escalate above the compiled grade. This makes the effective grade
+    ``min(compiled, requested)`` — a pure, replayable dial that only ever loosens toward caution.
+
+    Both arguments are coerced via :meth:`TrustGrade.parse` (a grade, int ``0-3``, or name/alias).
+    Returns the lower of the two as a :class:`TrustGrade`; a ``requested`` at or above ``compiled``
+    yields ``compiled`` unchanged (the escalation is silently clamped, not honored).
+    """
+    ceiling = TrustGrade.parse(compiled)
+    floor = TrustGrade.parse(requested)
+    return floor if floor < ceiling else ceiling

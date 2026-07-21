@@ -88,6 +88,19 @@ _PLAN_NOTE_KIND = "run_plan"
 # payload`` so :func:`_note_to_record` REFUSES it (same guard) and the record loaders skip it.
 _PAYLOAD_NOTE_KIND = "payload"
 
+# The OPT-IN append-only note VERSION TIMELINE. A note the store re-writes with different
+# content is not a run record either: each distinct content is snapshotted into a ``versions/``
+# sidecar (``<run_dir>/versions/<note_stem>/vNNN.md``), append-only, carrying typed provenance
+# frontmatter (``version`` / ``when`` / ``content_hash`` / ``source_note``, plus ``reverted_from``
+# for a forward revert). Each version note is stamped ``concursus_note_kind: note_version`` so
+# :func:`_note_to_record` REFUSES it and the ``*.md`` record globs — which are non-recursive and so
+# never descend into ``versions/`` — skip it: the timeline can NEVER leak into a resume/replay. The
+# whole feature is gated behind ``FileVaultStateStore(versioned=…)`` (default OFF), so the DEFAULT
+# single-write path is byte-identical to before (no ``versions/`` dir is ever created).
+_VERSIONS_DIR_NAME = "versions"
+_VERSION_NOTE_KIND = "note_version"
+_VERSION_SNAPSHOT_KEY = "snapshot"  # a ``b64:`` blob of the full versioned note text (round-trip-exact)
+
 # Machine-finding keys a renderer surfaces IF THEY HAPPEN to be present in an agent's output dict.
 # Purely reflective: the renderer copies whatever the agent emitted — it NEVER derives, judges, or
 # generates a verdict/hypothesis of its own (that reasoning tier is Phase 5, deliberately excluded).
@@ -884,6 +897,249 @@ def add_reciprocal_backlinks(run_dir) -> int:
     return amended
 
 
+# ----------------------------------------------- OPT-IN append-only note version timeline
+# A note that the store re-writes with different content (the ``_run.md`` trail entry point grows on
+# every ``put``; a post-run pass amends a producer note) has, by default, no HISTORY — the prior
+# bytes are simply overwritten. This opt-in timeline closes that gap WITHOUT ever rewriting the
+# append-only log: each distinct content of a note is snapshotted into a ``versions/`` sidecar tree
+# (``<run_dir>/versions/<note_stem>/vNNN.md``), append-only, newest version = highest N. Every
+# snapshot carries typed provenance frontmatter (``version`` / ``when`` / ``content_hash`` /
+# ``source_note``; plus ``reverted_from`` for a forward revert) and embeds the full versioned note
+# text as an authoritative ``b64:`` blob so it round-trips byte-exact. It is stamped
+# ``concursus_note_kind: note_version`` so :func:`_note_to_record` REFUSES to parse it, and — because
+# every record loader globs ``*.md`` NON-recursively — a version note under ``versions/`` is never
+# seen by a resume/replay. All of it is inert unless a caller opts in (``append_note_version`` /
+# ``revert_note`` directly, or ``FileVaultStateStore(versioned=True)``): the DEFAULT store never
+# creates a ``versions/`` dir, so its on-disk bytes stay identical.
+def _version_stem(note_name: str) -> str:
+    """The per-note timeline subdir stem for a note file name (drops a trailing ``.md``)."""
+    name = os.path.basename(str(note_name))
+    return name[:-3] if name.endswith(".md") else name
+
+
+def _version_dir(run_dir, note_name: str) -> Path:
+    """The append-only timeline subdir for one note: ``<run_dir>/versions/<note_stem>/``."""
+    return Path(run_dir) / _VERSIONS_DIR_NAME / _version_stem(note_name)
+
+
+def _version_content_hash(content: str) -> str:
+    """A deterministic content hash of a note's text (reuses the statestore hasher)."""
+    return content_hash({"text": content})
+
+
+def _render_version_note(
+    *,
+    source_note: str,
+    version: int,
+    content: str,
+    when: str = "",
+    reverted_from: Optional[int] = None,
+) -> str:
+    """Render one append-only version snapshot: typed provenance frontmatter + an authoritative
+    ``snapshot`` b64 blob of the full versioned note text (the body is a lossy display copy).
+
+    Stamped ``concursus_note_kind: note_version`` so it is never parsed back as a run Record. The
+    ``snapshot`` blob is the source of truth (round-trip-exact for any content); everything else is
+    derived provenance/display.
+    """
+    chash = _version_content_hash(content)
+    fm: Dict[str, object] = {
+        "tags": ["resource", "concursus", "run_state", _VERSION_NOTE_KIND],
+        "keywords": ["concursus note version", "append-only timeline", f"version {version}"],
+        "topics": _SLIPBOX_TOPICS,
+        "language": "markdown",
+        "date of note": when,
+        "status": "active",
+        "building_block": "navigation",  # a structural history marker, not new evidence
+        "folgezettel": "1",
+        "lineage": [f"{_VERSION_NOTE_KIND}:1"],
+        _PLAN_NOTE_MARKER: _VERSION_NOTE_KIND,  # non-record stamp: _note_to_record REFUSES it
+        "source_note": source_note,
+        "version": version,
+        "when": when,
+        "content_hash": chash,
+        "access_control_group": ["general"],
+    }
+    if reverted_from is not None:
+        fm["reverted_from"] = reverted_from
+    lines = ["---"]
+    for key, value in fm.items():
+        if isinstance(value, list):
+            if not value:
+                lines.append(f"{key}: []")
+            else:
+                lines.append(f"{key}:")
+                lines.extend(f"  - {json.dumps(v)}" for v in value)
+        else:
+            lines.append(f"{key}: {json.dumps(value)}")
+    lines.append(f"{_VERSION_SNAPSHOT_KEY}: {_encode_blob({'content': content})}")
+    lines.append("---")
+    lines.append("")
+    revert_note_line = (
+        f" (a forward revert of version {reverted_from})" if reverted_from is not None else ""
+    )
+    lines.append(f"# Note Version: {source_note} v{version}{revert_note_line}")
+    lines.append("")
+    lines.append(
+        f"An append-only snapshot of `{source_note}` at version {version}{revert_note_line}. The "
+        f"authoritative content is the `{_VERSION_SNAPSHOT_KEY}` frontmatter blob; the copy below is "
+        "a derived, human-readable display. This is history — it is never rewritten."
+    )
+    lines.append("")
+    lines.append("```markdown")
+    lines.append(content)
+    lines.append("```")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _parse_version_note(text: str) -> Dict[str, Any]:
+    """Parse a version snapshot note into ``{version, when, content_hash, reverted_from, content}``.
+
+    Reads the authoritative ``snapshot`` b64 blob for the exact content and the flat provenance
+    keys for the metadata. Raises ``ValueError`` if it is not a ``note_version`` snapshot.
+    """
+    if not text.startswith("---"):
+        raise ValueError("version note missing frontmatter")
+    _, _, rest = text.partition("---\n")
+    fm_block, _, _ = rest.partition("\n---")
+    if f"{_PLAN_NOTE_MARKER}: {json.dumps(_VERSION_NOTE_KIND)}" not in fm_block:
+        raise ValueError("not a note_version snapshot")
+    snapshot_token = ""
+    flat: Dict[str, Any] = {}
+    for line in fm_block.splitlines():
+        stripped = line.strip()
+        if not stripped or ":" not in stripped or stripped.startswith("- "):
+            continue
+        key, _, raw = stripped.partition(":")
+        key, raw = key.strip(), raw.strip()
+        if key == _VERSION_SNAPSHOT_KEY:
+            snapshot_token = raw
+        elif not raw:
+            continue
+        else:
+            try:
+                flat[key] = json.loads(raw)
+            except json.JSONDecodeError:
+                flat[key] = raw
+    content = _decode_blob(snapshot_token).get("content", "") if snapshot_token else ""
+    return {
+        "version": _coerce_int(flat.get("version")) or 0,
+        "when": flat.get("when", "") or "",
+        "content_hash": flat.get("content_hash", "") or "",
+        "reverted_from": _coerce_int(flat.get("reverted_from")),
+        "content": content,
+        "source_note": flat.get("source_note", "") or "",
+    }
+
+
+def read_note_versions(run_dir, note_name: str) -> List[Dict[str, Any]]:
+    """Every append-only version of one note, oldest→newest (empty if the note has no timeline)."""
+    vdir = _version_dir(run_dir, note_name)
+    if not vdir.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    for vf in sorted(vdir.glob("v*.md")):
+        try:
+            out.append(_parse_version_note(vf.read_text(encoding="utf-8")))
+        except (ValueError, json.JSONDecodeError, OSError):
+            continue  # skip a malformed / partial snapshot rather than abort the whole read
+    out.sort(key=lambda v: v["version"])
+    return out
+
+
+def append_note_version(
+    run_dir,
+    note_name: str,
+    content: str,
+    *,
+    when: str = "",
+    reverted_from: Optional[int] = None,
+    force: bool = False,
+) -> Optional[str]:
+    """**.** Append a new version of ``note_name`` to its append-only timeline; return the new
+    snapshot path, or ``None`` when the content is unchanged (a de-duplicated no-op).
+
+    APPEND-ONLY: an existing snapshot is NEVER rewritten — a new ``vNNN.md`` (N = one past the
+    current latest) is written under ``<run_dir>/versions/<note_stem>/``. By default a re-write whose
+    content is byte-identical to the latest version is a no-op (returns ``None``), so only a note
+    that changed grows the timeline; pass ``force=True`` (used by :func:`revert_note`) to always
+    append even when the content matches the head. ``reverted_from`` stamps the forward-revert
+    provenance. Pure disk write under the sidecar tree; touches no run record and no live note.
+    """
+    versions = read_note_versions(run_dir, note_name)
+    chash = _version_content_hash(content)
+    if not force and versions and versions[-1]["content_hash"] == chash:
+        return None  # unchanged since the last snapshot — nothing to append (append-only dedup)
+    next_version = (versions[-1]["version"] + 1) if versions else 1
+    vdir = _version_dir(run_dir, note_name)
+    vdir.mkdir(parents=True, exist_ok=True)
+    text = _render_version_note(
+        source_note=_version_stem(note_name) + ".md",
+        version=next_version,
+        content=content,
+        when=when,
+        reverted_from=reverted_from,
+    )
+    path = vdir / f"v{next_version:03d}.md"
+    FileVaultStateStore._atomic_write(path, text)
+    return str(path)
+
+
+def revert_note(
+    run_dir,
+    note_name: str,
+    version: int,
+    *,
+    when: str = "",
+    restore_live: bool = True,
+) -> str:
+    """**.** Revert a note to a prior ``version`` by writing that version's content FORWARD as
+    a NEW timeline version (never rewriting history); return the new snapshot path.
+
+    A revert is not a rollback of the log — it is a forward step: it reads the immutable snapshot at
+    ``version``, appends its content as the new latest version (``force``-appended even if it matches
+    the head, stamped ``reverted_from=version``), and — with ``restore_live=True`` (default) — also
+    restores that content to the live note file (the mutable head). The prior snapshots are left
+    untouched, so the full timeline (including the state we reverted away from) is preserved. Raises
+    ``ValueError`` if ``version`` is not in the note's timeline. Pure/offline (stdlib + atomic write).
+    """
+    versions = read_note_versions(run_dir, note_name)
+    target = next((v for v in versions if v["version"] == version), None)
+    if target is None:
+        available = [v["version"] for v in versions]
+        raise ValueError(
+            f"cannot revert {note_name!r} to version {version}: not in timeline {available}"
+        )
+    content = target["content"]
+    new_path = append_note_version(
+        run_dir, note_name, content, when=when, reverted_from=version, force=True
+    )
+    if restore_live:
+        FileVaultStateStore._atomic_write(Path(run_dir) / (_version_stem(note_name) + ".md"), content)
+    assert new_path is not None  # force=True always appends
+    return new_path
+
+
+def iter_note_versions(run_dir):
+    """Yield ``(note_stem, version_dict)`` for every append-only snapshot under ``run_dir/versions/``.
+
+    A flat read over the whole timeline tree — used by the derived version index in
+    :mod:`concursus.state.rundb`. Empty when the run was never versioned (no ``versions/`` dir).
+    """
+    root = Path(run_dir) / _VERSIONS_DIR_NAME
+    if not root.exists():
+        return
+    for stem_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        for vf in sorted(stem_dir.glob("v*.md")):
+            try:
+                parsed = _parse_version_note(vf.read_text(encoding="utf-8"))
+            except (ValueError, json.JSONDecodeError, OSError):
+                continue
+            parsed["file_path"] = str(vf)
+            yield stem_dir.name, parsed
+
+
 # ------------------------------------------------------- run-dir heartbeat ownership lease (opt-in)
 # A ``host:pid:epoch`` lease at the run-dir root that a SUPERVISOR agent can take to claim
 # single-owner exclusion over a run. This is orthogonal to the per-write ``.lock``/``.gen`` OCC guard
@@ -1043,12 +1299,24 @@ class FileVaultStateStore:
     plus a generation-token OCC read-fresh over ``.gen``.
     """
 
-    def __init__(self, run_dir, *, slipbox_form: bool = True, trail_id: str = "run", date: str = "") -> None:
+    def __init__(
+        self,
+        run_dir,
+        *,
+        slipbox_form: bool = True,
+        trail_id: str = "run",
+        date: str = "",
+        versioned: bool = False,
+    ) -> None:
         self._dir = Path(run_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._slipbox_form = slipbox_form
         self._trail_id = trail_id
         self._date = date
+        # OPT-IN (default OFF): when set, every note the store re-writes with DIFFERENT content is
+        # snapshotted into the append-only ``versions/`` timeline. OFF ⇒ no ``versions/``
+        # dir is ever created, so the store's on-disk bytes are byte-identical to before.
+        self._versioned = versioned
         self._records: List[Record] = []
         self._projection: Dict[str, dict] = {}
         self._attempts: Dict[str, int] = {}
@@ -1060,7 +1328,8 @@ class FileVaultStateStore:
 
     @classmethod
     def from_config(
-        cls, *, vault_path, session_id: str, slipbox_form: bool = True, date: str = ""
+        cls, *, vault_path, session_id: str, slipbox_form: bool = True, date: str = "",
+        versioned: bool = False,
     ) -> "FileVaultStateStore":
         """Bind a run to ``<vault_path>/runs/<slug(session_id)>/`` (persistence-by-default posture).
 
@@ -1072,7 +1341,10 @@ class FileVaultStateStore:
         explicit persistent choice (mirrors ``MemoryService.from_config``).
         """
         run_dir = Path(vault_path) / "runs" / _slug(session_id)
-        return cls(run_dir, slipbox_form=slipbox_form, trail_id=_trail_id(session_id), date=date)
+        return cls(
+            run_dir, slipbox_form=slipbox_form, trail_id=_trail_id(session_id), date=date,
+            versioned=versioned,
+        )
 
     # -- run identity (for post-run distillation; read-only accessors) ------
     @property
@@ -1135,6 +1407,17 @@ class FileVaultStateStore:
         addr = record.address or record.node
         return f"{_slug(addr)}__a{record.attempt}.md"
 
+    def _maybe_version(self, note_name: str, text: str) -> None:
+        """Snapshot a just-written note into the append-only timeline IFF versioning is opted in.
+
+        A no-op unless ``self._versioned`` — so the DEFAULT store never creates a ``versions/`` dir
+        and its bytes stay identical. :func:`append_note_version` de-dups by content hash, so a
+        re-write with the SAME content adds nothing (only a genuinely changed note grows a timeline).
+        """
+        if not self._versioned:
+            return
+        append_note_version(self._dir, note_name, text, when=self._date)
+
     def _write_note(self, record: Record) -> None:
         position = len(self._records) + 1 # 1-based write order → the record's FZ position
         related = self._related_for(record)
@@ -1146,7 +1429,9 @@ class FileVaultStateStore:
             date=self._date,
             related=related,
         )
-        self._atomic_write(self._dir / self._note_filename(record), text)
+        note_name = self._note_filename(record)
+        self._atomic_write(self._dir / note_name, text)
+        self._maybe_version(note_name, text)
         if self._slipbox_form:
             self._write_run_entry()
 
@@ -1194,7 +1479,10 @@ class FileVaultStateStore:
                   "Each record below is one node output, addressed as a child of this root.", ""]
         lines += rows if rows else ["- (no records yet)"]
         lines.append("")
-        self._atomic_write(self._dir / "_run.md", "\n".join(lines))
+        text = "\n".join(lines)
+        self._atomic_write(self._dir / "_run.md", text)
+        # The entry point is re-written on every put, so its timeline is the run's growth history.
+        self._maybe_version("_run.md", text)
 
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:

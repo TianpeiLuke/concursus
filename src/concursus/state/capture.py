@@ -161,9 +161,11 @@ def capture_run(
     trail_id: str = "run",
     date: str = "",
     backlinks: bool = True,
+    version_notes: bool = False,
 ) -> Dict[str, Any]:
     """** T4.** The post-run capture trigger: build + dispatch envelopes for a finished
-    run, then run the T6 reciprocal-backlink post-pass. Returns ``{"paths": [...], "backlinks": n}``.
+    run, then run the T6 reciprocal-backlink post-pass. Returns ``{"paths": [...], "backlinks": n}``
+    (plus ``"versioned": n`` when ``version_notes=True``).
 
     Call this AFTER ``Supervisor.run`` returns (or between governor episodes). It captures the
     frozen ``plan`` (if given) and each node's frozen invoke ``payload`` (if given) into Hive's OWN
@@ -172,6 +174,11 @@ def capture_run(
     already written by the store during the run (``FileVaultStateStore``); this trigger adds the
     plan + payload artifacts + the reciprocal edges. Pure post-run (INV-safe): notes-not-records,
     no live-plan mutation.
+
+    ``version_notes`` (OPT-IN, default OFF) snapshots the run's current top-level notes into the
+    append-only version timeline AFTER the backlink pass records its typed provenance
+    (``when``/``content_hash``), so the post-run amendments are captured as history. It is OFF by
+    default so ``capture_run`` writes byte-identically to before (no ``versions/`` dir is created).
     """
     paths: List[str] = []
     tiers = dict(trust_tiers or {})
@@ -202,7 +209,32 @@ def capture_run(
         from concursus.state.filevault import add_reciprocal_backlinks
 
         n_backlinks = add_reciprocal_backlinks(run_dir)
-    return {"paths": paths, "backlinks": n_backlinks}
+    result: Dict[str, Any] = {"paths": paths, "backlinks": n_backlinks}
+    if version_notes:
+        result["versioned"] = _version_run_notes(run_dir, date=date)
+    return result
+
+
+def _version_run_notes(run_dir: str, *, date: str = "") -> int:
+    """Snapshot every current top-level note under ``run_dir`` into the append-only version timeline
+    ; return how many notes gained a new version. Skips the ``versions/`` sidecar tree and
+    the derived ``index/`` DB dir. Append-only + content-hash de-duped, so a re-run adds nothing for
+    an unchanged note. Pure post-run write (notes-not-records; no live-plan mutation)."""
+    import os
+
+    from concursus.state.filevault import append_note_version
+
+    run = os.fspath(run_dir)
+    if not os.path.isdir(run):
+        return 0
+    versioned = 0
+    for name in sorted(os.listdir(run)):
+        if not name.endswith(".md"):
+            continue
+        text = open(os.path.join(run, name), encoding="utf-8").read()
+        if append_note_version(run, name, text, when=date) is not None:
+            versioned += 1
+    return versioned
 
 
 # -- T5: the gate + verify pass over a run dir ------------------------------

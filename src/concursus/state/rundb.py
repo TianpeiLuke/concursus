@@ -16,12 +16,16 @@ Pure stdlib (``sqlite3``). No AWS, no third-party deps.
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from .filevault import _note_to_record
+from .filevault import _note_to_record, iter_note_versions
 from .statestore import Record, _ADDR_SEP
+
+_LOG = logging.getLogger(__name__)
 
 
 # The ``records`` table is the incremental source (one row per note, carrying its file_path +
@@ -96,6 +100,24 @@ WHERE r.status = 'validated'
 # ships FTS5; a run without it degrades gracefully (no records_fts table, everything else works).
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE records_fts USING fts5(event_key, node, output_text);
+"""
+
+# The derived index over the OPT-IN append-only note version timeline. One row per
+# snapshot under ``<run_dir>/versions/<note_stem>/vNNN.md`` — a pure DERIVATION of that sidecar
+# tree, DROP+recreated on every build (never a source of truth; the version notes are canonical).
+# A run that never opted into versioning has an empty ``note_versions`` table — the default path is
+# unchanged. ``reverted_from`` is non-NULL for a forward-revert snapshot.
+_NOTE_VERSIONS_SCHEMA = """
+CREATE TABLE note_versions (
+    note           TEXT NOT NULL,      -- the versioned note's stem (e.g. '_run' or 'a__a1')
+    version        INTEGER NOT NULL,   -- 1-based, append-only (newest = MAX per note)
+    when_stamp     TEXT,               -- the 'when' provenance stamp (may be empty)
+    content_hash   TEXT,               -- hash of the snapshotted content
+    reverted_from  INTEGER,            -- source version for a forward revert; NULL otherwise
+    file_path      TEXT,               -- the snapshot note on disk
+    PRIMARY KEY (note, version)
+);
+CREATE INDEX ix_note_versions_note ON note_versions(note);
 """
 
 
@@ -186,9 +208,33 @@ def _discard_corrupt_db(db_path: str) -> None:
         p.unlink(missing_ok=True)
 
 
-def _rebuild_derived_tables(con: sqlite3.Connection) -> None:
-    """(Re)derive consumes_edges, run_addresses, the projection VIEW, and (if available) the FTS
-    index — all pure projections OF the ``records`` table.
+def _rebuild_note_versions(con: sqlite3.Connection, run_dir) -> None:
+    """(Re)derive the ``note_versions`` index from the OPT-IN ``versions/`` timeline tree.
+
+    Pure projection of the append-only version notes on disk (canonical). DROP+recreated every
+    build. A run that never opted into versioning yields no rows, so the table is simply empty —
+    the default (unversioned) code path is unaffected.
+    """
+    con.executescript("DROP TABLE IF EXISTS note_versions;")
+    con.executescript(_NOTE_VERSIONS_SCHEMA)
+    for note_stem, v in iter_note_versions(run_dir):
+        con.execute(
+            "INSERT OR REPLACE INTO note_versions VALUES (?,?,?,?,?,?)",
+            (
+                note_stem,
+                int(v.get("version") or 0),
+                v.get("when") or None,
+                v.get("content_hash") or None,
+                v.get("reverted_from"),
+                v.get("file_path"),
+            ),
+        )
+
+
+def _rebuild_derived_tables(con: sqlite3.Connection, run_dir=None) -> None:
+    """(Re)derive consumes_edges, run_addresses, the projection VIEW, (if available) the FTS
+    index, and — when ``run_dir`` is given — the opt-in ``note_versions`` timeline index; all pure
+    projections OF the ``records`` table (or, for ``note_versions``, of the ``versions/`` tree).
 
     An incremental pass upserts only changed ``records`` rows, then calls this to rebuild the
     derived read-models; a full rebuild rebuilds ``records`` too. Either way the derived tables
@@ -233,6 +279,9 @@ def _rebuild_derived_tables(con: sqlite3.Connection) -> None:
                 "INSERT INTO records_fts (event_key, node, output_text) VALUES (?,?,?)",
                 (event_key, node, output_json),
             )
+    # The opt-in append-only note version timeline index (empty for an unversioned run).
+    if run_dir is not None:
+        _rebuild_note_versions(con, run_dir)
     con.commit()
 
 
@@ -391,7 +440,135 @@ def build_run_db(
                 con.execute("DELETE FROM records WHERE file_path = ?", (stale,))
         con.commit()
 
-        _rebuild_derived_tables(con)
+        _rebuild_derived_tables(con, run_dir)
     finally:
         con.close()
     return db_path
+
+
+# --------------------------------------------------------------------------- at-rest snapshot read
+# ``get_run_snapshot`` is the at-rest, cross-process analogue of ``DirectorCockpit.snapshot()``: a
+# single OFFLINE read over one run's note SSOT (via :func:`load_records`) that returns an ordered,
+# JSON-serializable slice — optionally narrowed to one agent/node and/or a step window. It is a PURE
+# read projection: it opens no live plan, drives no dispatch, mutates nothing, and pulls no
+# boto3/langgraph. A run whose notes are absent yields an empty (but well-formed) snapshot.
+#
+# A "step" is the 1-based ORDINAL of a record in the run's canonical AT-REST order — the
+# deterministic order :func:`load_records` returns (address then attempt; the append-only note
+# metadata does NOT persist a global wall-clock sequence, so this is a stable structural index, not
+# an execution clock). ``step=3`` is the third record in that order and ``step=(2, 4)`` is that
+# inclusive window. Ordinals are assigned over the WHOLE run before the agent filter, so a step
+# number names the same record regardless of which agent it is scoped to.
+_REDACTED = "[REDACTED]"
+
+
+def _normalize_step_window(step: Any) -> tuple:
+    """Coerce the ``step`` arg into an inclusive ``(lo, hi)`` 1-based window (``None`` = unbounded).
+
+    ``None`` → ``(None, None)`` (every step); an ``int`` → ``(step, step)`` (that single step); a
+    2-element ``(lo, hi)`` tuple/list → that inclusive window, where either bound may be ``None`` for
+    an open-ended side. Any other shape raises ``ValueError`` (a caller passing a malformed window
+    should hear about it rather than silently get the whole log)."""
+    if step is None:
+        return (None, None)
+    if isinstance(step, (tuple, list)):
+        if len(step) != 2:
+            raise ValueError(f"step window must be a (lo, hi) pair, got {step!r}")
+        lo, hi = step
+        return (None if lo is None else int(lo), None if hi is None else int(hi))
+    return (int(step), int(step))
+
+
+def _record_projection(record: Record, step: int) -> Dict[str, Any]:
+    """Project one :class:`Record` to a JSON-serializable snapshot row (display copy, read-only).
+
+    ``status``/``record_type`` are forced to plain ``str`` (they are ``str``-subclass enums) so the
+    row serializes cleanly, and ``consumes`` is copied to a fresh list. ``output`` is the verbatim
+    agent output already decoded from the note's authoritative blob."""
+    return {
+        "step": step,
+        "node": record.node,
+        "address": record.address or record.node,
+        "attempt": record.attempt,
+        "status": str(record.status),
+        "record_type": str(record.record_type),
+        "schema": record.schema,
+        "producer": record.producer,
+        "consumes": list(record.consumes or []),
+        "content_hash": record.content_hash,
+        "timestamp": record.timestamp,
+        "output": record.output,
+    }
+
+
+def get_run_snapshot(run_id, *, agent: Optional[str] = None, step: Any = None) -> Dict[str, Any]:
+    """Return one run's ordered, JSON-serializable snapshot — optionally filtered by agent/step.
+
+    A single OFFLINE read over the run's note SSOT: ``run_id`` is the run directory (the
+    ``FileVaultStateStore`` run dir whose ``*.md`` notes are the single source of truth). Records are
+    loaded via :func:`load_records` (the canonical deterministic at-rest order) and each is assigned
+    a 1-based ``step`` ordinal over the WHOLE run; the agent/node filter runs through the derived
+    :class:`~concursus.state.runindex.RunIndex` metadata index, and the step window is applied on
+    top. Returns::
+
+        {"run_id", "agent", "step", "total", "count", "records": [<row>, ...]}
+
+    where ``records`` are the selected rows in step order and ``total`` is the full log length. It is
+    a PURE read projection (INV-5): it re-derives everything from the append-only notes on each call,
+    opens no live plan, drives no dispatch, and mutates nothing — the at-rest, cross-process analogue
+    of :meth:`DirectorCockpit.snapshot`. An absent/empty run dir yields an empty snapshot."""
+    from .runindex import RunIndex  # lazy: keeps rundb import-light; runindex → statestore only
+
+    records = load_records(run_id)  # timestamp-ordered read over the note SSOT (offline)
+    step_of = {id(r): i for i, r in enumerate(records, start=1)}
+    pool = RunIndex.from_records(records).query(node=agent) if agent is not None else records
+
+    lo, hi = _normalize_step_window(step)
+    rows = [
+        _record_projection(r, step_of[id(r)])
+        for r in pool
+        if (lo is None or step_of[id(r)] >= lo) and (hi is None or step_of[id(r)] <= hi)
+    ]
+    rows.sort(key=lambda row: row["step"])
+    return {
+        "run_id": str(run_id),
+        "agent": agent,
+        "step": list(step) if isinstance(step, (tuple, list)) else step,
+        "total": len(records),
+        "count": len(rows),
+        "records": rows,
+    }
+
+
+def redact_snapshot(snapshot: Any, pattern: Any) -> Any:
+    """Return a deep copy of ``snapshot`` with every ``pattern`` match masked as ``[REDACTED]``.
+
+    An OPTIONAL egress guard for :func:`get_run_snapshot` output (or any JSON-serializable value): a
+    single compiled pattern is applied to every string in the structure (dict values, list items,
+    nested), each match replaced with the ``[REDACTED]`` sentinel. ``pattern`` may be a ``str``
+    (compiled here) or an already-compiled ``re.Pattern``. When at least one match is masked a WARN
+    is logged (so an operator sees that egress carried a secret), and the count is included. Pure and
+    read-only: it copies rather than mutating its input and touches no disk/network."""
+    compiled = re.compile(pattern) if isinstance(pattern, (str, bytes)) else pattern
+    masked = 0
+
+    def _walk(value: Any) -> Any:
+        nonlocal masked
+        if isinstance(value, str):
+            new, n = compiled.subn(_REDACTED, value)
+            masked += n
+            return new
+        if isinstance(value, dict):
+            return {k: _walk(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_walk(v) for v in value]
+        return value
+
+    redacted = _walk(snapshot)
+    if masked:
+        _LOG.warning(
+            "redact_snapshot masked %d match(es) of pattern %r before egress",
+            masked,
+            getattr(compiled, "pattern", pattern),
+        )
+    return redacted

@@ -26,13 +26,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from concursus.state.distill import load_precedents
 from concursus.state.filevault import FileVaultStateStore, _SLIPBOX_TOPICS
 
 # The ordered scope stack, coarsest -> finest. A run/episode is a ``task``.
 SCOPE_LEVELS = ("org", "portfolio", "program", "task")
+
+# --- Control-surface verb taxonomy (-CS) -----------------------------
+# The verbs an agent-facing control surface can expose over the SSOT, split by blast radius.
+#
+# READ verbs are pure projections over the append-only log / frozen plan / durable precedents:
+# querying the plan order, tailing the run log, running run-db FTS, retrieving precedents. They
+# are ALWAYS available (they mutate nothing and touch no actuator) and need no authorization.
+#
+# ACTUATING verbs each drive an EXISTING actuator (deploy -> provision, run -> Supervisor.run,
+# recompile -> assembler). ``recompile`` is additionally RECURSIVE (it re-enters the compiler
+# front). These are gated by NON-REGISTRATION: a verb the compiled scope does not authorize is
+# simply ABSENT from the surface (there is no disabled/deny stub to bypass) and, when present, is
+# additionally guarded by an explicit activation gate + the monotonic TrustGrade clamp.
+READ_VERBS: FrozenSet[str] = frozenset({"query_plan", "tail_log", "search_runs", "precedents"})
+ACTUATING_VERBS: FrozenSet[str] = frozenset({"deploy", "run", "recompile"})
+# The subset of actuating verbs that re-enter the compiler (recursive) — held to the strictest gate.
+RECURSIVE_VERBS: FrozenSet[str] = frozenset({"recompile"})
 
 # The trail_id addressing separator. A trail_id is a scope address: its
 # segments fill the levels top-down (org first); a bare token is a task-less
@@ -125,6 +142,71 @@ class ScopeAddress:
     def to_dict(self) -> Dict[str, str]:
         """The address as a plain, JSON-serializable dict keyed by level."""
         return {level: getattr(self, level) for level in SCOPE_LEVELS}
+
+
+# --------------------------------------------------------------------------- control scope
+@dataclass(frozen=True)
+class ControlScope:
+    """The compiled authorization bound for an agent-facing control surface (-CS).
+
+    A frozen VALUE derived ONCE from a compiled plan/scope — NEVER from an env var or a live
+    mutable flag. It records which :data:`ACTUATING_VERBS` the compiled scope authorized and the
+    compiled :class:`~concursus.build.trust.TrustGrade` ceiling. :class:`READ_VERBS` are
+    implicit and always present, so they are not stored here.
+
+    Non-registration is the gate: a verb absent from ``actuating`` is simply NOT bound onto the
+    surface (there is no disabled stub to route around). This object never touches the plan, an
+    actuator, AWS, or a run log; it is a pure descriptor.
+    """
+
+    #: The actuating verbs the compiled scope authorized (subset of :data:`ACTUATING_VERBS`).
+    actuating: FrozenSet[str] = frozenset()
+    #: The compiled TrustGrade ceiling as an int (0-3). A surface may clamp DOWN, never above it.
+    #: ``None`` => no trust ceiling was compiled (dangerous verbs must then be activated explicitly).
+    trust_ceiling: Optional[int] = None
+    #: The frozen plan's revision the bound was compiled from (provenance; never re-derived).
+    revision: Optional[int] = None
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: Any,
+        *,
+        authorize: Optional[Any] = None,
+        trust_ceiling: Optional[Any] = None,
+    ) -> "ControlScope":
+        """Compile a control bound from a FROZEN ``plan`` (+ optional operator authorization).
+
+        The available actuating verbs are resolved from the compiled plan/scope, NOT an env var:
+        by default a plan authorizes NO actuating verb (read-only, offline — the safe floor). An
+        operator may pass ``authorize`` (an iterable of verb names, or a plan attribute is read
+        from ``plan.control_verbs`` when present) to bind specific actuating verbs; anything not in
+        :data:`ACTUATING_VERBS` is dropped. The ``trust_ceiling`` is taken from the argument, else
+        from ``plan.trust_ceiling`` when the frozen plan carries one, else ``None``.
+
+        Pure: reads only plain attributes off the value; drives nothing.
+        """
+        raw = authorize
+        if raw is None:
+            raw = getattr(plan, "control_verbs", None)
+        verbs = frozenset(str(v) for v in (raw or ())) & ACTUATING_VERBS
+        ceiling = trust_ceiling
+        if ceiling is None:
+            ceiling = getattr(plan, "trust_ceiling", None)
+        ceiling_int = int(ceiling) if ceiling is not None else None
+        return cls(
+            actuating=verbs,
+            trust_ceiling=ceiling_int,
+            revision=getattr(plan, "revision", None),
+        )
+
+    def available_verbs(self) -> FrozenSet[str]:
+        """Every verb the surface exposes: the always-on read verbs + authorized actuating verbs."""
+        return READ_VERBS | self.actuating
+
+    def authorizes(self, verb: str) -> bool:
+        """Whether ``verb`` is bound: read verbs always, actuating verbs only when compiled in."""
+        return verb in READ_VERBS or verb in self.actuating
 
 
 # --------------------------------------------------------------------------- program-grain synthesis

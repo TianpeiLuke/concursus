@@ -35,9 +35,9 @@ correct-but-inert without one. Pure stdlib.
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Mapping, Optional, Sequence
 
-from ..core.dag import AgentDAG
+from ..core.dag import AgentDAG, DAGError
 from .dks_engine import DKSEngine
 from .inner_graph import (
     InnerGraphDigest,
@@ -208,6 +208,87 @@ def _node_name(hyp: Hypothesis, hid: str) -> str:
     return f"{base}__{suffix}"
 
 
+# --------------------------------------------------------------------------- OPT-IN: static fan-out unroll
+def unroll_static_fanout(
+    dag: AgentDAG,
+    unroll: Optional[Mapping[str, int]] = None,
+) -> AgentDAG:
+    """Compile-time virtualization: unroll STATICALLY-BOUNDED fan-out into frozen parallel branches.
+
+    OPT-IN and DEFAULT-OFF. Given ``unroll = {base_node: N}`` (a DECLARED, data-INDEPENDENT fan-out
+    count ``N``), each named ``base`` node is expanded, IN THIS ONE COMPILE PASS, into ``N`` frozen
+    parallel branches — the sub-node is cloned under namespaced ids ``f"{base}__fe{i}"`` (``i`` in
+    ``0..N-1``) — plus:
+
+    * a **scatter**: every upstream producer of ``base`` fans its (shared) input to all ``N`` clones,
+      so the branches read the same inputs (a static shared-input scatter, not a runtime split); and
+    * a **gather**: a synthetic join node ``f"{base}__gather"`` that collects the ``N`` clone outputs,
+      onto which every original downstream consumer of ``base`` is re-pointed.
+
+    The result is a NEW frozen :class:`AgentDAG` whose :meth:`~concursus.core.dag.AgentDAG.validate`
+    passes, so the static :class:`~concursus.supervisor.Supervisor` runs the ``N`` branches + the
+    gather in ONE pass over the frozen ``plan.order`` — NO runtime graph mutation, NO dynamic split.
+    This is purely a compile-time rewrite of the topology BEFORE ``assemble`` freezes it.
+
+    Gating (INV — default path byte-for-byte unchanged):
+
+    * ``unroll`` absent / empty => the input ``dag`` is returned UNCHANGED (same object), so a caller
+      that never asks for unrolling gets a byte-identical plan.
+    * Only ``N >= 2`` unrolls (``N == 1`` is a degenerate no-op: the base node is left in place); a
+      base id not present in ``dag`` or a non-int / ``N < 1`` count raises :class:`DAGError` (a
+      spec error, caught at compile, never a silent mis-compile). Unbounded / data-dependent fan-out
+      is OUT of scope — ``N`` MUST be a declared static bound.
+    """
+    if not unroll:
+        return dag  # default: no spec => byte-for-byte unchanged (same object)
+
+    # Validate the spec up front (fail closed on a bad declared bound) before any rewrite.
+    for base, count in unroll.items():
+        if base not in dag.nodes:
+            raise DAGError(f"unroll spec names unknown node {base!r} (add it to the DAG first)")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise DAGError(
+                f"unroll[{base!r}] must be a declared static fan-out int >= 1 (got {count!r}); "
+                "unbounded / data-dependent fan-out is out of scope"
+            )
+
+    targets = {base: n for base, n in unroll.items() if n >= 2}  # N==1 => degenerate no-op
+
+    out = AgentDAG()
+    # 1) Nodes: clone each unrolled base into N branch nodes + a gather; copy the rest verbatim.
+    for node in dag.nodes:
+        n = targets.get(node)
+        if n is None:
+            out.add_node(node)
+            continue
+        for i in range(n):
+            out.add_node(f"{node}__fe{i}")
+        out.add_node(f"{node}__gather")
+
+    # 2) Edges: rewrite each original edge around the unrolled bases.
+    #    - producer -> base            becomes producer -> every clone (SCATTER shared input)
+    #    - base -> consumer            becomes gather -> consumer (GATHER feeds downstream)
+    #    - producer/consumer both plain edges copy verbatim.
+    for frm, to in dag.edges:
+        frm_n = targets.get(frm)
+        to_n = targets.get(to)
+        srcs = [f"{frm}__gather"] if frm_n is not None else [frm]
+        dsts = (
+            [f"{to}__fe{i}" for i in range(to_n)] if to_n is not None else [to]
+        )
+        for s in srcs:
+            for d in dsts:
+                out.add_edge(s, d)
+
+    # 3) Gather wiring: each clone feeds its base's synthetic gather (the synthetic join).
+    for base, n in targets.items():
+        gather = f"{base}__gather"
+        for i in range(n):
+            out.add_edge(f"{base}__fe{i}", gather)
+
+    return out.validate()
+
+
 # --------------------------------------------------------------------------- AI-31: the driver
 def form_plan(
     trail: HypothesisTrail,
@@ -292,4 +373,4 @@ def _lower_roots(
     return merged.validate()
 
 
-__all__ = ["seed", "lower_to_dag", "form_plan", "Investigator"]
+__all__ = ["seed", "lower_to_dag", "unroll_static_fanout", "form_plan", "Investigator"]

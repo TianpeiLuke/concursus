@@ -32,6 +32,13 @@ class ManifestError(ValueError):
 #: against a newer compiler). Bump this only when the manifest schema itself changes.
 MAX_SUPPORTED_CONTRACT_VERSION = 1
 
+#: The valid literals for an :class:`AgentManifest`'s OPTIONAL ``context_mode`` — the per-agent
+#: content-reuse policy. ``"reuse"`` = this node's prior content may be reused; ``"isolation"`` =
+#: always re-provision (never reuse); ``""`` = INHERIT (defer to a team/group default, then a
+#: hardcoded ``"isolation"`` floor — see
+#: :func:`~concursus.core.resolve.resolve_context_mode`).
+CONTEXT_MODES = ("", "reuse", "isolation")
+
 
 @dataclass(frozen=True)
 class AgentCapabilities:
@@ -125,6 +132,13 @@ class AgentManifest:
         contract_version: OPTIONAL manifest-schema revision this ``.agent.yaml`` was
             authored against; defaults to :data:`MAX_SUPPORTED_CONTRACT_VERSION`. ``validate``
             fails closed if it exceeds what this compiler supports.
+        context_mode: OPTIONAL per-agent content-reuse policy — one of ``"reuse"`` (this node's
+            already-stood-up content may be reused), ``"isolation"`` (always re-provision this node,
+            never reuse a prior deployment's content), or ``""`` (INHERIT — the default; defer to a
+            team/group default, then a hardcoded ``"isolation"`` floor, via
+            :func:`~concursus.core.resolve.resolve_context_mode`). The empty default is
+            purely inherit and takes NO action on its own, so an absent ``context_mode:`` is
+            byte-for-byte identical to before.
     """
 
     name: str
@@ -136,6 +150,7 @@ class AgentManifest:
     escalate_boundary: str = ""
     capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
     contract_version: int = MAX_SUPPORTED_CONTRACT_VERSION
+    context_mode: str = ""
 
     # -- accessors ----------------------------------------------------------
     @property
@@ -210,6 +225,12 @@ class AgentManifest:
                 f"{self.name}: capabilities must be an AgentCapabilities (got "
                 f"{type(self.capabilities).__name__})"
             )
+        # Reject an invalid content-reuse policy literal (the empty default is INHERIT, always OK).
+        if self.context_mode not in CONTEXT_MODES:
+            raise ManifestError(
+                f"{self.name}: context_mode must be one of {list(CONTEXT_MODES)!r} "
+                f"('' = inherit) (got {self.context_mode!r})"
+            )
         return self
 
     # -- construction -------------------------------------------------------
@@ -242,6 +263,7 @@ class AgentManifest:
             escalate_boundary=str(data.get("escalate_boundary", "") or ""),
             capabilities=capabilities,
             contract_version=contract_version,
+            context_mode=str(data.get("context_mode", "") or ""),
         )
 
     @classmethod

@@ -61,15 +61,32 @@ from concursus.core.manifest import AgentManifest
 from concursus.execute.supervisor import InvokeFn, Supervisor
 from concursus.governor.state import GovernorState
 from concursus.state.statestore import (
+    RUN_EVENT_KINDS,
     InProcessStateStore,
     MemoryStateStore,
+    RunEvent,
+    RunEventKind,
     StateStore,
     content_hash,
+    list_pending_notices,
 )
 
 # The fixed governor cycle nodes (the linear chain; ``synthesize`` is the terminal node reached
 # from the routing edge after ``collect``).
 GOV_NODES = ("planner", "router", "run_episode", "collect")
+
+# The CLOSED set of run-event kinds this loop's opt-in ``EventSink`` emitter emits at episode
+# boundaries. It is shared with the readers via the single :class:`RunEventKind` vocabulary; the
+# build-time drift guard :func:`check_run_event_alignment` (exercised in
+# ``tests/test_run_event_contract.py``) asserts every kind here is a member of ``RUN_EVENT_KINDS``,
+# so an emitter/reader mismatch fails at test/build time rather than silently at runtime.
+GOV_EVENT_KINDS = frozenset(
+    (
+        RunEventKind.EPISODE_START.value,
+        RunEventKind.EPISODE_END.value,
+        RunEventKind.DECISION.value,
+    )
+)
 
 # Routing sentinel for the pure-Python fallback driver (mirrors langgraph's END).
 _END = "__end__"
@@ -136,9 +153,14 @@ class EventSink(Protocol):
 
     The governor emits a small plain-dict event at each episode boundary — ``episode_start`` (before
     a Supervisor episode runs), ``episode_end`` (after ``collect`` folds the episode's outputs into
-    the log), and ``decision`` (the bounded routing verdict after ``collect``). An event is a VALUE
-    (``{"type", "run_id", ...}``), never a live ctx/plan handle, so a sink can never reach inside a
-    running Supervisor or mutate a frozen plan (INV-1/INV-3/INV-5).
+    the log), and ``decision`` (the bounded routing verdict after ``collect``). Each event is a
+    frozen typed VALUE — a :class:`~concursus.state.statestore.RunEvent` whose ``type`` is a member
+    of the closed :class:`~concursus.state.statestore.RunEventKind` vocabulary — never a live
+    ctx/plan handle, so a sink can never reach inside a running Supervisor or mutate a frozen plan
+    (INV-1/INV-3/INV-5). Emitter and readers share that ONE closed vocabulary; the build-time drift
+    guard :func:`~concursus.state.statestore.check_run_event_alignment` (see
+    ``tests/test_run_event_contract.py``) fails if the emitter ever sends a kind the readers don't
+    know.
 
     Wiring a sink is strictly opt-in: the default is None (interpreted as no-op — nothing is
     emitted, no method is called), so the default loop is byte-for-byte unchanged. The shipped
@@ -146,7 +168,7 @@ class EventSink(Protocol):
     swallowed by the loop so a misbehaving sink can never break a live episode or the bound.
     """
 
-    def emit(self, event: Dict[str, Any]) -> None:
+    def emit(self, event: RunEvent) -> None:
         ...  # pragma: no cover - Protocol
 
 
@@ -158,7 +180,7 @@ class NullEventSink:
     touches ctx, the frozen plan, or the append-only log.
     """
 
-    def emit(self, event: Dict[str, Any]) -> None:  # noqa: D401 - trivial no-op
+    def emit(self, event: RunEvent) -> None:  # noqa: D401 - trivial no-op
         return None
 
 
@@ -994,8 +1016,8 @@ class GovernorLoop:
         return ctx
 
     # ================================================= OPT-IN boundary gate + event sink
-    def _boundary_view(self, ctx: dict, *, event_type: str) -> Dict[str, Any]:
-        """A read-only plain-dict VALUE describing the current episode boundary.
+    def _boundary_view(self, ctx: dict, *, event_type: str) -> RunEvent:
+        """A read-only typed :class:`RunEvent` VALUE describing the current episode boundary.
 
         Copies scalars out of ``ctx`` and RE-DERIVES the completed/frontier sets from the append-only
         log + the frozen plan's order (never a live ctx/frozen-plan handle), so neither the gate nor
@@ -1046,15 +1068,27 @@ class GovernorLoop:
         return None
 
     def _emit_event(self, event_type: str, ctx: dict, **extra: Any) -> None:
-        """Emit an episode-BOUNDARY event to the OPT-IN sink (default no-op).
+        """Emit a typed :class:`RunEvent` at an episode BOUNDARY to the OPT-IN sink (default no-op).
 
         No-op when no sink is configured (default), so the GovernorResult is byte-identical to a
-        sink-free run. The event is a plain-dict VALUE (never a live ctx/plan handle). Any sink
-        exception is swallowed so a misbehaving observer can never break a live episode or the bound.
+        sink-free run. The event is a typed VALUE (a :class:`RunEvent`; never a live ctx/plan
+        handle). The emitted ``type`` is a member of the closed :class:`RunEventKind` vocabulary the
+        readers expect — :data:`GOV_EVENT_KINDS` — so a drifted emitter kind fails a
+        :func:`check_run_event_alignment` build guard rather than reaching a reader at runtime; the
+        cheap membership assertion here (only on the sink-wired path, so the default stays
+        byte-identical) surfaces a self-emitted mismatch immediately. Any sink exception is swallowed
+        so a misbehaving observer can never break a live episode or the bound.
         """
         sink = self._event_sink
         if sink is None:
             return
+        # Emitter/reader contract: every kind this loop emits must be in the closed vocabulary the
+        # readers switch on (mirrors the compiler's check_alignment edge gate). An AssertionError here
+        # means the emitter drifted — a bug the contract test is designed to catch at build time.
+        assert event_type in GOV_EVENT_KINDS, (
+            f"emitter run-event kind {event_type!r} is not in the closed vocabulary "
+            f"{sorted(GOV_EVENT_KINDS)}"
+        )
         event = self._boundary_view(ctx, event_type=event_type)
         if extra:
             event.update(extra)
@@ -1062,6 +1096,29 @@ class GovernorLoop:
             sink.emit(event)
         except Exception:  # noqa: BLE001 - an observer error must never break the bounded loop
             pass
+
+    def _read_pending_notices(self, ctx: dict) -> List[str]:
+        """Read the OPT-IN coordination notices at THIS episode boundary; re-validate for staleness.
+
+        A PURE read over the append-only :class:`StateStore` log (INV-5): it hands
+        ``store.records()`` and the freshly-sampled ``store.completed()`` terminal set to
+        :func:`~concursus.state.statestore.list_pending_notices`, which returns only the notices whose
+        referenced node is NOT yet terminal (a notice about a finished node is stale and dropped) —
+        the "read + re-validate" step. It SELECTS nothing, dispatches nothing, and mutates neither the
+        log nor the frozen plan; marking a notice consumed is a separate follow-up append, never done
+        here.
+
+        Opt-in by ABSENCE: when the log carries ZERO coordination records the pending list is empty,
+        so nothing is stashed on ``ctx`` and the default loop (which never appends a notice) is
+        byte-for-byte unchanged. Only when notices exist is the surfaced set recorded on
+        ``ctx["pending_notices"]`` for read-only observability. Returns the sorted referenced-node ids.
+        """
+        pending = list_pending_notices(self._store.records(), self._store.completed())
+        if not pending:
+            return []
+        nodes = sorted({n for n in (r.producer for r in pending) if n})
+        ctx["pending_notices"] = nodes
+        return nodes
 
     def _run_episode(self, ctx: dict) -> dict:
         """RUN_EPISODE: run one static Supervisor pass over the current frozen plan (INV-1).
@@ -1079,6 +1136,13 @@ class GovernorLoop:
         short-circuits and the routing edge finalizes at ``synthesize``. The gate can only stop the
         bounded loop EARLIER, never extend it.
         """
+        # -- OPT-IN coordination-notice read: re-validated at episode START (never mid-episode) --
+        # A PURE staleness read over the append-only log: list the opt-in coordination notices whose
+        # referenced node is NOT already terminal (re-validated against store.completed() THIS
+        # boundary, so a notice about a finished node is dropped). It stashes nothing and dispatches
+        # nothing when there are ZERO coordination records — the default loop is byte-for-byte
+        # unchanged. Marking a notice consumed is a separate follow-up append, never a mutation here.
+        self._read_pending_notices(ctx)
         # -- OPT-IN episode-boundary gate: consulted BEFORE dispatch (never mid-episode) --------
         gate_stop = self._consult_gate(ctx)
         if gate_stop:

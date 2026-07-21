@@ -880,6 +880,64 @@ def test_run_parallel_rejects_non_positive():
         sup.run({"uri": "s3://doc"}, parallel=0)
 
 
+def test_run_parallel_clamped_to_cpu_capacity(monkeypatch):
+    # A huge soft `parallel` request is CLAMPED to the host CPU capacity (min(pref, cap)) — the
+    # pool width shrinks, but the dispatched node set (and thus the store) is byte-for-byte
+    # identical to the serial pass. Capacity is stubbed so the test is host-independent.
+    import concursus.execute.supervisor as sup_mod
+
+    captured = {}
+    real_pool = sup_mod.ThreadPoolExecutor
+
+    def _spy_pool(*args, **kwargs):
+        captured["max_workers"] = kwargs.get("max_workers", args[0] if args else None)
+        return real_pool(*args, **kwargs)
+
+    monkeypatch.setattr(sup_mod, "_cpu_capacity", lambda: 2)
+    monkeypatch.setattr(sup_mod, "ThreadPoolExecutor", _spy_pool)
+
+    dag, manifests = _diamond()
+    serial_store = InProcessStateStore()
+    Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=FakeInvoker(_diamond_outputs()),
+        arns=_DIAMOND_ARNS, state_store=serial_store,
+    ).run({"seed": "s3://doc"}, parallel=1)
+
+    par_store = InProcessStateStore()
+    par_out = Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=FakeInvoker(_diamond_outputs()),
+        arns=_DIAMOND_ARNS, state_store=par_store,
+    ).run({"seed": "s3://doc"}, parallel=1000)  # far above capacity → clamped to 2
+
+    # The pool was capped at the CPU capacity, not the huge soft request.
+    assert captured["max_workers"] == 2
+    # Clamping only narrows pool WIDTH: the run result and store are identical to serial.
+    assert par_out == {n: serial_store.get(n) for n in par_store.completed()}
+    assert par_store.completed() == serial_store.completed() == {"a", "b", "c", "d"}
+
+
+def test_run_parallel_one_is_never_clamped_to_parallel_path(monkeypatch):
+    # DEFAULT/serial guard: even if capacity were 1, parallel=1 stays the serial pass and never
+    # enters _run_parallel (byte-for-byte unchanged).
+    import concursus.execute.supervisor as sup_mod
+
+    monkeypatch.setattr(sup_mod, "_cpu_capacity", lambda: 1)
+    called = {"parallel": False}
+    orig = Supervisor._run_parallel
+
+    def _spy(self, inputs, parallel):
+        called["parallel"] = True
+        return orig(self, inputs, parallel)
+
+    monkeypatch.setattr(Supervisor, "_run_parallel", _spy)
+    dag, manifests = _chain()
+    out = Supervisor(
+        _plan(dag, manifests), manifests, invoke_fn=FakeInvoker(_fake_outputs()), arns=_ARNS
+    ).run({"uri": "s3://doc"}, parallel=1)
+    assert called["parallel"] is False  # serial path only
+    assert set(out) == {"ingest", "summarize", "critique"}
+
+
 # -- B3: output-acceptance QA contract ---------------------------
 def test_check_acceptance_unit_rules():
     """check_acceptance enforces each declarative rule; a field with no acceptance is unconstrained."""

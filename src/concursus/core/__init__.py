@@ -1,0 +1,1 @@
+"""concursus.core subpackage."""

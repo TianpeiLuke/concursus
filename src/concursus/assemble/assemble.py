@@ -1,0 +1,525 @@
+"""The **assembler** — compile an ``AgentDAG`` + manifests into a provisioning plan.
+
+This is the offline convergence point of the core: it validates the topology and every
+manifest, type-gates the declared ``depends_on`` edges (:func:`concursus.resolve.check_alignment`),
+compiles each edge into :class:`~concursus.resolve.AgentRef` wiring, synthesizes one
+:class:`~concursus.build.BuildPlanEntry` per node, and orders the nodes for dispatch. The
+resulting :class:`ProvisioningPlan` is a pure, JSON-serializable preview (a ``concursus plan``)
+— no AWS is touched here; deploy + the supervisor consume the plan downstream.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Set
+
+from ..core import resolve
+from ..build.build import BuildPlanEntry, RuntimeBuilderFactory
+from ..core.resolve import AgentRef
+
+if TYPE_CHECKING:  # pragma: no cover - hints only; keeps the runtime import graph pure
+    from ..core.dag import AgentDAG
+    from ..core.manifest import AgentManifest
+    from ..state.precedent import PrecedentRetriever
+
+#: Default ceiling on monotonic re-compiles (AI-20). The plan-generation feedback edge lives
+#: AROUND ``assemble`` (run -> distill -> precedent -> next compile); this cap makes that outer
+#: loop BOUNDED so a mis-behaving planner can never re-compile without end.
+DEFAULT_MAX_REVISIONS = 16
+
+
+class AssemblyError(ValueError):
+    """Raised when a DAG/manifest set cannot be compiled into a provisioning plan."""
+
+
+class MonotonicityError(AssemblyError):
+    """Raised when a re-compile would edit, remove, or reorder an already-executed node.
+
+    The adaptive-compiler contract (AI-20): every plan mutation is a BOUNDED, MONOTONIC
+    re-compile that emits a fully-frozen SUPERSET plan pinning already-executed nodes; an edit
+    to (or removal / reordering of) a node the supervisor has already run is rejected here rather
+    than silently replayed differently — resume must stay a faithful replay of the prior plan.
+    """
+
+
+@dataclass
+class ProvisioningPlan:
+    """The compiled orchestration plan for one agent team.
+
+    Attributes:
+        order: A valid dispatch order (topological sort of the DAG).
+        entries: ``{node_id: BuildPlanEntry}`` — the packaging + ``create_agent_runtime``
+            params for each agent.
+        wiring: ``{node_id: [AgentRef, ...]}`` — resolved producer→consumer data edges.
+    """
+
+    order: List[str] = field(default_factory=list)
+    entries: Dict[str, BuildPlanEntry] = field(default_factory=dict)
+    wiring: Dict[str, List[AgentRef]] = field(default_factory=dict)
+    #: Read-only cross-run precedent context (AI-17), surfaced for the plan author (AI-22) to
+    #: consult. Empty by default. This NEVER participates in the compiled topology — ``order`` /
+    #: ``entries`` / ``wiring`` are computed identically whether or not it is populated; it is
+    #: pure advisory context attached alongside the frozen plan.
+    precedents: List[dict] = field(default_factory=list)
+    #: Monotonic re-compile counter (AI-20). ``0`` for a first ``assemble``; each
+    #: :meth:`OrchestrationAssembler.recompile` emits a FRESH plan with ``revision`` one higher
+    #: than the prior plan, bounded by ``max_revisions``. Surfaced in :meth:`to_dict` ONLY when
+    #: non-zero, so a first-compile plan's preview is byte-for-byte unchanged.
+    revision: int = 0
+    #: The scheduler's cleared-frontier set for THIS revision ( P4.2) — the nodes the
+    #: router bound + cleared to dispatch this round (``FrontierProposal.compile_next`` /
+    #: ``propose_bindings`` DISPATCH nodes). READ-ONLY ADVISORY: it NEVER changes ``order`` /
+    #: ``entries`` / ``wiring`` (the topology is identical with or without it — the monotonic
+    #: superset is preserved), it merely RECORDS on the frozen plan which frontier the scheduler
+    #: cleared, closing the previously-dead ``compile_next`` channel. Empty by default -> ``to_dict``
+    #: byte-for-byte unchanged.
+    frontier: List[str] = field(default_factory=list)
+    #: The per-node frozen PAYLOAD contract ( F1) — ``{node: {static_context,
+    #: trust_tier}}``, authored by ``assemble`` when a ``payload_tier_fn`` is wired (opt-in). This
+    #: is *dimension 2/3* of the payload contract (the tiered coaching context + trust tier); it
+    #: NEVER changes ``order`` / ``entries`` / ``wiring`` (the topology is identical with or without
+    #: it — a pure additive annotation on the frozen plan). Empty by default -> ``to_dict`` /
+    #: ``to_summary_dict`` byte-for-byte unchanged. The Supervisor may read it (F3) to build the
+    #: invoke payload; the capture session persists it (Phase 3 I1).
+    payload_contract: Dict[str, dict] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        """Render the plan as a JSON-serializable dict (for a ``concursus plan`` preview).
+
+        The compiled topology (``order`` / ``entries`` / ``wiring``) is always present; the
+        read-only ``precedents``/``frontier`` fields are emitted ONLY when non-empty, so a plan
+        compiled with no retriever and no scheduler frontier is byte-for-byte unchanged.
+        """
+        out = {
+            "order": list(self.order),
+            "entries": {name: entry.to_dict() for name, entry in self.entries.items()},
+            "wiring": {
+                node: [asdict(ref) for ref in refs] for node, refs in self.wiring.items()
+            },
+        }
+        if self.precedents:
+            out["precedents"] = [dict(p) for p in self.precedents]
+        if self.revision:
+            out["revision"] = self.revision
+        if self.frontier:
+            out["frontier"] = list(self.frontier)
+        if self.payload_contract:
+            out["payload_contract"] = {n: dict(c) for n, c in self.payload_contract.items()}
+        return out
+
+    def to_summary_dict(self) -> dict:
+        """A COMPACT, navigable projection of the plan for a durable plan note (AI-18).
+
+        Unlike :meth:`to_dict` (the full, byte-exact ``concursus plan`` preview that inlines each
+        :class:`~concursus.build.BuildPlanEntry`'s ``wrapper`` source, ``dockerfile``, and
+        ``create_agent_runtime`` request — potentially megabytes), this DROPS those bulky deploy
+        payloads, keeping only a per-node **hosting digest** (``build_mode`` / ``protocol`` /
+        ``port`` / ``fingerprint`` / ``ecr_repo`` + whether a wrapper/dockerfile was synthesized).
+        The compiled topology (``order`` and the resolved ``wiring`` as ``producer→consumer``
+        edges) is preserved verbatim so a note can render the DAG. This is a read-only projection
+        of the *frozen* plan — it influences no dispatch and mutates nothing.
+        """
+        out = {
+            "order": list(self.order),
+            "wiring": {
+                node: [
+                    {"producer": ref.producer, "path": ref.path, "input_name": ref.input_name}
+                    for ref in refs
+                ]
+                for node, refs in self.wiring.items()
+            },
+            "entries": {
+                name: {
+                    "build_mode": entry.build_mode,
+                    "protocol": entry.invoke.get("protocol"),
+                    "port": entry.invoke.get("port"),
+                    "fingerprint": entry.fingerprint,
+                    "ecr_repo": entry.ecr_repo,
+                    "has_wrapper": entry.wrapper is not None,
+                    "has_dockerfile": entry.dockerfile is not None,
+                }
+                for name, entry in self.entries.items()
+            },
+        }
+        if self.payload_contract:
+            out["payload_contract"] = {n: dict(c) for n, c in self.payload_contract.items()}
+        return out
+
+
+class OrchestrationAssembler:
+    """Compile an :class:`~concursus.dag.AgentDAG` + manifests into a :class:`ProvisioningPlan`.
+
+    The assembler is pure and offline: given the topology and per-agent manifests it validates
+    everything, resolves the wiring, and synthesizes the build/deploy entries — it never imports
+    boto3 or calls AWS. ``account``/``region`` are threaded into the synthesized IAM roles so the
+    plan is previewable ahead of a real deploy.
+    """
+
+    def __init__(
+        self,
+        *,
+        account: Optional[str] = None,
+        region: Optional[str] = None,
+        precedent_retriever: Optional["PrecedentRetriever"] = None,
+        strict_types: bool = False,
+        single_writer: bool = False,
+        strict_fn: Optional[Callable[[str], bool]] = None,
+        payload_tier_fn: Optional[Callable[[str], Any]] = None,
+        full_input_cover: bool = False,
+    ) -> None:
+        self.account = account
+        self.region = region
+        #: Optional COMPILE-TIME, read-only precedent retriever (AI-17). When supplied, ``assemble``
+        #: retrieves relevant prior resolved runs BEFORE freezing and attaches them to the plan as
+        #: advisory context for the plan author (AI-22). It NEVER changes the compiled topology and
+        #: NEVER touches AWS or a run log. Default ``None`` keeps ``assemble`` byte-for-byte
+        #: unchanged (the feedback edge lives AROUND assemble, never inside ``Supervisor.run``).
+        self.precedent_retriever = precedent_retriever
+        #: OPT-IN deep-alignment gate ( B2). Default ``False`` keeps ``check_alignment`` at
+        #: its name-level gate (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile``
+        #: ALSO type-gate every ``depends_on`` edge (producer output type must be compatible with the
+        #: consumer input type); a concrete mismatch raises :class:`AlignmentError`. Conservative:
+        #: unknown/absent types pass, so it never rejects an un-annotated manifest. Compile-time only
+        #: — no runtime effect, INV-2 preserved.
+        self.strict_types = bool(strict_types)
+        #: OPT-IN single-writer gate ( B1). Default ``False`` keeps ``check_alignment`` at
+        #: its default (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile`` ALSO
+        #: reject a plan where any consumer input is fed by more than one ``depends_on`` edge (a
+        #: silent last-wins overwrite at run time). Compile-time only — INV-2 preserved.
+        self.single_writer = bool(single_writer)
+        #: OPT-IN adaptive-strictness dial ( B4). ``None`` (default) applies the enabled
+        #: deep gates (``strict_types`` / ``single_writer``) to EVERY node. When set, it is a
+        #: ``node -> bool`` predicate that NARROWS them to the nodes it returns truthy for — wire
+        #: :func:`~concursus.governor.make_trust_strictness` so WEAK/low-trust agents get the strict
+        #: contract and STRONG/high-trust ones get the lean path. Author/compile-time only (INV-2).
+        self.strict_fn = strict_fn
+        #: OPT-IN payload-tier authoring dial ( F1/F4). ``None`` (default) => no
+        #: ``payload_contract`` is authored and the plan is byte-for-byte unchanged. When set, a
+        #: ``node -> Tier`` selector (wire :func:`~concursus.governor.make_payload_tier`);
+        #: ``assemble`` authors, per node with a declared ``contract.context``, the tiered static
+        #: context (via :func:`~concursus.governor.project_context`) + the ``trust_tier`` into the
+        #: frozen ``ProvisioningPlan.payload_contract``. Author/compile-time only; it NEVER changes
+        #: ``order`` / ``entries`` / ``wiring`` (a pure additive annotation, INV-2/3 preserved).
+        self.payload_tier_fn = payload_tier_fn
+        #: OPT-IN full-input-cover gate ( F2). Default ``False`` keeps ``check_alignment``
+        #: at its name+edge gate (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile``
+        #: ALSO require every declared consumer input to have a compile-visible supplier (a
+        #: ``depends_on`` edge or a static ``contract.context`` key) — the b2 dimension-1
+        #: completeness quantifier. Compile-time only (INV-2).
+        self.full_input_cover = bool(full_input_cover)
+
+    def assemble(
+        self, dag: "AgentDAG", manifests: Dict[str, "AgentManifest"]
+    ) -> ProvisioningPlan:
+        """Validate, align, wire, and synthesize — returning the full provisioning plan.
+
+        Steps: (1) validate the DAG; (2) validate each manifest; (3) type-gate the
+        ``depends_on`` edges via :func:`concursus.resolve.check_alignment`; (4) compile the
+        wiring via :func:`concursus.resolve.resolve_edges`; (5) synthesize a
+        :class:`~concursus.build.BuildPlanEntry` per node; (6) order the nodes by
+        topological sort. Raises :class:`AssemblyError` if a node has no manifest, and
+        propagates the underlying validation/alignment errors otherwise.
+        """
+        dag.validate()
+        for manifest in manifests.values():
+            manifest.validate()
+        resolve.check_alignment(
+            dag, manifests, strict_types=self.strict_types,
+            single_writer=self.single_writer, strict_fn=self.strict_fn,
+            full_input_cover=self.full_input_cover,
+        )
+        wiring = resolve.resolve_edges(dag, manifests)
+
+        entries: Dict[str, BuildPlanEntry] = {}
+        for node in dag.nodes:
+            manifest = manifests.get(node)
+            if manifest is None:
+                raise AssemblyError(f"DAG node {node!r} has no manifest to provision")
+            entries[node] = RuntimeBuilderFactory.synthesize(
+                manifest, account=self.account, region=self.region
+            )
+
+        order = dag.topological_sort()
+
+        # AI-17 hook: retrieve read-only precedent context BEFORE freezing, purely as advisory
+        # input for the plan author. This is computed AFTER the topology is fully resolved and does
+        # NOT influence ``order`` / ``entries`` / ``wiring`` in any way — the compiled plan is
+        # identical to one produced without a retriever. Default (no retriever) => empty list, so
+        # the plan (and its ``to_dict``) is byte-for-byte unchanged.
+        precedents: List[dict] = []
+        if self.precedent_retriever is not None:
+            precedents = [
+                p.to_dict()
+                for p in self.precedent_retriever.retrieve(nodes=order)
+            ]
+
+        # F1/F4: author the per-node payload contract when a tier dial is wired. For each node with
+        # a declared ``contract.context``, record the TIERED static context (projected per the
+        # node's trust tier) + the tier name. Default (no tier_fn) => empty => byte-for-byte
+        # unchanged. Pure/additive: it reads manifests + the tier fn, never touches order/wiring.
+        payload_contract = self._author_payload_contract(order, manifests)
+
+        return ProvisioningPlan(
+            order=order, entries=entries, wiring=wiring, precedents=precedents,
+            payload_contract=payload_contract,
+        )
+
+    def _author_payload_contract(
+        self, order: List[str], manifests: Dict[str, "AgentManifest"]
+    ) -> Dict[str, dict]:
+        """Author the per-node payload contract (F1/F4). Empty when no ``payload_tier_fn`` is wired.
+
+        For each node whose manifest declares a non-empty ``contract.context``, project that context
+        down to the node's trust tier and record ``{node: {trust_tier, static_context}}``. Pure +
+        compile-time; wired via :func:`~concursus.governor.make_payload_tier`. A node with no
+        declared context contributes nothing (so a plan of un-annotated agents stays empty)."""
+        if self.payload_tier_fn is None:
+            return {}
+        from concursus.governor.scheduler import project_context
+
+        contract: Dict[str, dict] = {}
+        for node in order:
+            manifest = manifests.get(node)
+            context = getattr(manifest, "context", None) if manifest is not None else None
+            if not context:
+                continue
+            try:
+                tier = self.payload_tier_fn(node)
+                projected = project_context(context, tier)
+            except Exception:  # noqa: BLE001 - a bad dial must not break a compile
+                continue
+            tier_name = getattr(tier, "name", str(tier))
+            contract[node] = {"trust_tier": tier_name, "static_context": projected}
+        return contract
+
+    # -- AI-20: bounded, monotonic re-compile -------------------------------
+    def recompile(
+        self,
+        prior_plan: ProvisioningPlan,
+        *,
+        completed: Set[str],
+        content_hashes: Optional[Mapping[str, str]] = None,
+        dag: Optional["AgentDAG"] = None,
+        manifests: Optional[Dict[str, "AgentManifest"]] = None,
+        max_revisions: int = DEFAULT_MAX_REVISIONS,
+        compile_next: Optional[Iterable[str]] = None,
+    ) -> ProvisioningPlan:
+        """Emit a FRESH, FROZEN, MONOTONIC-SUPERSET plan superseding ``prior_plan`` (AI-20).
+
+        This is the ONLY sanctioned plan mutation: the plan-generation feedback edge lives AROUND
+        the compiler (run -> distill -> precedent -> next compile), never inside
+        :meth:`~concursus.supervisor.Supervisor.run`. It re-compiles ``dag`` + ``manifests`` into a
+        brand-new plan (a fresh ``assemble``), then guarantees monotonicity against the prior plan:
+
+        (a) **Pins** every already-executed node (present in ``completed``) to its PRIOR
+            ``entries``/``wiring`` entry, so a resumed run replays those nodes byte-identically.
+        (b) A :meth:`_check_monotonic` guard RAISES :class:`MonotonicityError` if the re-compile
+            would edit, remove, or reorder an already-executed node — or drop / reorder any
+            already-planned node (the prior ``order`` must survive as a subsequence).
+        (c) Is **bounded**: it refuses once the running ``revision`` would exceed ``max_revisions``.
+
+        The returned plan is a NEW frozen object with ``revision = prior_plan.revision + 1``; the
+        prior plan (and any running supervisor over it) is never mutated. ``content_hashes`` (an
+        optional ``{node: output content_hash}`` snapshot from the durable store) is accepted as
+        read-only provenance of what was executed; it does not relax the guard.
+
+        Args:
+            prior_plan: The frozen plan the current run replayed; its ``order``/``entries``/
+                ``wiring`` are the monotonic floor.
+            completed: The already-executed node ids (e.g. ``state_store.completed()``) — pinned.
+            content_hashes: Optional ``{node: content_hash}`` provenance for the executed outputs.
+            dag: The (possibly extended) topology to re-compile. Required.
+            manifests: The manifests to re-compile. Required.
+            max_revisions: The revision ceiling (default :data:`DEFAULT_MAX_REVISIONS`).
+            compile_next: Optional cleared-frontier node ids from the scheduler
+                (``FrontierProposal.compile_next`` / ``propose_bindings`` DISPATCH nodes). When
+                supplied, recorded on the returned plan's read-only ``frontier`` (P4.2, closing the
+                previously-dead channel); filtered to nodes present in the compiled topology. It
+                NEVER changes ``order``/``entries``/``wiring`` — the monotonic superset is preserved.
+
+        Raises:
+            MonotonicityError: on a non-monotonic edit or once the revision cap is exceeded.
+            AssemblyError: if ``dag`` / ``manifests`` are missing, or the fresh compile fails.
+        """
+        revision = int(prior_plan.revision) + 1
+        if revision > max_revisions:
+            raise MonotonicityError(
+                f"re-compile refused: revision {revision} exceeds max_revisions={max_revisions}; "
+                "the adaptive-compile loop is bounded — raise max_revisions to allow more passes"
+            )
+        if dag is None or manifests is None:
+            raise AssemblyError(
+                "recompile requires dag= and manifests= (the re-authored topology to compile)"
+            )
+
+        completed_set: Set[str] = set(completed)
+        fresh = self.assemble(dag, manifests)
+        self._check_monotonic(prior_plan, fresh, completed=completed_set)
+
+        # Pin executed nodes to their PRIOR entry/wiring (identical after the guard, but make the
+        # pin explicit so the frozen executed slice is provably the prior plan's, not a re-derived
+        # look-alike). Newly-added nodes take the freshly-compiled entry/wiring.
+        entries: Dict[str, BuildPlanEntry] = dict(fresh.entries)
+        wiring: Dict[str, List[AgentRef]] = dict(fresh.wiring)
+        for node in completed_set:
+            if node in prior_plan.entries:
+                entries[node] = prior_plan.entries[node]
+            if node in prior_plan.wiring:
+                wiring[node] = list(prior_plan.wiring[node])
+
+        # P4.2: record the scheduler's cleared frontier (compile_next) as READ-ONLY advisory
+        # metadata on the frozen plan — it does NOT alter order/entries/wiring (the monotonic
+        # superset above is untouched), it merely closes the dead compile_next channel by carrying
+        # WHICH frontier nodes the scheduler cleared this revision. A cleared node must be a real
+        # node of the compiled topology (a spec-error guard, not a topology change).
+        frontier: List[str] = []
+        if compile_next is not None:
+            order_set = set(fresh.order)
+            frontier = [n for n in compile_next if n in order_set]
+
+        # F5 re-tiering: the fresh compile re-authored payload_contract by re-reading the live tier
+        # dial (a promotion thins / a demotion thickens the not-yet-run nodes). But an already-EXECUTED
+        # node keeps the tier it actually ran with — pin its prior contract so the frozen executed
+        # slice is unchanged (INV-3). Not-yet-executed nodes carry the freshly re-tiered contract.
+        payload_contract: Dict[str, dict] = dict(fresh.payload_contract)
+        for node in completed_set:
+            if node in prior_plan.payload_contract:
+                payload_contract[node] = prior_plan.payload_contract[node]
+
+        return ProvisioningPlan(
+            order=fresh.order,
+            entries=entries,
+            wiring=wiring,
+            precedents=fresh.precedents,
+            revision=revision,
+            frontier=frontier,
+            payload_contract=payload_contract,
+        )
+
+    @staticmethod
+    def _check_monotonic(
+        prior: ProvisioningPlan, new: ProvisioningPlan, *, completed: Set[str]
+    ) -> None:
+        """Assert ``new`` is a monotonic superset of ``prior`` that leaves executed nodes intact.
+
+        Two invariants (see :class:`MonotonicityError`):
+
+        1. **Prior order survives as a subsequence** — no already-planned node is dropped, and the
+           prior nodes keep their exact relative order (new nodes may be interleaved). This forbids
+           reordering any node before an already-planned peer.
+        2. **Executed nodes are frozen** — for every node in ``completed``, its ``entries`` and
+           ``wiring`` in ``new`` must equal ``prior`` verbatim (no edit) and it must still be
+           present (no removal).
+        """
+        prior_order = list(prior.order)
+        new_order = list(new.order)
+        prior_set = set(prior_order)
+        new_set = set(new_order)
+
+        restricted = [n for n in new_order if n in prior_set]
+        if restricted != prior_order:
+            dropped = [n for n in prior_order if n not in new_set]
+            if dropped:
+                raise MonotonicityError(
+                    f"re-compile drops already-planned node(s) {dropped}; a monotonic re-compile "
+                    "may only ADD nodes, never remove them"
+                )
+            raise MonotonicityError(
+                "re-compile reorders already-planned nodes; the prior dispatch order "
+                f"{prior_order} must survive as a subsequence (got {restricted})"
+            )
+
+        for node in sorted(completed):
+            if node not in new_set:
+                raise MonotonicityError(
+                    f"re-compile removes already-executed node {node!r}; executed nodes must be "
+                    "pinned, never dropped"
+                )
+            if node in prior.entries and new.entries.get(node) != prior.entries.get(node):
+                raise MonotonicityError(
+                    f"re-compile edits already-executed node {node!r} (its BuildPlanEntry "
+                    "changed); executed nodes are frozen — route a change through a NEW node"
+                )
+            if list(prior.wiring.get(node, [])) != list(new.wiring.get(node, [])):
+                raise MonotonicityError(
+                    f"re-compile rewires already-executed node {node!r}; executed nodes are "
+                    "frozen — route a change through a NEW node"
+                )
+
+    # -- OPT-IN validate-and-retry budget (bounded by the recompile budget) --
+    @staticmethod
+    def retry_budget(
+        max_retries: int, *, max_revisions: int = DEFAULT_MAX_REVISIONS
+    ) -> int:
+        """The bounded re-drive count: a requested ``max_retries`` clamped to ``[0, max_revisions]``.
+
+        The validate-and-retry loop (:meth:`redrive_until_valid`) shares the SAME ceiling as the
+        monotonic recompile (:data:`DEFAULT_MAX_REVISIONS`), so BOTH of the OS's plan-author
+        feedback edges — re-compile a plan / re-drive a node — are bounded by one dial. A negative
+        request floors at ``0`` (no retry); a request above the ceiling is capped, so a caller can
+        never open an unbounded loop.
+        """
+        if max_retries < 0:
+            return 0
+        return min(int(max_retries), int(max_revisions))
+
+    def redrive_until_valid(
+        self,
+        node: str,
+        manifest: "AgentManifest",
+        drive_fn: Callable[[Dict[str, Any]], Any],
+        *,
+        base_context: Optional[Mapping[str, Any]] = None,
+        max_retries: int = 1,
+        max_revisions: int = DEFAULT_MAX_REVISIONS,
+        error_key: str = "validation_error",
+    ) -> Any:
+        """OPT-IN, BOUNDED validate-and-retry hook a caller may use to re-drive ONE node.
+
+        This is a helper a plan-author driver AROUND the compiler may call — it is NOT wired into
+        :meth:`assemble` / :meth:`recompile` (whose default output is byte-for-byte unchanged) and
+        it is NEVER inside :meth:`~concursus.execute.supervisor.Supervisor.run` (which stays a single
+        static pass over a frozen ``plan.order``). It re-drives a node whose output failed its
+        manifest-declared output schema (``contract["outputs"]``):
+
+        each attempt calls ``drive_fn(context)`` and shape-checks the result against
+        ``manifest.output_schema`` via :func:`~concursus.execute.supervisor.validate_output`; on a
+        :class:`~concursus.execute.supervisor.SchemaError` the failing reason is fed back into the
+        NEXT attempt's ``context`` under ``error_key`` and the node is re-driven. The first
+        schema-valid output is returned; the last ``SchemaError`` is re-raised once the budget is
+        exhausted.
+
+        This is a BOUNDED helper, NOT an unbounded in-node loop: the retry count is clamped by
+        :meth:`retry_budget` to the recompile/revision budget (``max_revisions``), so a total of at
+        most ``1 + retry_budget(max_retries)`` drives run. It touches no plan, no StateStore, and no
+        AWS — a purely functional loop the caller owns.
+
+        Args:
+            node: The node id being re-driven (for error context / caller bookkeeping).
+            manifest: The node's manifest; its ``output_schema`` is the gate.
+            drive_fn: ``context -> output`` — invokes the node with the (error-augmented) context.
+            base_context: Optional seed context for the FIRST attempt (copied, never mutated).
+            max_retries: Requested re-drives after the first attempt (clamped by ``max_revisions``).
+            max_revisions: The shared ceiling (default :data:`DEFAULT_MAX_REVISIONS`).
+            error_key: The context key under which the prior attempt's validation error is fed back.
+
+        Raises:
+            SchemaError: the last validation failure, once the bounded budget is exhausted.
+        """
+        from ..execute.supervisor import SchemaError, validate_output
+
+        budget = self.retry_budget(max_retries, max_revisions=max_revisions)
+        schema = manifest.output_schema
+        context: Dict[str, Any] = dict(base_context or {})
+        last_error: Optional[SchemaError] = None
+        for _ in range(budget + 1):  # 1 initial drive + up to `budget` bounded retries
+            result = drive_fn(context)
+            try:
+                validate_output(result, schema)
+                return result
+            except SchemaError as exc:
+                last_error = exc
+                context = dict(context)
+                context[error_key] = f"node {node!r} output failed its schema: {exc}"
+        assert last_error is not None  # budget+1 >= 1, so the loop ran at least once
+        raise last_error

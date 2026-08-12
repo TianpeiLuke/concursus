@@ -202,7 +202,8 @@ sub-agent. Four pieces, all compile-time or strictly-outer (never an in-`Supervi
   green unless the transfer ran and was accepted.
 
 Import from `concursus.state.transfer` (and `FanOutEventSink` from `concursus.governor`). Wire none
-of it and the run is byte-for-byte unchanged.
+of it and the run is byte-for-byte unchanged. See the full guide:
+[docs/knowledge-transfer.md](docs/knowledge-transfer.md).
 
 ## The governor (opt-in dynamic outer loop)
 

@@ -64,6 +64,7 @@ reasoning = [
 ]
 dev = [
     "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",  # the execute-tier tests (invoker/monitor/harness) are async
     "build>=1.0.0",
     "twine>=5.0.0",
     "black>=23.0.0",
@@ -100,3 +101,6 @@ target-version = ["py310", "py311", "py312"]
 minversion = "7.0"
 addopts = "-ra -q"
 testpaths = ["tests"]
+# The execute-tier tests (invoker / monitor / harness) use `@pytest.mark.asyncio`; strict mode
+# means only explicitly-marked coroutines run as async (no implicit auto-marking).
+asyncio_mode = "strict"

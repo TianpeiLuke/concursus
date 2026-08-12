@@ -5,8 +5,11 @@
     "contract",
     "contract_version",
     "escalate_boundary",
+    "monitor",
     "name",
+    "output_mapping",
     "registry",
+    "runtime",
     "side_effecting",
     "spec",
     "trust_seed"

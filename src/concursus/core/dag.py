@@ -9,7 +9,7 @@ the design (the analog of cursus's ``PipelineDAG``).
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
 
 class DAGError(ValueError):
@@ -33,13 +33,54 @@ class AgentDAG:
     def __init__(self) -> None:
         self._nodes: Set[str] = set()
         self._edges: List[tuple] = []  # (from_node, to_node)
+        #: Per-node authoring attributes — ``{id: {task, inputs, outputs}}``.
+        #: I/O is a NODE property, never an edge property: a node declares what it emits and what
+        #: it consumes, and an edge asserts only adjacency. :func:`resolve.check_alignment` remains
+        #: the sole authority that the producer's declared output satisfies the consumer's declared
+        #: input. Kept in a parallel map so :attr:`nodes` still returns ``List[str]`` and every
+        #: existing caller is untouched.
+        self._attrs: Dict[str, dict] = {}
 
     # -- construction -------------------------------------------------------
-    def add_node(self, name: str) -> "AgentDAG":
+    def add_node(
+        self,
+        name: str,
+        *,
+        task: "Optional[str]" = None,
+        inputs: "Optional[Dict[str, Any]]" = None,
+        outputs: "Optional[Dict[str, Any]]" = None,
+    ) -> "AgentDAG":
+        """Add a node, optionally with its authored task and declared I/O.
+
+        All three attributes are OPTIONAL and default to absent, so ``add_node("x")`` behaves
+        exactly as before. ``task`` is the per-node instruction the compiler vends to the agent.
+        ``inputs`` / ``outputs`` are flat field maps in the form
+        ``{field: {"type": ..., "content_type": ..., "required": ...}}`` — the same shape
+        :func:`resolve._field_type` and ``AgentHarness._write_outputs`` read, so one declaration
+        serves the edge gate, the artifact write, and the prompt.
+        """
         if not isinstance(name, str) or not name.strip():
             raise DAGError("node name must be a non-empty string")
         self._nodes.add(name)
+        attrs = {}
+        if task is not None:
+            attrs["task"] = str(task)
+        if inputs:
+            attrs["inputs"] = dict(inputs)
+        if outputs:
+            attrs["outputs"] = dict(outputs)
+        if attrs:
+            self._attrs.setdefault(name, {}).update(attrs)
         return self
+
+    def node_attrs(self, name: str) -> dict:
+        """The authored attributes for ``name`` — ``{}`` for a node added without any."""
+        return dict(self._attrs.get(name, {}))
+
+    @property
+    def attrs(self) -> "Dict[str, dict]":
+        """All authored node attributes, as ``{id: {task, inputs, outputs}}`` (copy)."""
+        return {n: dict(a) for n, a in self._attrs.items()}
 
     def add_edge(self, from_node: str, to_node: str) -> "AgentDAG":
         """Add a data dependency ``from_node -> to_node`` (to_node depends on from_node)."""
@@ -213,13 +254,48 @@ class AgentDAG:
 
     # -- serialization ------------------------------------------------------
     def to_dict(self) -> dict:
-        return {"nodes": self.nodes, "edges": [list(e) for e in self._edges]}
+        """Serialize to ``{nodes, edges}``, plus ``node_attrs`` only when some node has attributes.
+
+        Omitting an empty ``node_attrs`` keeps the payload byte-identical for every DAG authored
+        without per-node declarations, so existing snapshots and record artifacts do not move.
+        """
+        out: dict = {"nodes": self.nodes, "edges": [list(e) for e in self._edges]}
+        if self._attrs:
+            out["node_attrs"] = {n: dict(a) for n, a in self._attrs.items()}
+        return out
 
     @classmethod
     def from_dict(cls, data: dict) -> "AgentDAG":
+        """Lower ``{nodes, edges}`` into a DAG, accepting BOTH node forms.
+
+        A node may be a bare ``"id"`` string (the historical form — no declarations) or a mapping
+        ``{"id": ..., "task": ..., "inputs": {...}, "outputs": {...}}``. A bare string is exactly
+        equivalent to a mapping carrying only ``id``, so an authoring model that ignores the richer
+        contract still produces a valid plan. ``node_attrs`` is also accepted as a sidecar map for
+        round-tripping :meth:`to_dict`.
+        """
         dag = cls()
         for n in data.get("nodes", []):
-            dag.add_node(n)
+            if isinstance(n, Mapping):
+                node_id = n.get("id") or n.get("name")
+                if not isinstance(node_id, str) or not node_id.strip():
+                    raise DAGError(f"node mapping has no usable 'id': {dict(n)!r}")
+                dag.add_node(
+                    node_id,
+                    task=n.get("task"),
+                    inputs=n.get("inputs"),
+                    outputs=n.get("outputs"),
+                )
+            else:
+                dag.add_node(n)
+        for node_id, attrs in (data.get("node_attrs") or {}).items():
+            if node_id in dag._nodes and isinstance(attrs, Mapping):
+                dag.add_node(
+                    node_id,
+                    task=attrs.get("task"),
+                    inputs=attrs.get("inputs"),
+                    outputs=attrs.get("outputs"),
+                )
         for e in data.get("edges", []):
             dag.add_edge(e[0], e[1])
         return dag

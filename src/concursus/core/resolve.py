@@ -161,6 +161,50 @@ def _output_properties(schema: Dict[str, Any]) -> Set[str]:
     return set(schema.keys())
 
 
+def _input_fields(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Declared consumer-input fields of a (nested or flat) input schema, as a field map.
+
+    The canonical reading rule (same as outputs / :func:`validate_output`): when the schema
+    carries a ``properties`` dict, its keys are the fields (nested JSON-Schema form); otherwise
+    every top-level key except ``"required"`` is a field (flat shorthand). Returning the field
+    MAP (not just names) keeps :func:`_field_type` reads working off the same normalized table.
+    """
+    if not isinstance(schema, dict):
+        return {}
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        return props
+    return {k: v for k, v in schema.items() if k != "required"}
+
+
+def _declared_inputs(dag: Any, node: str, manifest: Any) -> Dict[str, Any]:
+    """The effective INPUT schema block for ``node`` — the PLAN's declaration is authoritative.
+
+    I/O is a per-node property, so the plan node's authored ``inputs`` is the source of truth: only
+    the plan author knows what shape *this* node must receive. ``manifest.inputs`` is consulted only
+    as a MIGRATION FALLBACK — it must stay until every plan declares its own I/O, because
+    :func:`check_alignment` *raises* when a producer does not declare a wired output field, so
+    reading solely from an undeclared DAG would reject every existing edge.
+    """
+    attrs = dag.node_attrs(node) if hasattr(dag, "node_attrs") else {}
+    declared = attrs.get("inputs")
+    if declared:
+        return dict(declared)
+    return getattr(manifest, "inputs", {}) or {}
+
+
+def _declared_outputs(dag: Any, node: str, manifest: Any) -> Dict[str, Any]:
+    """The effective OUTPUT schema block for ``node`` — plan declaration first, manifest fallback.
+
+    Same precedence and same migration caveat as :func:`_declared_inputs`.
+    """
+    attrs = dag.node_attrs(node) if hasattr(dag, "node_attrs") else {}
+    declared = attrs.get("outputs")
+    if declared:
+        return dict(declared)
+    return getattr(manifest, "output_schema", {}) or {}
+
+
 def _top_field(path_rest: str) -> str:
     """The top-level output field named by a ``from`` spec's remainder (first path segment)."""
     return re.split(r"[.\[]", path_rest, maxsplit=1)[0]
@@ -250,6 +294,7 @@ def check_alignment(
     strict_fn: "Optional[Callable[[str], bool]]" = None,
     full_input_cover: bool = False,
     require_capabilities: bool = False,
+    require_declared_io: bool = False,
 ) -> None:
     """Type-gate every ``depends_on`` edge; raise :class:`AlignmentError` on any violation.
 
@@ -296,9 +341,30 @@ def check_alignment(
     declares). A manifest with no ``spec.requires`` imposes nothing, so default off — and even on,
     an agent that requires nothing — is byte-for-byte the prior behavior. Author/compile-time only;
     it declares nothing about the run and never touches AWS (INV-2 preserved).
+
+    ``require_declared_io`` (default ``False``) adds the DECLARED-OR-REFUSE gate: every node must
+    declare a non-empty effective ``outputs`` block (see :func:`_declared_outputs`). It exists
+    because SILENCE IS NOT SAFE once the manifest fallback goes away: the harness enforces a node's
+    output contract by iterating that same schema
+    (:meth:`~concursus.execute.harness.AgentHarness._check_contract`), so an EMPTY schema
+    yields an empty loop — no required-field check, no artifact-shape check, and no error to say so.
+    That failure is silent in the one direction a compiler must never be quiet about. Turning this on
+    converts "nobody declared it" from a pass into a compile-time refusal, which is the precondition
+    for deleting the manifest's static I/O. Default off while plans are still being migrated to
+    per-node declarations. Author/compile-time only (INV-2 preserved).
     """
     for node, manifest in manifests.items():
-        consumer_inputs = manifest.inputs
+        # DECLARED-OR-REFUSE: an undeclared output schema disables runtime enforcement SILENTLY
+        # (harness._check_contract iterates this same block), so refuse it here rather than let a
+        # node run unguarded. Checked before the edge gates: a node with nothing declared cannot
+        # meaningfully participate in one.
+        if require_declared_io and not _output_properties(_declared_outputs(dag, node, manifest)):
+            raise AlignmentError(
+                f"{node}: declares no output contract. Author `outputs` on the plan node "
+                f"(AgentDAG.add_node(..., outputs={{...}})) — an undeclared schema silently "
+                f"disables the harness output check for this node."
+            )
+        consumer_inputs = _input_fields(_declared_inputs(dag, node, manifest))
         # B4: is a NODE subject to the deep gates this compile? (strict_fn=None => every node).
         node_strict = True if strict_fn is None else bool(strict_fn(node))
         node_strict_types = strict_types and node_strict
@@ -321,7 +387,9 @@ def check_alignment(
                 )
 
             field = _top_field(rest)
-            properties = _output_properties(producer_manifest.output_schema)
+            properties = _output_properties(
+                _declared_outputs(dag, producer, producer_manifest)
+            )
             if field not in properties:
                 raise AlignmentError(
                     f"{node}: producer {producer!r} does not declare output field {field!r} "
@@ -372,7 +440,9 @@ def check_alignment(
             # consumer input type. Only a concrete, mutually-declared mismatch raises; unknown
             # types pass (conservative), so this never rejects an un-annotated manifest.
             if node_strict_types:
-                producer_type = _field_type(producer_manifest.output_schema, field)
+                producer_type = _field_type(
+                    _declared_outputs(dag, producer, producer_manifest), field
+                )
                 consumer_type = _field_type(consumer_inputs, input_name)
                 if not _types_compatible(producer_type, consumer_type):
                     raise AlignmentError(

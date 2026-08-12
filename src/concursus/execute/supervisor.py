@@ -18,14 +18,15 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from concurrent.futures import ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..core.resolve import extract
 from ..reasoning.inner_graph import _cpu_capacity, resolve_ceiling
 from ..state.rungraph import RunGraph
 from ..state.runindex import RunIndex
 from ..state.statestore import InProcessStateStore, StateStore, content_hash
+from .futility import CancelTokenRegistry, futility_closure, invert_wiring
 
 if TYPE_CHECKING:  # pragma: no cover - hints only; keeps the runtime import graph AWS-free
     from ..assemble.assemble import ProvisioningPlan
@@ -44,6 +45,74 @@ _FAILURE_CRASH = "crash"
 #: A failed record's ``failure_class`` when the node was NEVER invoked because a producer it
 #: consumes failed or was itself held/blocked — a pruned-subtree skip, not this node's fault.
 _FAILURE_HOLD = "hold"
+#: A failed record's ``failure_class`` when the node's per-node monitor judged the run unhealthy and
+#: terminated it mid-flight (:class:`~.types.PreemptiveTermination`). Written by the
+#: harness node executor, not by :meth:`Supervisor._dispatch`.
+_FAILURE_PREEMPTIVE = "preemptive_termination"
+#: A failed record's ``failure_class`` when the Supervisor cancelled this node mid-flight because
+#: every consumer of its output had become unreachable (futility closure). Morally a
+#: :data:`_FAILURE_HOLD` — not the node's own fault — but detected DURING dispatch rather than
+#: before it, which is why it earns its own class.
+_FAILURE_FUTILITY = "futility_cancelled"
+#: Every recognized ``failure_class``, in reporting order. :meth:`Supervisor.summary` emits one count
+#: per entry (always present, possibly zero) and :meth:`Supervisor._classify_failure` honors any of
+#: them when written explicitly.
+_FAILURE_CLASSES = (
+    _FAILURE_CRASH,
+    _FAILURE_HOLD,
+    _FAILURE_PREEMPTIVE,
+    _FAILURE_FUTILITY,
+)
+
+
+def record_failure(
+    supervisor: "Supervisor",
+    node: str,
+    *,
+    failure_class: str,
+    error: str,
+    error_type: str,
+    consumes: Optional[List[str]] = None,
+    schema: Optional[str] = None,
+    blocked_on: Optional[str] = None,
+    address: Optional[str] = None,
+) -> None:
+    """Write THE failed record for ``node`` — the single writer both node-kind branches share.
+
+    Before this existed, :meth:`Supervisor._dispatch` and the harness node executor
+    each hand-rolled their own ``store.put`` for failures, and the two drifted twice:
+
+    * the harness path had no generic ``except Exception`` branch at all, so a contract violation
+      aborted an ``on_error='record'`` run instead of pruning one subtree;
+    * the harness path's failure writes then omitted the ``consumes`` / ``schema`` metadata its own
+      SUCCESS write included, silently dropping a failed node's edge and schema provenance from the
+      append-only log.
+
+    Both are classes of bug a shared writer makes unrepresentable. Keeping the metadata shape in one
+    place is the point — ``producer`` is always the node, ``consumes`` mirrors the wiring, and
+    ``blocked_on`` is set only when a reason is worth surfacing to ``summary_line()``.
+
+    ``address`` defaults to ``node`` but is overridable, because the retry path deliberately encodes
+    the attempt (``f"{node}/{attempt}"``) so successive attempts are distinguishable in the log. That
+    is a real difference between the two call sites, not an inconsistency to normalize away.
+
+    Caller-agnostic on purpose: it does NOT consult ``on_error``. Deciding whether to record or
+    re-raise stays with the caller, because only the caller knows whether the exception it is holding
+    is recoverable in its own context.
+    """
+    meta: Dict[str, Any] = {
+        "status": "failed",
+        "producer": node,
+        "failure_class": failure_class,
+        "address": address if address is not None else node,
+    }
+    if consumes is not None:
+        meta["consumes"] = consumes
+    if schema is not None:
+        meta["schema"] = schema
+    if blocked_on is not None:
+        meta["blocked_on"] = blocked_on
+    supervisor._store.put(node, {"error": error, "error_type": error_type}, meta=meta)
 
 
 class SchemaError(ValueError):
@@ -124,7 +193,7 @@ def validate_output(obj: Any, schema: Dict[str, Any]) -> None:
         )
 
 
-# -- output ACCEPTANCE contract ( B3) -----------------------------
+# -- output ACCEPTANCE contract (B3) -----------------------------
 def _acceptance_violation(value: Any, rules: Dict[str, Any]) -> Any:
     """Return a human-readable reason string iff ``value`` fails a declared acceptance ``rules``
     mapping, else ``None``. Rules are DECLARATIVE + DETERMINISTIC (no code eval), a superset of
@@ -158,7 +227,7 @@ def _acceptance_violation(value: Any, rules: Dict[str, Any]) -> Any:
 
 
 def check_hive_contract(obj: Any) -> None:
-    """The agent↔Hive-layer boundary gate ( B2-remainder): an output must conform to what
+    """The agent↔Hive-layer boundary gate (B2-remainder): an output must conform to what
     the OS layer routes, stores, and content-addresses — i.e. be a JSON-SERIALIZABLE object.
 
     ``validate_output`` checks dict-ness + required keys, but a dict carrying a non-JSON value (a
@@ -177,7 +246,7 @@ def check_hive_contract(obj: Any) -> None:
 
 
 def check_acceptance(obj: Any, schema: Dict[str, Any]) -> None:
-    """Post-run QA gate: every declared per-field ``acceptance`` rule must hold ( B3).
+    """Post-run QA gate: every declared per-field ``acceptance`` rule must hold (B3).
 
     This is DEEPER than :func:`validate_output` (which only checks required-key *presence*): it
     verifies each output field's *value* against a declared acceptance contract — the machine-checkable
@@ -289,9 +358,20 @@ class Supervisor:
         verify_plan_identity: bool = False,
         node_executors: Optional[Dict[str, NodeExecutor]] = None,
         node_kind_fn: Optional[Callable[[str], str]] = None,
+        cancel_futile: bool = False,
+        capture_agent_binding: bool = False,
     ) -> None:
         self._plan = plan
         self._manifests: Dict[str, "AgentManifest"] = dict(manifests)
+        # (R1-1 wiring) OPT-IN (default OFF): when set, each validated ``put`` records the bound
+        # agent name + ARN in the record meta (round-tripped only via the FileVault meta blob, never
+        # the AgentCore Memory projection). OFF ⇒ the put meta is byte-identical to before.
+        self._capture_agent_binding = capture_agent_binding
+        # (R1-4) When capture_agent_binding is on, the REAL per-node invoke payload the supervisor
+        # built in _dispatch is recorded here (redacted at capture time by capture_payload_note), so
+        # capture_run(payloads=sup.recorded_payloads()) persists the actual asked-of-the-agent bytes
+        # rather than only the compiler-authored static_context. Empty + unused when the flag is off.
+        self._recorded_payloads: Dict[str, Any] = {}
         self._invoke_fn: InvokeFn = invoke_fn or _default_invoke_fn
         self._session_id = session_id or _new_session_id()
         self._store: StateStore = state_store or InProcessStateStore()
@@ -303,6 +383,17 @@ class Supervisor:
         # DEFAULTS ('raise', 1) preserve today's byte-for-byte fail-fast single forward pass.
         self._on_error = on_error
         self._max_attempts = max_attempts
+        # OPT-IN futility cancellation for the antichain-parallel wave. False (the default,
+        # and every serial run) => no registry is built and no closure ever runs, so _run_parallel
+        # behaves exactly as today. When True, a node that fails mid-wave cancels in-flight SIBLINGS
+        # whose every consumer just became unreachable — the in-flight twin of the phase-3
+        # blocked-skip. It PRUNES only: it never reroutes and never mutates the frozen plan (INV-3).
+        self._cancel_futile = bool(cancel_futile)
+        # The registry serving the CURRENTLY-RUNNING parallel wave loop, else None. The harness node
+        # executor reads this to self-register its asyncio task (see execute.futility.run_registered);
+        # it is set on entry to _run_parallel and cleared in that method's ``finally``, so it never
+        # outlives the wave loop that owns it.
+        self._cancel_tokens: Optional[CancelTokenRegistry] = None
         # OPT-IN governance HOLD set (governor I-1): node ids the outer Trust-Ladder router withheld
         # THIS episode. None/empty (default) preserves today's byte-for-byte pass. A held node is
         # NEVER invoked — run() skips it exactly like a resume/blocked skip, so the frozen plan.order
@@ -310,7 +401,7 @@ class Supervisor:
         # failure: nothing is written to the log for a held node, so it does not surface as a failed
         # record (no spurious replan signal) and stays in the still-open frontier for a later round.
         self._held: Set[str] = set(held or ())
-        # AI-10: OPT-IN dispatch-time ARN integrity assertion. None (default) preserves today's
+        # OPT-IN dispatch-time ARN integrity assertion. None (default) preserves today's
         # behavior byte-for-byte. When supplied, it fetches the AUTHORITATIVE ARN so we can ASSERT
         # the compiled binding is still current — it NEVER re-binds the invoke to a re-fetched ARN.
         self._arn_resolver = arn_resolver
@@ -443,6 +534,12 @@ class Supervisor:
     def session_id(self) -> str:
         """The stable per-run ``runtimeSessionId`` shared across every invoke."""
         return self._session_id
+
+    def recorded_payloads(self) -> Dict[str, Any]:
+        """(R1-4) The REAL per-node invoke payloads captured during the run (empty unless
+        ``capture_agent_binding=True``). Pass to ``capture_run(payloads=...)`` so the persisted
+        payload notes carry what was actually asked of each agent, redacted at capture time."""
+        return dict(self._recorded_payloads)
 
     # -- payload assembly ---------------------------------------------------
     def _external_inputs(
@@ -603,40 +700,101 @@ class Supervisor:
         record per node and lets the pass continue (a failure prunes only its dependent subtree). A
         held node is never dispatched (governance HOLD), and a node whose producer failed/was held is
         recorded ``blocked_on`` exactly as the serial pass does — via the same store writes.
+
+        Observation vs. dispatch granularity: the wave is drained with ``as_completed``
+        rather than a single ``wait(futures)`` barrier, so each member's outcome is seen the moment it
+        resolves instead of when the SLOWEST sibling lands. Dispatch stays wave-structured — a node
+        still starts only after all its producers complete — so determinism is untouched; only the
+        observation latency changes. Because ``as_completed`` yields in completion order while the old
+        barrier inspected in futures-list order, failures are collected and the earliest in
+        ``plan.order`` is raised after the pool drains, preserving WHICH exception a caller sees.
+
+        That earlier observation is what makes the OPT-IN ``cancel_futile`` seam possible: when a node
+        fails mid-wave, in-flight siblings whose EVERY consumer just became unreachable are condemned
+        via :class:`~.futility.CancelTokenRegistry` (see :func:`~.futility.futility_closure`). This is
+        the in-flight twin of the blocked-remainder pass below — the same "these inputs will never be
+        consumed, record it and move on" judgement, evaluated during dispatch instead of after it.
+        With the flag off (the default) no registry exists and no closure is computed.
         """
         order = list(self._plan.order)
         wiring_by_node: Dict[str, List["AgentRef"]] = {
             node: list(self._plan.wiring.get(node, [])) for node in order
         }
         dispatched: Set[str] = set()  # nodes handed to _dispatch this run (attempted at most once)
-        with ThreadPoolExecutor(max_workers=parallel) as pool:
-            while True:
-                completed = self._store.completed()
-                open_nodes = [
-                    node for node in order
-                    if node not in completed
-                    and node not in self._held
-                    and node not in dispatched
-                ]
-                if not open_nodes:
-                    break
-                # the current ANTICHAIN: open nodes whose producers are ALL completed.
-                wave = [
-                    node for node in open_nodes
-                    if all(ref.producer in completed for ref in wiring_by_node[node])
-                ]
-                if not wave:
-                    break  # no dispatchable node: the rest are blocked (a producer failed/was held)
-                dispatched.update(wave)
-                futures = [
-                    pool.submit(self._route_dispatch, node, inputs, wiring_by_node[node])
-                    for node in wave
-                ]
-                wait(futures)
-                for fut in futures:
-                    exc = fut.exception()
-                    if exc is not None:
-                        raise exc  # on_error='raise': surface the first wave failure (fail-fast)
+        # futility cancellation (OPT-IN, off by default). The consumer graph is inverted ONCE
+        # — plan.wiring is frozen, so it cannot go stale — and the registry lives exactly as long as
+        # this wave loop. With the flag off both stay empty/None and no closure is ever computed, so
+        # the only difference from the previous implementation is WHEN futures are inspected.
+        consumers: Dict[str, Set[str]] = {}
+        tokens: Optional[CancelTokenRegistry] = None
+        if self._cancel_futile:
+            consumers = invert_wiring(wiring_by_node)
+            tokens = CancelTokenRegistry()
+        self._cancel_tokens = tokens
+        # Exceptions are COLLECTED rather than raised at first sight: as_completed yields in
+        # COMPLETION order whereas the previous wait(futures) inspected in FUTURES-LIST order, so
+        # raising eagerly could surface a DIFFERENT failure than before when two wave members both
+        # fail. plan.order is topological and the wave is built by walking it, so ranking the
+        # collected errors by plan.order index reproduces the old futures-list ordering exactly.
+        errors: List[Tuple[str, BaseException]] = []
+        try:
+            with ThreadPoolExecutor(max_workers=parallel) as pool:
+                while True:
+                    completed = self._store.completed()
+                    open_nodes = [
+                        node for node in order
+                        if node not in completed
+                        and node not in self._held
+                        and node not in dispatched
+                    ]
+                    if not open_nodes:
+                        break
+                    # the current ANTICHAIN: open nodes whose producers are ALL completed.
+                    wave = [
+                        node for node in open_nodes
+                        if all(ref.producer in completed for ref in wiring_by_node[node])
+                    ]
+                    if not wave:
+                        break  # no dispatchable node: the rest are blocked (a producer failed/was held)
+                    dispatched.update(wave)
+                    fut_to_node = {
+                        pool.submit(self._route_dispatch, node, inputs, wiring_by_node[node]): node
+                        for node in wave
+                    }
+                    # in_flight is a plain local: a wave member is in flight from submit until its own
+                    # future resolves. Tracking it here is why no registration API is needed.
+                    in_flight: Set[str] = set(wave)
+                    for fut in as_completed(fut_to_node):
+                        node = fut_to_node[fut]
+                        in_flight.discard(node)
+                        exc = fut.exception()
+                        if exc is not None:
+                            errors.append((node, exc))
+                        if tokens is None or not in_flight:
+                            continue  # default path, or nothing left in flight to cancel
+                        if exc is not None:
+                            # An escaped exception means this method WILL raise once the wave drains
+                            # (as it did before this change, under BOTH on_error modes), so the run is
+                            # over and no in-flight output can ever be consumed — condemn all of them.
+                            tokens.condemn_many(in_flight, f"fail-fast on {node}")
+                        elif node not in self._store.completed():
+                            # on_error='record': _route_dispatch already wrote the failed record and
+                            # returned normally. Resolved-but-not-completed IS the failure test, so no
+                            # index scan is needed. Prune only the PROVABLY futile siblings.
+                            tokens.condemn_many(
+                                futility_closure(consumers, node, in_flight),
+                                f"futility-cancelled on {node}",
+                            )
+                    if errors:
+                        break  # fail-fast: never start another wave, exactly as before
+        finally:
+            self._cancel_tokens = None
+
+        if errors:
+            # Surface the EARLIEST failure in plan.order — byte-for-byte the exception the previous
+            # `for fut in futures: raise fut.exception()` would have surfaced.
+            rank = {node: index for index, node in enumerate(order)}
+            raise min(errors, key=lambda pair: rank.get(pair[0], len(order)))[1]
 
         # Blocked remainder: any still-open node has an uncompleted producer (a failure or a HOLD).
         # Record it exactly as the serial pass would, iterating plan.order so the block cascades.
@@ -706,10 +864,12 @@ class Supervisor:
             else "DEFAULT"
         )
         payload_bytes = json.dumps(payload).encode()
+        if self._capture_agent_binding:  # (R1-4) record the REAL invoke payload for post-run capture
+            self._recorded_payloads[node] = payload
         consumes = [f"{r.producer}:{r.path}" for r in wiring]
         schema = manifest.name if manifest else None
 
-        # AI-10: dispatch-time ARN binding-INTEGRITY assertion, evaluated ONCE just before invoke.
+        # dispatch-time ARN binding-INTEGRITY assertion, evaluated ONCE just before invoke.
         # This verifies the SINGLE compiled ARN is real and current; it is NEVER a runtime rebind
         # (a mismatch fails/records — it does not silently swap in the re-fetched value) and NEVER
         # a match-by-trust selection among candidate agents.
@@ -717,17 +877,14 @@ class Supervisor:
         if integrity_error is not None:
             if self._on_error != "record":
                 raise integrity_error  # fail-fast: default path raises a clear binding error
-            self._store.put(
+            record_failure(
+                self,
                 node,
-                {"error": str(integrity_error), "error_type": type(integrity_error).__name__},
-                meta={
-                    "status": "failed",
-                    "producer": node,
-                    "consumes": consumes,
-                    "schema": schema,
-                    "failure_class": _FAILURE_CRASH,
-                    "address": node,
-                },
+                failure_class=_FAILURE_CRASH,
+                error=str(integrity_error),
+                error_type=type(integrity_error).__name__,
+                consumes=consumes,
+                schema=schema,
             )
             return
 
@@ -757,30 +914,32 @@ class Supervisor:
                 if attempt < self._max_attempts:
                     continue  # retry the SAME manifest-pinned node id
                 # terminal failure: write ONE failed record and stop (prune the subtree).
-                self._store.put(
+                record_failure(
+                    self,
                     node,
-                    {"error": str(exc), "error_type": type(exc).__name__},
-                    meta={
-                        "status": "failed",
-                        "producer": node,
-                        "consumes": consumes,
-                        "schema": schema,
-                        "failure_class": _FAILURE_CRASH,
-                        "address": f"{node}/{attempt}",
-                    },
+                    failure_class=_FAILURE_CRASH,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    consumes=consumes,
+                    schema=schema,
+                    address=f"{node}/{attempt}",
                 )
                 return
-            self._store.put(
-                node,
-                result,
-                meta={"producer": node, "consumes": consumes, "schema": schema},
-            )
+            put_meta: Dict[str, Any] = {"producer": node, "consumes": consumes, "schema": schema}
+            if self._capture_agent_binding:
+                # present-only: a node with no bound manifest/ARN adds nothing (byte-identical meta)
+                if manifest is not None and manifest.name:
+                    put_meta["agent_name"] = manifest.name
+                node_arn = self._arns.get(node)
+                if node_arn and node_arn != _ARN_PLACEHOLDER:
+                    put_meta["arn"] = node_arn
+            self._store.put(node, result, meta=put_meta)
             return
 
     def _check_arn_integrity(
         self, node: str, arn: str, manifest: Optional["AgentManifest"]
     ) -> Optional[Exception]:
-        """Return an ``Exception`` if ``node``'s compiled ARN fails the AI-10 integrity check.
+        """Return an ``Exception`` if ``node``'s compiled ARN fails the integrity check.
 
         Two independent checks, both purely a verification of the SINGLE compiled binding:
 
@@ -853,8 +1012,7 @@ class Supervisor:
             failed[r.node] = getattr(r, "blocked_on", None) or ""
             classes[r.node] = self._classify_failure(r)
         failure_classes = {
-            _FAILURE_CRASH: sum(1 for c in classes.values() if c == _FAILURE_CRASH),
-            _FAILURE_HOLD: sum(1 for c in classes.values() if c == _FAILURE_HOLD),
+            cls: sum(1 for c in classes.values() if c == cls) for cls in _FAILURE_CLASSES
         }
         return {
             "total": len(order),
@@ -867,14 +1025,20 @@ class Supervisor:
 
     @staticmethod
     def _classify_failure(record: Any) -> str:
-        """Classify one terminal failed ``record`` as :data:`_FAILURE_CRASH` or :data:`_FAILURE_HOLD`.
+        """Classify one terminal failed ``record`` as one of :data:`_FAILURE_CLASSES`.
 
-        Prefer the record's own ``failure_class`` (written by :meth:`_dispatch` / :meth:`run` under
-        ``on_error='record'``); fall back to ``blocked_on`` presence for a legacy record that predates
-        the field, so the classification is stable across store backends and older logs.
+        Prefer the record's own ``failure_class`` — written by :meth:`_dispatch` / :meth:`run` under
+        ``on_error='record'`` (:data:`_FAILURE_CRASH`, :data:`_FAILURE_HOLD`) or by the harness node
+        executor (:data:`_FAILURE_PREEMPTIVE`, :data:`_FAILURE_FUTILITY`). Fall back to ``blocked_on``
+        presence for a legacy record that predates the field, so the classification is stable across
+        store backends and older logs.
+
+        This widened this from two classes to four: ``preemptive_termination`` records were
+        previously written by the harness executor but not recognized here, so they silently bucketed
+        as ``crash`` — a monitor-initiated termination counted as a self-inflicted failure.
         """
         explicit = getattr(record, "failure_class", None)
-        if explicit in (_FAILURE_CRASH, _FAILURE_HOLD):
+        if explicit in _FAILURE_CLASSES:
             return explicit
         return _FAILURE_HOLD if getattr(record, "blocked_on", None) else _FAILURE_CRASH
 

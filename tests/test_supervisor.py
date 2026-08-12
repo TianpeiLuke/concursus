@@ -436,7 +436,9 @@ def test_failure_class_distinguishes_crash_from_hold():
 
     # summary() surfaces a per-class count alongside the unchanged failed rows.
     s = sup.summary()
-    assert s["failure_classes"] == {"crash": 1, "hold": 1}
+    assert s["failure_classes"] == {
+        "crash": 1, "hold": 1, "preemptive_termination": 0, "futility_cancelled": 0
+    }
     # the existing summary keys are untouched.
     assert s["completed"] == 1 and s["total"] == 3
     assert set(s["failed"]) == {"summarize", "critique"}
@@ -461,7 +463,9 @@ def test_failure_class_arn_integrity_is_crash():
     ingest_failed = [r for r in store.records() if r.node == "ingest" and r.status == "failed"]
     assert len(ingest_failed) == 1 and ingest_failed[0].failure_class == "crash"
     # ingest crashed (no ARN); summarize + critique are held behind it.
-    assert sup.summary()["failure_classes"] == {"crash": 1, "hold": 2}
+    assert sup.summary()["failure_classes"] == {
+        "crash": 1, "hold": 2, "preemptive_termination": 0, "futility_cancelled": 0
+    }
 
 
 def test_summary_failure_classes_empty_on_clean_run():
@@ -472,7 +476,9 @@ def test_summary_failure_classes_empty_on_clean_run():
         _plan(dag, manifests), manifests, invoke_fn=fake, arns=_ARNS, on_error="record"
     )
     sup.run({"uri": "s3://doc"})
-    assert sup.summary()["failure_classes"] == {"crash": 0, "hold": 0}
+    assert sup.summary()["failure_classes"] == {
+        "crash": 0, "hold": 0, "preemptive_termination": 0, "futility_cancelled": 0
+    }
 
 
 def test_failure_class_parallel_matches_serial():
@@ -495,7 +501,9 @@ def test_failure_class_parallel_matches_serial():
     d_failed = [r for r in store.records() if r.node == "d" and r.status == "failed"]
     assert b_failed[0].failure_class == "crash"
     assert d_failed[0].failure_class == "hold"
-    assert sup.summary()["failure_classes"] == {"crash": 1, "hold": 1}
+    assert sup.summary()["failure_classes"] == {
+        "crash": 1, "hold": 1, "preemptive_termination": 0, "futility_cancelled": 0
+    }
 
 
 # -- arn fallback -----------------------------------------------------------

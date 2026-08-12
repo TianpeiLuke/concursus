@@ -40,6 +40,75 @@ MAX_SUPPORTED_CONTRACT_VERSION = 1
 CONTEXT_MODES = ("", "reuse", "isolation")
 
 
+#: The invoker backends `execute/invoker.py` can dispatch to. ``validate`` fails closed on anything
+#: else, so a typo in a manifest is a compile-time error rather than a mid-run
+#: ``Unsupported backend`` from the invoker.
+RUNTIME_BACKENDS = ("callable", "agentcore", "http", "strands", "api")
+
+
+@dataclass(frozen=True)
+class AgentRuntime:
+    """OPTIONAL declaration of HOW to invoke this agent — the harness path's addressing.
+
+    Until now this block existed only in the RAW manifest dicts
+    ``execute/harness_factory.HarnessFactory`` consumes, and was **absent from the typed manifest
+    entirely** — which is why callers had to build and hand-maintain two representations of the same
+    agent, and why a field required by one could silently disagree with the other.
+
+    ``backend`` is the one key every backend needs, so it is typed and validated. The rest is
+    deliberately left as an open ``config`` mapping: the backends' remaining keys are heterogeneous
+    (``entry`` / ``client`` for callable, ``agent_id`` + ``alias_id`` for agentcore, ``endpoint`` for
+    http/api), the invoker already validates them per-backend at dispatch, and modelling that union
+    here would either lose information or duplicate the invoker's own checks.
+
+    The empty default is **falsy**, so a manifest with no ``runtime:`` block behaves exactly as before
+    — including routing to the legacy ``_dispatch`` path via ``HarnessFactory.make_kind_fn``.
+    """
+
+    backend: str = ""
+    config: Dict[str, Any] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:  # empty => falsy => the legacy dispatch path, unchanged
+        return bool(self.backend or self.config)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Back to the FLAT raw shape the harness stack reads (``{"backend": ..., **config}``).
+
+        Round-tripping matters: this is what lets a caller hold one typed manifest and derive the raw
+        dict, instead of maintaining both by hand.
+        """
+        if not self:
+            return {}
+        return {"backend": self.backend, **dict(self.config)}
+
+    @classmethod
+    def from_obj(cls, obj: Any, *, agent: str = "") -> "AgentRuntime":
+        """Build from ``None`` / a flat ``dict`` / an :class:`AgentRuntime`.
+
+        Accepts the flat authored shape (``{backend: "callable", entry: "m:f"}``) and splits
+        ``backend`` off from the rest, so an authored manifest needs no nesting it did not have.
+        """
+        if obj is None:
+            return cls()
+        if isinstance(obj, AgentRuntime):
+            return obj
+        if not isinstance(obj, dict):
+            raise ManifestError(
+                f"{agent}: runtime must be a mapping with a 'backend' (got {type(obj).__name__})"
+            )
+        if not obj:
+            return cls()
+        backend = obj.get("backend")
+        if backend is None or not str(backend).strip():
+            raise ManifestError(
+                f"{agent}: runtime must declare a 'backend' (one of {list(RUNTIME_BACKENDS)!r})"
+            )
+        return cls(
+            backend=str(backend),
+            config={k: v for k, v in obj.items() if k != "backend"},
+        )
+
+
 @dataclass(frozen=True)
 class AgentCapabilities:
     """OPTIONAL, purely-declarative inventory of what an agent's *runtime* provides.
@@ -151,6 +220,13 @@ class AgentManifest:
     capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
     contract_version: int = MAX_SUPPORTED_CONTRACT_VERSION
     context_mode: str = ""
+    # -- harness-path blocks ------------------------------------------------
+    # These three existed ONLY in the raw manifest dicts the HarnessFactory consumes, so a caller had
+    # to build and hand-maintain a second representation of the same agent. Modelling them here makes
+    # the typed manifest the single source; `to_harness_dict()` derives the raw shape from it.
+    runtime: AgentRuntime = field(default_factory=AgentRuntime)
+    monitor: Dict[str, Any] = field(default_factory=dict)
+    output_mapping: Dict[str, str] = field(default_factory=dict)
 
     # -- accessors ----------------------------------------------------------
     @property
@@ -182,18 +258,56 @@ class AgentManifest:
     def depends_on(self) -> List[Dict[str, str]]:
         return list(self.spec.get("depends_on", []))
 
+    # -- harness interop ----------------------------------------------------
+    def to_harness_dict(self) -> Dict[str, Any]:
+        """The RAW dict shape ``execute/harness_factory.HarnessFactory`` consumes.
+
+        The convergence step. ``HarnessFactory`` takes raw dicts because the typed manifest had no
+        ``runtime`` / ``monitor`` / ``output_mapping``; with those modelled, a caller can hold ONE
+        typed manifest and derive the raw view instead of authoring both and hoping they agree.
+
+        Emits only the keys the harness stack actually reads (``name``, ``runtime``, ``contract``,
+        ``monitor``, ``output_mapping``, ``side_effecting``), and omits the empty ones so the result is
+        identical in shape to what hand-written raw manifests look like today.
+        """
+        out: Dict[str, Any] = {"name": self.name, "contract": dict(self.contract)}
+        if self.runtime:
+            out["runtime"] = self.runtime.to_dict()
+        if self.monitor:
+            out["monitor"] = dict(self.monitor)
+        if self.output_mapping:
+            out["output_mapping"] = dict(self.output_mapping)
+        if self.side_effecting:
+            out["side_effecting"] = True
+        return out
+
     # -- validation ---------------------------------------------------------
     def validate(self) -> "AgentManifest":
         """Enforce the manifest contract; returns self.
 
-        Rules: a name is required; the registry must name either a ``container_uri`` (to
-        provision) or an ``agent_runtime_arn`` (to reuse); and an **output schema is
-        mandatory** — it is what makes dependency resolution meaningful for agents.
+        Rules: a name is required; an **output schema is mandatory** (it is what makes dependency
+        resolution meaningful for agents); and the registry must name either a ``container_uri`` (to
+        provision) or an ``agent_runtime_arn`` (to reuse) — **unless** a ``runtime`` block declares a
+        backend that is not AgentCore-hosted, in which case there is no AgentCore runtime to name.
         """
         if not self.name or not str(self.name).strip():
             raise ManifestError("manifest requires a non-empty 'name'")
+        # Fail closed on an unknown backend, so a typo is caught at compile time rather than
+        # surfacing mid-run as the invoker's `Unsupported backend`.
+        if self.runtime and self.runtime.backend not in RUNTIME_BACKENDS:
+            raise ManifestError(
+                f"{self.name}: runtime.backend must be one of {list(RUNTIME_BACKENDS)!r} "
+                f"(got {self.runtime.backend!r})"
+            )
         reg = self.registry
-        if not (reg.get("container_uri") or reg.get("agent_runtime_arn")):
+        # An in-process / self-hosted agent (callable, http, strands, api) genuinely has no AgentCore
+        # runtime to name, so demanding one forced callers to FABRICATE a container_uri purely to pass
+        # this gate. The requirement now applies only where it means something: no runtime block at
+        # all (the legacy _dispatch path, which invokes an ARN), or an explicitly agentcore-backed one.
+        needs_agentcore_hosting = (not self.runtime) or self.runtime.backend == "agentcore"
+        if needs_agentcore_hosting and not (
+            reg.get("container_uri") or reg.get("agent_runtime_arn")
+        ):
             raise ManifestError(
                 f"{self.name}: registry must set 'container_uri' (to provision) or "
                 "'agent_runtime_arn' (to reuse an existing AgentCore Runtime)"
@@ -264,6 +378,13 @@ class AgentManifest:
             capabilities=capabilities,
             contract_version=contract_version,
             context_mode=str(data.get("context_mode", "") or ""),
+            runtime=AgentRuntime.from_obj(
+                data.get("runtime"), agent=str(data.get("name", ""))
+            ),
+            monitor=dict(data.get("monitor", {}) or {}),
+            output_mapping={
+                str(k): str(v) for k, v in (data.get("output_mapping", {}) or {}).items()
+            },
         )
 
     @classmethod

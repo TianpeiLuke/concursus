@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — the execute runtime stack (invoke real leaf agents)
+- `concursus.execute` gains the harness/invoker/monitor runtime that turns the abstract `Supervisor`
+  into a system that actually **invokes real leaf agents** — previously `execute/` was only
+  `supervisor.py` (a dispatcher over an injected `invoke_fn`). All opt-in via the existing
+  `NodeExecutor` seam: a run that does not wire a harness factory is byte-for-byte unchanged.
+  - `AgentInvoker` — dispatches to a leaf agent by `manifest.runtime.backend`: `callable` (in-process),
+    `agentcore` (Bedrock InvokeAgentRuntime), `http` (aiohttp/urllib + SSE), `strands` (the Strands
+    SDK); `api` is a declared stub. `invoke_with_tap` returns the response + a live `LogEvent` stream.
+  - `ExecutionMonitor` — a rule-based per-node health monitor (idle-timeout / error-threshold /
+    tool-loop / token-budget) over that log stream, emitting a `HealthSignal` and, on a terminating
+    verdict, `PreemptiveTermination` + a `remediation_for` corrective retry amendment.
+  - `AgentHarness` / `HarnessFactory` / `make_harness_supervisor_factory` — the per-node wrapper that
+    owns I/O, contract enforcement, monitor wiring, and retry, plugged into the Supervisor.
+  - `FileStore` / `S3Store` (`execute.object_store`) — the artifact `ObjectStore` (boto3 lazy).
+  - Futility cancellation (`execute.futility` + the Supervisor `cancel_futile` seam) — stop in-flight
+    parallel work whose output can no longer be consumed; the `_run_parallel` wave drains with
+    `as_completed` so a sibling is condemned the moment its consumers become unreachable.
+- `core.manifest` gains the typed `AgentRuntime` block (`runtime` / `monitor` / `output_mapping`
+  fields + `to_harness_dict()`), so one typed manifest is the single source the harness reads;
+  `validate()` fail-closes on an unknown `runtime.backend` and no longer demands an AgentCore hosting
+  handle for a self-hosted (callable/http/strands) agent.
+- `core` per-node declared I/O — `AgentDAG.add_node(*, task, inputs, outputs)` + `node_attrs` / `attrs`,
+  and `check_alignment(require_declared_io=True)` (a declared-or-refuse gate that reads the plan node's
+  I/O first). Fully backward-compatible: bare `add_node("x")` is unchanged.
+- `Supervisor` failure taxonomy widened to four classes (`crash` / `hold` / `preemptive_termination`
+  / `futility_cancelled`) via a shared `record_failure()` writer, and gains `capture_agent_binding`
+  (record the real per-node invoke payloads for post-run capture).
+
 ### Added — session-end knowledge transfer (opt-in, default-off)
 - `concursus.state.transfer` — the connector that flows a finished run's episodic notes out into
   a permanent external Slipbox via a knowledge-consolidation sub-agent, on completion or teardown.

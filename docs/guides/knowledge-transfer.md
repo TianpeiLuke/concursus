@@ -7,7 +7,7 @@
 
 A Concursus run already writes slipbox-shaped notes to its run dir as it goes — one round-trip-exact
 markdown note per record under `<vault>/runs/<session>/` (see *Durable run state* in the
-[README](../README.md)). But those notes are **episodic**: they live within the session and die with
+[README](../../README.md)). But those notes are **episodic**: they live within the session and die with
 the run dir. This connector is the egress — it flows a finished session's episodic memory *out* into
 a **permanent** external Slipbox via a knowledge-consolidation sub-agent, on both request-completion
 and termination, so what a run learned becomes durable, retrievable knowledge instead of being lost
@@ -138,5 +138,5 @@ Wire none of it and the default `plan → deploy → run` is byte-for-byte uncha
 
 ## See also
 
-- [Concursus README](../README.md) — the product overview; *Durable run state* and *The governor* sections.
-- [AgentCore-aligned durable placement](agentcore_placement.md) — where the durable log lives under AgentCore hosting.
+- [Concursus README](../../README.md) — the product overview; *Durable run state* and *The governor* sections.
+- [AgentCore-aligned durable placement](../agentcore_placement.md) — where the durable log lives under AgentCore hosting.

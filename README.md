@@ -17,7 +17,7 @@ It is the **coordinator AgentCore deliberately doesn't ship**: AgentCore gives y
 
 ```bash
 pip install concursus                 # declarative core (pure Python)
-pip install "concursus[agentcore]"    # + the AWS Bedrock AgentCore runtime binding (roadmap)
+pip install "concursus[agentcore]"    # + boto3: the AWS Bedrock AgentCore runtime binding (deploy + the `agentcore` invoke backend)
 ```
 
 Requires **Python 3.10+**.
@@ -312,6 +312,7 @@ events-after filter.
 - [x] Memory-backed shared run state (the `StateStore` seam: in-process default / AgentCore Memory opt-in, replay-resume, the AgentRef link graph + `context(node)`)
 - [x] The governor: an opt-in dynamic outer loop (`GovernorLoop` / `TrustLadderScheduler` / `AgentRegistry` / `DirectorCockpit` / `KTLODaemon` / `scope`) that drives the freeze compiler as bounded episodes (LangGraph optional)
 - [x] Session-end knowledge transfer: the opt-in `state.transfer` connector (the `slipbox_transfer` terminal node + fail-closed acceptance gate, the episodic-log export, the strictly-outer `synthesize` trigger + reaper backstop, and the transfer-inclusive `session_overall_ok` rollup)
+- [x] The execute runtime stack: invoke real leaf agents — `AgentInvoker` (dispatch by `manifest.runtime.backend`: `callable` / `agentcore` `InvokeAgent` / `http` SSE / `strands`, with `api` a declared stub) + a rule-based per-node `ExecutionMonitor` over its live `LogEvent` stream + the `AgentHarness` wrapper (I/O, contract enforcement, monitor wiring, bounded retry) + `FileStore`/`S3Store` artifacts + futility cancellation, all plugged into the Supervisor's `NodeExecutor` seam (opt-in: a run that wires no harness factory is byte-for-byte unchanged)
 - [ ] Gateway/A2A node types; a data-driven catalog + recommender of team topologies
 
 ## License

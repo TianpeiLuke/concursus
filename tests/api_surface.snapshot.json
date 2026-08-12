@@ -41,6 +41,7 @@
     "EpisodeAdmissionGate",
     "EventSink",
     "EventSource",
+    "FanOutEventSink",
     "FileVaultStateStore",
     "FireBudgetGate",
     "FrontierProposal",

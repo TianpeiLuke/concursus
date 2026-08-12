@@ -184,6 +184,28 @@ class NullEventSink:
         return None
 
 
+class FanOutEventSink:
+    """A composite :class:`EventSink` that fans one event out to several child sinks.
+
+    The loop has exactly ONE ``event_sink`` slot, so observers that must coexist are composed here:
+    ``event_sink=FanOutEventSink([a, b])``. Each child's ``emit`` is called in order, INDIVIDUALLY
+    guarded, so one misbehaving child can never starve the others. An empty list is a no-op —
+    behaviorally identical to leaving ``event_sink`` unset, so it stays byte-for-byte default-off.
+    Observer-only: it reads the plain-dict :class:`RunEvent` VALUE and forwards it; it never touches
+    ctx/plan/log (INV-1/3/5).
+    """
+
+    def __init__(self, sinks) -> None:
+        self._sinks = [s for s in (sinks or []) if s is not None]
+
+    def emit(self, event: RunEvent) -> None:
+        for sink in self._sinks:
+            try:
+                sink.emit(event)
+            except Exception:  # noqa: BLE001 - one bad child must not starve the others
+                pass
+
+
 class GovernorLoopError(ValueError):
     """Raised on an invalid governor-loop configuration or an unknown backend."""
 

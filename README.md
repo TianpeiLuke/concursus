@@ -177,6 +177,33 @@ outputs = sup.run({"uri": "s3://doc"})   # {node_id: output_dict}
 sup.context("critique")                  # {producer: output} for its transitive upstream
 ```
 
+### Session-end knowledge transfer (opt-in egress)
+
+Those run notes are **episodic** — they live in the run's own `<vault>/runs/<session>/` and die with
+it. The **`concursus.state.transfer`** connector is the opt-in egress that flows a finished
+session's episodic memory *out* into a **permanent** external Slipbox via a knowledge-consolidation
+sub-agent. Four pieces, all compile-time or strictly-outer (never an in-`Supervisor.run` mutation):
+
+- **the `slipbox_transfer` terminal node** — `build_slipbox_transfer_manifest` +
+  `wire_slipbox_transfer_terminal` author an MCP node wired as the run's sole sink, with a
+  **fail-closed acceptance contract** (`state` must be `complete`, `result_path` non-empty) that
+  mirrors the consolidation sub-agent's real job dict; `slipbox_transfer_acceptance_fn` narrows the
+  `Supervisor`'s opt-in `check_acceptance` gate to just this node.
+- **registration** — `register_slipbox_foundry` seeds the `AgentRegistry` + `DeployLedger` so
+  `match_task("slipbox_transfer")` resolves the standing sub-agent.
+- **the export** — `export_run_log` copies the run's episodic notes (byte-identical, idempotent,
+  inode-stable) into the sub-agent's local ingestion inbox; `distill_export` wires the cross-run
+  precedent. Ingestion is an **injected** `admit_fn` (default a pure file-drop) — concursus never
+  imports the consolidation runtime.
+- **the trigger** — `TransferTriggerSink` (composed with a phase sink via `FanOutEventSink`) fires
+  the export at the strictly-outer `decision` / `route=="synthesize"` boundary;
+  `sweep_untransferred_runs` is the reaper / next-boot backstop; a `.slipbox_transferred` marker
+  makes at-least-once converge to exactly-once. `session_overall_ok` is the rollup: a session is not
+  green unless the transfer ran and was accepted.
+
+Import from `concursus.state.transfer` (and `FanOutEventSink` from `concursus.governor`). Wire none
+of it and the run is byte-for-byte unchanged.
+
 ## The governor (opt-in dynamic outer loop)
 
 The compiler and supervisor are **static**: `assemble` freezes one `ProvisioningPlan` and
@@ -283,6 +310,7 @@ events-after filter.
 - [x] `plan` / `deploy` / `run` CLI verbs (deploy/run `--execute` bind boto3 lazily)
 - [x] Memory-backed shared run state (the `StateStore` seam: in-process default / AgentCore Memory opt-in, replay-resume, the AgentRef link graph + `context(node)`)
 - [x] The governor: an opt-in dynamic outer loop (`GovernorLoop` / `TrustLadderScheduler` / `AgentRegistry` / `DirectorCockpit` / `KTLODaemon` / `scope`) that drives the freeze compiler as bounded episodes (LangGraph optional)
+- [x] Session-end knowledge transfer: the opt-in `state.transfer` connector (the `slipbox_transfer` terminal node + fail-closed acceptance gate, the episodic-log export, the strictly-outer `synthesize` trigger + reaper backstop, and the transfer-inclusive `session_overall_ok` rollup)
 - [ ] Gateway/A2A node types; a data-driven catalog + recommender of team topologies
 
 ## License

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — session-end knowledge transfer (opt-in, default-off)
+- `concursus.state.transfer` — the connector that flows a finished run's episodic notes out into
+  a permanent external Slipbox via a knowledge-consolidation sub-agent, on completion or teardown.
+  All compile-time or strictly-outer (never an in-`Supervisor.run` mutation); wire none of it and
+  the default `plan → deploy → run` stays byte-for-byte unchanged.
+  - `build_slipbox_transfer_manifest` / `wire_slipbox_transfer_terminal` / `slipbox_transfer_acceptance_fn`
+    — the `slipbox_transfer` MCP terminal node (the run's sole sink) with a fail-closed acceptance
+    contract (`state` = `complete`, `result_path` non-empty) mirroring the sub-agent's real job dict.
+  - `register_slipbox_foundry` — registry capability + ledger row so `match_task("slipbox_transfer")`
+    resolves the standing sub-agent.
+  - `export_run_log` / `distill_export` — copy the run's episodic notes (idempotent, inode-stable)
+    into the sub-agent's ingestion inbox; ingestion is an injected `admit_fn` (concursus never
+    imports the consolidation runtime).
+  - `TransferTriggerSink` + `governor.FanOutEventSink` — fire the export at the strictly-outer
+    `decision`/`route=="synthesize"` boundary; `sweep_untransferred_runs` is the reaper/next-boot
+    backstop; a `.slipbox_transferred` marker makes at-least-once converge to exactly-once.
+  - `session_overall_ok` / `transfer_node_ok` — the rollup: a session is not green unless the
+    transfer ran and was accepted.
+
 ## [0.6.0] - 2026-07-21
 
 Completes the flexibility & robustness roadmap — the remaining nine **opt-in, default-off**

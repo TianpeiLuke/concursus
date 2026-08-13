@@ -43,6 +43,7 @@ from concursus.governor.loop import (
     GovernorResult,
     InProcessCheckpointStore,
     NullEventSink,
+    PhaseNoteSink,
 )
 from concursus.governor.registry import (
     AgentRegistry,
@@ -108,6 +109,7 @@ __all__ = [
     "EventSink",
     "NullEventSink",
     "FanOutEventSink",
+    "PhaseNoteSink",
     "GOV_NODES",
     "KTLODaemon",
     "KTLODaemonError",

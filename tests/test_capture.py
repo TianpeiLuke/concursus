@@ -236,7 +236,7 @@ def test_load_payload_tiers_reads_back(tmp_path):
     assert tiers.get("summarize") == "LOW"
 
 
-# --: opt-in note version timeline from the post-run trigger --------
+# -- opt-in note version timeline from the post-run trigger --------
 def test_capture_run_does_not_version_by_default(tmp_path):
     """``capture_run`` default (``version_notes=False``) creates NO ``versions/`` timeline and keeps
     the legacy result shape (no ``versioned`` key)."""
@@ -278,3 +278,39 @@ def test_capture_run_versions_notes_when_opted_in(tmp_path):
     for vf in (run / _VERSIONS_DIR_NAME).rglob("v*.md"):
         with pytest.raises(ValueError):
             _note_to_record(vf.read_text())
+
+
+# -- R4: consolidation-digestible digest view (a second, additive projection) ----------------------
+def test_digest_view_is_markdown_bb_classified_and_not_a_record(tmp_path):
+    import json
+    from concursus.state.capture import capture_digest_view, DIGEST_VIEW
+    from concursus.state.statestore import Record
+    from concursus.state.filevault import _note_to_record
+
+    recs = [
+        Record(node="triage", output={"root_cause": "disk-full"}, content_hash="h",
+               schema="s1", consumes=["fetch:$.ok"], agent_name="worker", arn="arn:x", address="triage"),
+        Record(node="score", output={}, status="failed", failure_class="hold",
+               blocked_on="fetch", address="score"),
+    ]
+    paths = capture_digest_view(str(tmp_path), recs, trail_id="run", date="2026-08-11")
+    assert len(paths) == 2 and all(p.endswith(".digest.md") for p in paths)
+
+    ok = (tmp_path / [p for p in paths if "triage" in p][0].split("/")[-1]).read_text()
+    assert 'language: "markdown"' in ok and '"empirical_observation"' in ok
+    assert "## Observed" in ok and "## Provenance" in ok
+    assert "`triage`" in ok and "`worker`" in ok and "`fetch:$.ok`" in ok  # backticked identifiers
+
+    bad = (tmp_path / [p for p in paths if "score" in p][0].split("/")[-1]).read_text()
+    assert '"counter_argument"' in bad and "## Failure" in bad and "`hold`" in bad
+
+    # neither digest note parses back as a run Record (loader-safe)
+    for p in paths:
+        with pytest.raises(ValueError):
+            _note_to_record((tmp_path / p.split("/")[-1]).read_text())
+
+
+def test_digest_view_empty_records_writes_nothing(tmp_path):
+    from concursus.state.capture import capture_digest_view
+    assert capture_digest_view(str(tmp_path), []) == []
+    assert not list(tmp_path.glob("*.digest.md"))

@@ -22,7 +22,7 @@ if TYPE_CHECKING:  # pragma: no cover - hints only; keeps the runtime import gra
     from ..core.manifest import AgentManifest
     from ..state.precedent import PrecedentRetriever
 
-#: Default ceiling on monotonic re-compiles (AI-20). The plan-generation feedback edge lives
+#: Default ceiling on monotonic re-compiles. The plan-generation feedback edge lives
 #: AROUND ``assemble`` (run -> distill -> precedent -> next compile); this cap makes that outer
 #: loop BOUNDED so a mis-behaving planner can never re-compile without end.
 DEFAULT_MAX_REVISIONS = 16
@@ -35,7 +35,7 @@ class AssemblyError(ValueError):
 class MonotonicityError(AssemblyError):
     """Raised when a re-compile would edit, remove, or reorder an already-executed node.
 
-    The adaptive-compiler contract (AI-20): every plan mutation is a BOUNDED, MONOTONIC
+    The adaptive-compiler contract: every plan mutation is a BOUNDED, MONOTONIC
     re-compile that emits a fully-frozen SUPERSET plan pinning already-executed nodes; an edit
     to (or removal / reordering of) a node the supervisor has already run is rejected here rather
     than silently replayed differently — resume must stay a faithful replay of the prior plan.
@@ -56,17 +56,17 @@ class ProvisioningPlan:
     order: List[str] = field(default_factory=list)
     entries: Dict[str, BuildPlanEntry] = field(default_factory=dict)
     wiring: Dict[str, List[AgentRef]] = field(default_factory=dict)
-    #: Read-only cross-run precedent context (AI-17), surfaced for the plan author (AI-22) to
+    #: Read-only cross-run precedent context, surfaced for the plan author to
     #: consult. Empty by default. This NEVER participates in the compiled topology — ``order`` /
     #: ``entries`` / ``wiring`` are computed identically whether or not it is populated; it is
     #: pure advisory context attached alongside the frozen plan.
     precedents: List[dict] = field(default_factory=list)
-    #: Monotonic re-compile counter (AI-20). ``0`` for a first ``assemble``; each
+    #: Monotonic re-compile counter. ``0`` for a first ``assemble``; each
     #: :meth:`OrchestrationAssembler.recompile` emits a FRESH plan with ``revision`` one higher
     #: than the prior plan, bounded by ``max_revisions``. Surfaced in :meth:`to_dict` ONLY when
     #: non-zero, so a first-compile plan's preview is byte-for-byte unchanged.
     revision: int = 0
-    #: The scheduler's cleared-frontier set for THIS revision ( P4.2) — the nodes the
+    #: The scheduler's cleared-frontier set for THIS revision (P4.2) — the nodes the
     #: router bound + cleared to dispatch this round (``FrontierProposal.compile_next`` /
     #: ``propose_bindings`` DISPATCH nodes). READ-ONLY ADVISORY: it NEVER changes ``order`` /
     #: ``entries`` / ``wiring`` (the topology is identical with or without it — the monotonic
@@ -74,7 +74,7 @@ class ProvisioningPlan:
     #: cleared, closing the previously-dead ``compile_next`` channel. Empty by default -> ``to_dict``
     #: byte-for-byte unchanged.
     frontier: List[str] = field(default_factory=list)
-    #: The per-node frozen PAYLOAD contract ( F1) — ``{node: {static_context,
+    #: The per-node frozen PAYLOAD contract (F1) — ``{node: {static_context,
     #: trust_tier}}``, authored by ``assemble`` when a ``payload_tier_fn`` is wired (opt-in). This
     #: is *dimension 2/3* of the payload contract (the tiered coaching context + trust tier); it
     #: NEVER changes ``order`` / ``entries`` / ``wiring`` (the topology is identical with or without
@@ -108,7 +108,7 @@ class ProvisioningPlan:
         return out
 
     def to_summary_dict(self) -> dict:
-        """A COMPACT, navigable projection of the plan for a durable plan note (AI-18).
+        """A COMPACT, navigable projection of the plan for a durable plan note.
 
         Unlike :meth:`to_dict` (the full, byte-exact ``concursus plan`` preview that inlines each
         :class:`~concursus.build.BuildPlanEntry`'s ``wrapper`` source, ``dockerfile``, and
@@ -166,34 +166,35 @@ class OrchestrationAssembler:
         strict_fn: Optional[Callable[[str], bool]] = None,
         payload_tier_fn: Optional[Callable[[str], Any]] = None,
         full_input_cover: bool = False,
+        require_declared_io: bool = False,
     ) -> None:
         self.account = account
         self.region = region
-        #: Optional COMPILE-TIME, read-only precedent retriever (AI-17). When supplied, ``assemble``
+        #: Optional COMPILE-TIME, read-only precedent retriever. When supplied, ``assemble``
         #: retrieves relevant prior resolved runs BEFORE freezing and attaches them to the plan as
-        #: advisory context for the plan author (AI-22). It NEVER changes the compiled topology and
+        #: advisory context for the plan author. It NEVER changes the compiled topology and
         #: NEVER touches AWS or a run log. Default ``None`` keeps ``assemble`` byte-for-byte
         #: unchanged (the feedback edge lives AROUND assemble, never inside ``Supervisor.run``).
         self.precedent_retriever = precedent_retriever
-        #: OPT-IN deep-alignment gate ( B2). Default ``False`` keeps ``check_alignment`` at
+        #: OPT-IN deep-alignment gate (B2). Default ``False`` keeps ``check_alignment`` at
         #: its name-level gate (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile``
         #: ALSO type-gate every ``depends_on`` edge (producer output type must be compatible with the
         #: consumer input type); a concrete mismatch raises :class:`AlignmentError`. Conservative:
         #: unknown/absent types pass, so it never rejects an un-annotated manifest. Compile-time only
         #: — no runtime effect, INV-2 preserved.
         self.strict_types = bool(strict_types)
-        #: OPT-IN single-writer gate ( B1). Default ``False`` keeps ``check_alignment`` at
+        #: OPT-IN single-writer gate (B1). Default ``False`` keeps ``check_alignment`` at
         #: its default (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile`` ALSO
         #: reject a plan where any consumer input is fed by more than one ``depends_on`` edge (a
         #: silent last-wins overwrite at run time). Compile-time only — INV-2 preserved.
         self.single_writer = bool(single_writer)
-        #: OPT-IN adaptive-strictness dial ( B4). ``None`` (default) applies the enabled
+        #: OPT-IN adaptive-strictness dial (B4). ``None`` (default) applies the enabled
         #: deep gates (``strict_types`` / ``single_writer``) to EVERY node. When set, it is a
         #: ``node -> bool`` predicate that NARROWS them to the nodes it returns truthy for — wire
         #: :func:`~concursus.governor.make_trust_strictness` so WEAK/low-trust agents get the strict
         #: contract and STRONG/high-trust ones get the lean path. Author/compile-time only (INV-2).
         self.strict_fn = strict_fn
-        #: OPT-IN payload-tier authoring dial ( F1/F4). ``None`` (default) => no
+        #: OPT-IN payload-tier authoring dial (F1/F4). ``None`` (default) => no
         #: ``payload_contract`` is authored and the plan is byte-for-byte unchanged. When set, a
         #: ``node -> Tier`` selector (wire :func:`~concursus.governor.make_payload_tier`);
         #: ``assemble`` authors, per node with a declared ``contract.context``, the tiered static
@@ -201,12 +202,19 @@ class OrchestrationAssembler:
         #: frozen ``ProvisioningPlan.payload_contract``. Author/compile-time only; it NEVER changes
         #: ``order`` / ``entries`` / ``wiring`` (a pure additive annotation, INV-2/3 preserved).
         self.payload_tier_fn = payload_tier_fn
-        #: OPT-IN full-input-cover gate ( F2). Default ``False`` keeps ``check_alignment``
+        #: OPT-IN full-input-cover gate (F2). Default ``False`` keeps ``check_alignment``
         #: at its name+edge gate (byte-for-byte unchanged). When ``True``, ``assemble``/``recompile``
         #: ALSO require every declared consumer input to have a compile-visible supplier (a
         #: ``depends_on`` edge or a static ``contract.context`` key) — the b2 dimension-1
         #: completeness quantifier. Compile-time only (INV-2).
         self.full_input_cover = bool(full_input_cover)
+        #: OPT-IN declared-or-refuse gate. Default ``False`` keeps ``check_alignment`` at its
+        #: ``outputs`` block on its PLAN node or the compile fails. It is ON because the manifest no
+        #: longer carries a static I/O contract to fall back to — the harness enforces a node's
+        #: output contract by iterating that schema, so an undeclared node would be "enforced" by an
+        #: EMPTY loop: silently unguarded rather than loudly rejected. Refusing at compile time costs
+        #: nothing; tolerating it costs one unchecked agent call per node. Compile-time only (INV-2).
+        self.require_declared_io = bool(require_declared_io)
 
     def assemble(
         self, dag: "AgentDAG", manifests: Dict[str, "AgentManifest"]
@@ -227,6 +235,7 @@ class OrchestrationAssembler:
             dag, manifests, strict_types=self.strict_types,
             single_writer=self.single_writer, strict_fn=self.strict_fn,
             full_input_cover=self.full_input_cover,
+            require_declared_io=self.require_declared_io,
         )
         wiring = resolve.resolve_edges(dag, manifests)
 
@@ -241,7 +250,7 @@ class OrchestrationAssembler:
 
         order = dag.topological_sort()
 
-        # AI-17 hook: retrieve read-only precedent context BEFORE freezing, purely as advisory
+        # hook: retrieve read-only precedent context BEFORE freezing, purely as advisory
         # input for the plan author. This is computed AFTER the topology is fully resolved and does
         # NOT influence ``order`` / ``entries`` / ``wiring`` in any way — the compiled plan is
         # identical to one produced without a retriever. Default (no retriever) => empty list, so
@@ -257,7 +266,7 @@ class OrchestrationAssembler:
         # a declared ``contract.context``, record the TIERED static context (projected per the
         # node's trust tier) + the tier name. Default (no tier_fn) => empty => byte-for-byte
         # unchanged. Pure/additive: it reads manifests + the tier fn, never touches order/wiring.
-        payload_contract = self._author_payload_contract(order, manifests)
+        payload_contract = self._author_payload_contract(order, manifests, dag)
 
         return ProvisioningPlan(
             order=order, entries=entries, wiring=wiring, precedents=precedents,
@@ -265,19 +274,52 @@ class OrchestrationAssembler:
         )
 
     def _author_payload_contract(
-        self, order: List[str], manifests: Dict[str, "AgentManifest"]
+        self,
+        order: List[str],
+        manifests: Dict[str, "AgentManifest"],
+        dag: "Optional[AgentDAG]" = None,
     ) -> Dict[str, dict]:
-        """Author the per-node payload contract (F1/F4). Empty when no ``payload_tier_fn`` is wired.
+        """Author the per-node payload contract (F1/F4) — ``{node: {task, io, trust_tier, static_context}}``.
 
-        For each node whose manifest declares a non-empty ``contract.context``, project that context
-        down to the node's trust tier and record ``{node: {trust_tier, static_context}}``. Pure +
-        compile-time; wired via :func:`~concursus.governor.make_payload_tier`. A node with no
-        declared context contributes nothing (so a plan of un-annotated agents stays empty)."""
+        Two INDEPENDENT halves, deliberately not gated on each other:
+
+        * ``task`` / ``io`` come from the DAG node's authored attributes and are recorded
+          **unconditionally**. This is ``{task, ...}`` envelope key
+          principle 1's "compiler-vended task description" — a compile-time fact about *what this
+          node must do*, which has nothing to do with trust dialling. Authoring it here is what
+          makes ``harness_factory``'s existing ``frozen_contract[node].get("task", "")`` read return
+          something; before this, every agent received ``_serialize_prompt``'s bare fallback.
+        * ``trust_tier`` / ``static_context`` still require a wired ``payload_tier_fn`` and a
+          manifest that declares ``contract.context``, exactly as before.
+
+        A node with neither an authored task nor projectable context contributes nothing, so a plan
+        of un-annotated agents against no tier dial still yields ``{}``.
+        """
+        contract: Dict[str, dict] = {}
+
+        # -- half 1: the authored task + declared I/O (ALWAYS, no dial required) --------------
+        attrs = dag.attrs if dag is not None else {}
+        for node in order:
+            node_attrs = attrs.get(node) or {}
+            task = node_attrs.get("task")
+            io = {
+                key: node_attrs[key]
+                for key in ("inputs", "outputs")
+                if node_attrs.get(key)
+            }
+            if not task and not io:
+                continue
+            entry = contract.setdefault(node, {})
+            if task:
+                entry["task"] = task
+            if io:
+                entry["io"] = io
+
+        # -- half 2: the trust-tiered static context (opt-in, unchanged) ----------------------
         if self.payload_tier_fn is None:
-            return {}
+            return contract
         from concursus.governor.scheduler import project_context
 
-        contract: Dict[str, dict] = {}
         for node in order:
             manifest = manifests.get(node)
             context = getattr(manifest, "context", None) if manifest is not None else None
@@ -289,10 +331,12 @@ class OrchestrationAssembler:
             except Exception:  # noqa: BLE001 - a bad dial must not break a compile
                 continue
             tier_name = getattr(tier, "name", str(tier))
-            contract[node] = {"trust_tier": tier_name, "static_context": projected}
+            entry = contract.setdefault(node, {})
+            entry["trust_tier"] = tier_name
+            entry["static_context"] = projected
         return contract
 
-    # -- AI-20: bounded, monotonic re-compile -------------------------------
+    # -- bounded, monotonic re-compile -------------------------------
     def recompile(
         self,
         prior_plan: ProvisioningPlan,
@@ -304,7 +348,7 @@ class OrchestrationAssembler:
         max_revisions: int = DEFAULT_MAX_REVISIONS,
         compile_next: Optional[Iterable[str]] = None,
     ) -> ProvisioningPlan:
-        """Emit a FRESH, FROZEN, MONOTONIC-SUPERSET plan superseding ``prior_plan`` (AI-20).
+        """Emit a FRESH, FROZEN, MONOTONIC-SUPERSET plan superseding ``prior_plan``.
 
         This is the ONLY sanctioned plan mutation: the plan-generation feedback edge lives AROUND
         the compiler (run -> distill -> precedent -> next compile), never inside

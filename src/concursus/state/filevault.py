@@ -82,7 +82,7 @@ _PLAN_NOTE_NAME = "_plan.md"
 _PLAN_NOTE_MARKER = "concursus_note_kind"
 _PLAN_NOTE_KIND = "run_plan"
 
-# The durable per-agent PAYLOAD-contract note ( Phase 1 T3): the frozen invoke payload
+# The durable per-agent PAYLOAD-contract note: the frozen invoke payload
 # a node was dispatched with (the b2 contract — wired inputs + tiered static context + tool_calls +
 # trust_tier). Like the plan snapshot it is NOT a run record — stamped ``concursus_note_kind:
 # payload`` so :func:`_note_to_record` REFUSES it (same guard) and the record loaders skip it.
@@ -125,7 +125,7 @@ def _building_block_for(record: Record) -> str:
 # A run's records form a per-run Folgezettel trail: the run root is FZ ``"1"`` and each record is a
 # write-order child (``1a``, ``1b`` … bijective base-26 past 26), so notes carry a valid
 # ``folgezettel:`` / ``lineage:`` the SlipBox tooling accepts. Concursus addresses are ``/``-paths
-# (not dotted ordinals like HiveFleet), so FZ position is assigned by write order, not re-based.
+# (not dotted ordinals like HiveFleet), so is assigned by write order, not re-based.
 def _int_to_letters(n: int) -> str:
     """Bijective base-26: ``1→a … 26→z, 27→aa`` (a total, reversible ordinal→letter map)."""
     out = ""
@@ -136,8 +136,20 @@ def _int_to_letters(n: int) -> str:
 
 
 def _fz_for(position: int) -> str:
-    """The FZ string for the ``position``-th (1-based) record in a run: ``1a``, ``1b`` … under root ``1``."""
+    """The for the ``position``-th (1-based) record in a run: ``1a``, ``1b`` … under root ``1``."""
     return "1" + _int_to_letters(position)
+
+
+def _fz_child_suffix(parent_fz: str, ordinal: int) -> str:
+    """The ``ordinal``-th (0-based) child ``parent_fz`` in the alternating letter/digit grammar.
+
+    A parent ending in a DIGIT takes letter children (``a,b,…``); a parent ending in a LETTER takes
+    digit children (``1,2,…``). Prefix-derivable by construction: the child with the
+    parent FZ. (a prefix-derived child-FZ allocation.)
+    """
+    if parent_fz and parent_fz[-1].isdigit():
+        return parent_fz + _int_to_letters(ordinal + 1)  # 1-based bijective base-26: a, b, …
+    return parent_fz + str(ordinal + 1)  # 1, 2, …
 
 
 def _trail_id(session_id: str) -> str:
@@ -294,6 +306,25 @@ def _migrate_note_meta(meta: Dict[str, Any], from_version: int) -> Dict[str, Any
     return upgraded
 
 
+# The FileVault-LOCAL authoritative metadata: the shared, charset-restricted
+# :func:`_build_metadata` (untouched, so the AgentCore Memory projection is unchanged) PLUS the
+# extra run-state fields FileVault can afford to carry losslessly (its notes are not charset-limited
+# and never enter the Memory write path). Each extra key is emitted ONLY when present, so a record
+# without it produces a ``meta:`` blob byte-identical to the pre-R1-1 output. ``_apply_meta`` /
+# ``_event_to_record`` read these back, so they round-trip.
+_FILEVAULT_EXTRA_META_KEYS: Tuple[str, ...] = ("blocked_on", "failure_class", "agent_name", "arn")
+
+
+def _filevault_meta(record: Record) -> Dict[str, str]:
+    """`_build_metadata(record)` plus FileVault-only run-state keys (present-only; never in Memory)."""
+    machine = _build_metadata(record)  # shared, charset-restricted — do NOT mutate its contract
+    for key in _FILEVAULT_EXTRA_META_KEYS:
+        value = getattr(record, key, None)
+        if value is not None:
+            machine[key] = str(value)
+    return machine
+
+
 def _record_to_note(
     record: Record,
     *,
@@ -303,6 +334,7 @@ def _record_to_note(
     date: str = "",
     related: Optional[List[str]] = None,
     stamp_schema_version: bool = False,
+    fz_override: Optional[str] = None,
 ) -> str:
     """Render a :class:`Record` as a round-trip-exact markdown note.
 
@@ -323,7 +355,7 @@ def _record_to_note(
     future forward-only migration can key off it; it is OFF by default so the emitted bytes stay
     IDENTICAL to the pre-migration format (an unstamped note reads back as v1 — the baseline).
     """
-    machine = _build_metadata(record)  # the authoritative, all-string run-state keys
+    machine = _filevault_meta(record)  # shared _build_metadata + present-only FileVault extras
     # Two authoritative, lossless lines the reader reconstructs from — the HiveFleet discipline:
     # ``payload`` = the output blob, ``meta`` = the record's metadata. Every display field below
     # (SlipBox frontmatter, H1, body) is a lossy copy that :func:`_note_to_record` never reads.
@@ -342,7 +374,7 @@ def _record_to_note(
                   "", "```json", json.dumps(record.output, indent=2, sort_keys=True), "```", ""]
         return "\n".join(lines)
 
-    fz = _fz_for(position)
+    fz = fz_override if fz_override is not None else _fz_for(position)  # address-derived when set
     status = _SLIPBOX_STATUS.get(record.status, "active")
     tags = ["resource", "concursus", "run_state", record.record_type]
     keywords = [
@@ -539,6 +571,8 @@ def capture_run_plan_note(
     trail_id: str = "run",
     date: str = "",
     slipbox_form: bool = True,
+    revision: Optional[int] = None,
+    full: bool = False,
 ) -> str:
     """**AI-18.** Persist a compiled :class:`~concursus.assemble.ProvisioningPlan` as a durable
     ``model``+navigation note (``<run_dir>/_plan.md``); return its path.
@@ -554,8 +588,16 @@ def capture_run_plan_note(
     loaders (:meth:`FileVaultStateStore._load`, :func:`~concursus.rundb.load_records`) skip it — it
     never corrupts ``load_records`` or a resume/replay. Pure write-time projection of the frozen
     plan: it influences no dispatch and mutates nothing.
+
+    **Replan history (opt-in).** ``revision=None`` (default) writes the single fixed
+    ``_plan.md`` — byte-identical to before. When a ``revision`` int is passed, the note is written
+    to ``_plan_v{revision}.md`` instead, so a governor loop that recompiles per round keeps EVERY
+    plan revision rather than overwriting one file. ``full=False`` (default) keeps the compact
+    ``to_summary_dict()`` projection; ``full=True`` uses ``to_dict()`` (which additionally carries
+    ``revision``/``frontier``), so a per-revision note records what changed. Both default to the
+    pre-R2 behavior, so an unchanged caller emits an unchanged ``_plan.md``.
     """
-    summary = plan.to_summary_dict()
+    summary = plan.to_dict() if full else plan.to_summary_dict()
     order = summary["order"]
     wiring = summary["wiring"]
 
@@ -603,8 +645,9 @@ def capture_run_plan_note(
     lines.append("")
     lines.append("## Dispatch Order")
     lines.append("")
+    entries = summary.get("entries", {})  # to_dict may shape entries differently; tolerate absence
     for i, name in enumerate(order, 1):
-        entry = summary["entries"].get(name, {})
+        entry = entries.get(name, {}) if isinstance(entries, dict) else {}
         proto = entry.get("protocol") or "?"
         mode = entry.get("build_mode") or "?"
         lines.append(f"{i}. `{name}` — {mode}/{proto}")
@@ -620,8 +663,287 @@ def capture_run_plan_note(
     lines.append("```")
     lines.append("")
 
-    path = Path(run_dir) / _PLAN_NOTE_NAME
+    # per-revision filename when a revision is supplied; else the fixed single _plan.md.
+    note_name = f"_plan_v{revision}.md" if revision is not None else _PLAN_NOTE_NAME
+    path = Path(run_dir) / note_name
     Path(run_dir).mkdir(parents=True, exist_ok=True)
+    FileVaultStateStore._atomic_write(path, "\n".join(lines))
+    return str(path)
+
+
+# The digest-view marker: like the plan-note marker, it stamps a NON-record note so the record
+# loaders never parse a digest note back as a run Record.
+_DIGEST_NOTE_KIND = "hive_digest_view"
+
+# The goal-note marker: a NON-record note capturing the run's objective/request, stamped so
+# the loaders never parse it back as a run Record. The goal lives only in the planner input today,
+# so this is the durable on-disk record of "what this session was asked to do".
+_GOAL_NOTE_NAME = "_goal.md"
+_GOAL_NOTE_KIND = "hive_run_goal"
+
+
+# (R3-3/R3-4) The phase-note marker: one non-record navigation note per governor episode boundary,
+# giving the run trail its phase spine. Stamped so the loaders skip it.
+_PHASE_NOTE_KIND = "hive_phase_note"
+
+
+def render_phase_note(event: Dict[str, Any], run_dir, *, trail_id: str = "run", date: str = "") -> str:
+    """(R3-3/R3-4) Render one governor episode-boundary ``RunEvent`` as a phase note; return its path.
+
+    A small NON-record ``navigation`` note ``<run_dir>/_phase_r{round}_{type}.md`` carrying the
+    round's ``type`` (episode_start / episode_end / decision), ``completed`` and ``frontier`` sets,
+    so the trail shows the run's phases and the per-sub-agent record notes hang beneath a visible
+    round. Stamped ``concursus_note_kind: hive_phase_note`` so :func:`_note_to_record` refuses it and
+    the loaders skip it. Pure projection off a plain-dict event value; INV-safe.
+    """
+    etype = str(event.get("type", "phase"))
+    rnd = int(event.get("round", 0))
+    completed = list(event.get("completed", []) or [])
+    frontier = list(event.get("frontier", []) or [])
+    fm = {
+        "tags": ["resource", "concursus", "run_state", "run_phase"],
+        "keywords": [f"round {rnd}", etype, "governor phase", "episode boundary"],
+        "topics": _SLIPBOX_TOPICS,
+        "language": "markdown",
+        "date of note": date,
+        "status": "active",
+        "building_block": "navigation",
+        "folgezettel": "1",
+        "lineage": [f"{trail_id}:1"],
+        _PLAN_NOTE_MARKER: _PHASE_NOTE_KIND,
+        "access_control_group": ["general"],
+    }
+    lines: List[str] = ["---"]
+    for key, value in fm.items():
+        if isinstance(value, list):
+            lines.append(f"{key}:")
+            lines.extend(f"  - {json.dumps(v)}" for v in value)
+        else:
+            lines.append(f"{key}: {json.dumps(value)}")
+    lines += ["---", "", f"# Phase: round {rnd} — {etype} (`{trail_id}`)", "",
+              f"Governor episode boundary `{etype}` at round {rnd}.", "",
+              "## Completed", ""]
+    lines += [f"- `{n}`" for n in completed] or ["_(none yet)_"]
+    lines += ["", "## Frontier", ""]
+    lines += [f"- `{n}`" for n in frontier] or ["_(empty — run converged)_"]
+    lines.append("")
+    # ``etype`` is a member of the closed RunEventKind vocabulary (episode_start / episode_end /
+    # decision) — already filesystem-safe — so the phase note gets a STABLE, predictable name (no
+    # content-hash suffix), letting a later boundary of the same (round, type) overwrite in place.
+    safe_etype = "".join(c if (c.isalnum() or c in "._-") else "-" for c in etype).strip("-") or "phase"
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    path = Path(run_dir) / f"_phase_r{rnd}_{safe_etype}.md"
+    FileVaultStateStore._atomic_write(path, "\n".join(lines))
+    return str(path)
+
+
+# The raw-DAG note: the AUTHORED AgentDAG (nodes + edges = the task decomposition) BEFORE
+# assemble compiled it into a ProvisioningPlan. _plan.md keeps the compiled topology; this keeps the
+# intent. A NON-record note stamped so the loaders skip it.
+_DAG_NOTE_NAME = "_dag.md"
+_DAG_NOTE_KIND = "hive_run_dag"
+
+
+def capture_dag_note(
+    dag,
+    run_dir,
+    *,
+    trail_id: str = "run",
+    date: str = "",
+) -> str:
+    """Persist the AUTHORED ``AgentDAG`` (nodes + edges = task decomposition) as
+    ``<run_dir>/_dag.md``; return its path.
+
+    ``_plan.md`` captures the *compiled* ``ProvisioningPlan`` (post-assemble ``order``/``wiring``);
+    this captures the *authored intent* — the decomposition the planner produced before compilation
+    — which is otherwise lost. Non-record (stamped ``concursus_note_kind: hive_run_dag``), so the
+    loaders skip it. Pure write-time projection; INV-4 safe.
+    """
+    nodes = list(dag.nodes) if not callable(getattr(dag, "nodes", None)) else list(dag.nodes())
+    edges = list(dag.edges) if not callable(getattr(dag, "edges", None)) else list(dag.edges())
+    fm = {
+        "tags": ["resource", "concursus", "run_state", "run_dag"],
+        "keywords": ["concursus dag", "task decomposition", "authored topology"],
+        "topics": _SLIPBOX_TOPICS,
+        "language": "markdown",
+        "date of note": date,
+        "status": "active",
+        "building_block": "model",  # a structural model of the authored task graph
+        "folgezettel": "1",
+        "lineage": [f"{trail_id}:1"],
+        _PLAN_NOTE_MARKER: _DAG_NOTE_KIND,
+        "access_control_group": ["general"],
+    }
+    lines: List[str] = ["---"]
+    for key, value in fm.items():
+        if isinstance(value, list):
+            lines.append(f"{key}:")
+            lines.extend(f"  - {json.dumps(v)}" for v in value)
+        else:
+            lines.append(f"{key}: {json.dumps(value)}")
+    lines += ["---", "", f"# Authored DAG: {trail_id}", "", "## Nodes", ""]
+    for n in nodes:
+        lines.append(f"- `{n}`")
+    lines += ["", "## Edges", ""]
+    if edges:
+        for e in edges:
+            a, b = (e[0], e[1]) if isinstance(e, (tuple, list)) else (getattr(e, "src", "?"), getattr(e, "dst", "?"))
+            lines.append(f"- `{a}` → `{b}`")
+    else:
+        lines.append("_(no edges — independent nodes)_")
+    lines.append("")
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    path = Path(run_dir) / _DAG_NOTE_NAME
+    FileVaultStateStore._atomic_write(path, "\n".join(lines))
+    return str(path)
+
+
+def capture_goal_note(
+    goal: str,
+    run_dir,
+    *,
+    trail_id: str = "run",
+    date: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Persist the run's goal/request as ``<run_dir>/_goal.md``; return its path.
+
+    The objective the planner was handed is otherwise never written to disk (lost on teardown).
+    This captures it as a durable, non-record ``navigation`` note stamped ``concursus_note_kind:
+    hive_run_goal`` (so :func:`_note_to_record` refuses it and the loaders skip it — it never
+    corrupts ``load_records``/replay). Optional ``metadata`` (precision target, risk appetite, …)
+    is rendered as a small facts list. Pure write-time projection; INV-4 safe.
+    """
+    fm = {
+        "tags": ["resource", "concursus", "run_state", "run_goal"],
+        "keywords": ["concursus goal", "run objective", "request"],
+        "topics": _SLIPBOX_TOPICS,
+        "language": "markdown",
+        "date of note": date,
+        "status": "active",
+        "building_block": "navigation",
+        "folgezettel": "1",
+        "lineage": [f"{trail_id}:1"],
+        _PLAN_NOTE_MARKER: _GOAL_NOTE_KIND,
+        "access_control_group": ["general"],
+    }
+    lines: List[str] = ["---"]
+    for key, value in fm.items():
+        if isinstance(value, list):
+            lines.append(f"{key}:")
+            lines.extend(f"  - {json.dumps(v)}" for v in value)
+        else:
+            lines.append(f"{key}: {json.dumps(value)}")
+    lines += ["---", "", f"# Run Goal: {trail_id}", "", "## Objective", "", goal.strip(), ""]
+    if metadata:
+        lines += ["## Parameters", ""]
+        for k, v in metadata.items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    path = Path(run_dir) / _GOAL_NOTE_NAME
+    FileVaultStateStore._atomic_write(path, "\n".join(lines))
+    return str(path)
+
+
+def render_digest_view_note(
+    record: Record,
+    run_dir,
+    *,
+    trail_id: str = "run",
+    date: str = "",
+) -> str:
+    """Render ONE record as a **consolidation-digestible** markdown note; return its path.
+
+    This is a SECOND, additive projection (never a run Record — stamped ``concursus_note_kind:
+    hive_digest_view`` so :func:`_note_to_record` refuses it and the loaders skip it). It differs
+    from the replay record note in exactly the ways a knowledge-consolidation digester keys on:
+
+    * ``language: markdown`` (not ``json``) so the body is prose the plan-phase can section;
+    * one ATX ``##`` heading per building-block shape (a consolidation digester decomposes on H1-H3 headings and
+      forbids mixed BBs in one section) — a validated response → an ``## Observed`` empirical-
+      observation section; a failed record → a ``## Failure`` counter-argument section;
+    * every identifier (node, agent, arn, consumed producers, content hash) in ``backticks`` so
+      a consolidation digester.s identifier-grounding finds them verbatim in the source;
+    * a ``## Provenance`` section citing this record's own address/event so a claim can be grounded.
+
+    Written to ``<run_dir>/<slug(address)>__a<attempt>.digest.md``. Pure post-run projection: no
+    Record, no replay effect, INV-4 safe.
+    """
+    bb = _building_block_for(record)
+    addr = record.address or record.node
+    status = _SLIPBOX_STATUS.get(record.status, "active")
+    fm = {
+        "tags": ["resource", "concursus", "run_digest", record.record_type],
+        "keywords": [f"node {record.node}", f"attempt {record.attempt}",
+                     record.schema or "agent output", f"status {record.status}"],
+        "topics": _SLIPBOX_TOPICS,
+        "language": "markdown",
+        "date of note": date,
+        "status": status,
+        "building_block": bb,
+        "folgezettel": "1",
+        "lineage": [f"{trail_id}:1"],
+        _PLAN_NOTE_MARKER: _DIGEST_NOTE_KIND,  # non-record stamp: never parsed back as a Record
+        "access_control_group": ["general"],
+    }
+    lines: List[str] = ["---"]
+    for key, value in fm.items():
+        if isinstance(value, list):
+            lines.append(f"{key}:")
+            lines.extend(f"  - {json.dumps(v)}" for v in value)
+        else:
+            lines.append(f"{key}: {json.dumps(value)}")
+    lines += ["---", ""]
+
+    lines.append(f"# Run Node `{record.node}` (attempt {record.attempt}, {record.status})")
+    lines.append("")
+    if record.agent_name:
+        arn = f" (`{record.arn}`)" if record.arn else ""
+        lines.append(f"Executed by agent `{record.agent_name}`{arn}.")
+        lines.append("")
+
+    if record.status == "failed":
+        # counter_argument shape: the flaw + what it attacks
+        lines.append("## Failure")
+        lines.append("")
+        fc = f"`{record.failure_class}`" if record.failure_class else "unclassified"
+        blocked = f" blocked on `{record.blocked_on}`" if record.blocked_on else ""
+        lines.append(f"Node `{record.node}` did not validate — failure class {fc}{blocked}.")
+        lines.append("")
+    else:
+        # empirical_observation shape: what happened + the observed output
+        lines.append("## Observed")
+        lines.append("")
+        lines.append(
+            f"Node `{record.node}` returned a validated output"
+            + (f" against schema `{record.schema}`" if record.schema else "")
+            + f" (content hash `{record.content_hash or 'n/a'}`)."
+        )
+        lines.append("")
+        lines.append("```json")
+        lines.append(json.dumps(record.output, indent=2, sort_keys=True))
+        lines.append("```")
+        lines.append("")
+
+    if record.consumes:
+        lines.append("## Inputs Consumed")
+        lines.append("")
+        for edge in record.consumes:
+            lines.append(f"- `{edge}`")
+        lines.append("")
+
+    lines.append("## Provenance")
+    lines.append("")
+    lines.append(
+        f"Source: run `{trail_id}`, node address `{addr}`, attempt {record.attempt}"
+        + (f", event `{record.event_id}`" if record.event_id else "") + "."
+    )
+    lines.append("")
+
+    note_name = f"{_slug(addr)}__a{record.attempt}.digest.md"
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    path = Path(run_dir) / note_name
     FileVaultStateStore._atomic_write(path, "\n".join(lines))
     return str(path)
 
@@ -668,7 +990,7 @@ def capture_agent_log_note(
     For concursus the ONLY promotion trigger for a raw log is ``status == "failed"`` — a failed
     record is already a ``counter_argument`` note (see :func:`_building_block_for`). This
     deliberately does NOT build a ``.3``-verdict-citation promotion path: turning a log into a
-    cited verdict is the reasoning tier (Phase 5), out of scope for these write-time renderers. A
+    cited verdict is the reasoning tier, out of scope for these write-time renderers. A
     non-failed log is not worth a durable note here — the run's append-only record log already
     captures it — so this returns ``None`` (the caller keeps it as a gitignored/derived sidecar or
     drops it). When the record IS failed, it renders through the same round-trip-exact path as any
@@ -725,7 +1047,7 @@ def capture_run_output_note(
 
 
 def redact(payload: Mapping[str, Any], *, deny: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Return a shallow-redacted copy of a payload for durable capture ( T3, PII gate).
+    """Return a shallow-redacted copy of a payload for durable capture (T3, PII gate).
 
     A payload can carry sensitive run inputs (case data). Before a payload is written to a durable
     note, drop any top-level key in ``deny`` (default :data:`_DEFAULT_REDACT_KEYS`) and mask its
@@ -757,7 +1079,7 @@ def capture_payload_note(
     redact_keys: Optional[List[str]] = None,
     slipbox_form: bool = True,
 ) -> str:
-    """** T3.** Persist a node's frozen invoke PAYLOAD as a durable audit note; return
+    """**T3.** Persist a node's frozen invoke PAYLOAD as a durable audit note; return
     its path (``<run_dir>/<node>__payload.md``).
 
     Renders the b2 payload contract — the (redacted) invoke payload the node was dispatched with
@@ -826,12 +1148,12 @@ def capture_payload_note(
     return str(path)
 
 
-#: The heading a reciprocal-backlink post-pass appends under each producer note ( T6).
+#: The heading a reciprocal-backlink post-pass appends under each producer note (T6).
 _CONSUMED_BY_HEADING = "## Consumed By"
 
 
 def add_reciprocal_backlinks(run_dir) -> int:
-    """** T6.** Add reciprocal "consumed by" backlinks over a finished run's notes.
+    """**T6.** Add reciprocal "consumed by" backlinks over a finished run's notes.
 
     ``filevault``'s ``_related_for`` links a note FORWARD to each producer it ``consumes`` — but a
     producer note is a dead-end w.r.t. WHO consumed it. This post-pass closes that gap: it reads
@@ -1057,7 +1379,7 @@ def append_note_version(
     reverted_from: Optional[int] = None,
     force: bool = False,
 ) -> Optional[str]:
-    """**.** Append a new version of ``note_name`` to its append-only timeline; return the new
+    """Append a new version of ``note_name`` to its append-only timeline; return the new
     snapshot path, or ``None`` when the content is unchanged (a de-duplicated no-op).
 
     APPEND-ONLY: an existing snapshot is NEVER rewritten — a new ``vNNN.md`` (N = one past the
@@ -1094,7 +1416,7 @@ def revert_note(
     when: str = "",
     restore_live: bool = True,
 ) -> str:
-    """**.** Revert a note to a prior ``version`` by writing that version's content FORWARD as
+    """Revert a note to a prior ``version`` by writing that version's content FORWARD as
     a NEW timeline version (never rewriting history); return the new snapshot path.
 
     A revert is not a rollback of the log — it is a forward step: it reads the immutable snapshot at
@@ -1307,6 +1629,7 @@ class FileVaultStateStore:
         trail_id: str = "run",
         date: str = "",
         versioned: bool = False,
+        address_derived_fz: bool = False,
     ) -> None:
         self._dir = Path(run_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -1317,6 +1640,15 @@ class FileVaultStateStore:
         # snapshotted into the append-only ``versions/`` timeline. OFF ⇒ no ``versions/``
         # dir is ever created, so the store's on-disk bytes are byte-identical to before.
         self._versioned = versioned
+        # OPT-IN (default OFF): derive each record note's ``folgezettel`` from the record's
+        # materialized ``address`` (a prefix-derivable path like ``map/0``) instead of the flat
+        # write-order ``1a/1b/…``. OFF ⇒ the exact legacy write-order FZ scheme, byte-identical.
+        self._address_derived_fz = address_derived_fz
+        # allocator state (only used when address_derived_fz): the to each seen
+        # address path, and the child-count per parent siblings get distinct, prefix-derivable
+        # suffixes (map/0 → 1a1, map/1 → 1a2). The run root itself is FZ "1".
+        self._addr_fz: Dict[str, str] = {}
+        self._fz_child_count: Dict[str, int] = {}
         self._records: List[Record] = []
         self._projection: Dict[str, dict] = {}
         self._attempts: Dict[str, int] = {}
@@ -1418,9 +1750,33 @@ class FileVaultStateStore:
             return
         append_note_version(self._dir, note_name, text, when=self._date)
 
+    def _allocate_fz(self, address: str) -> str:
+        """A stable, prefix-derivable a record ``address`` path (root ``1``).
+
+        Memoized per address so a re-put of the same address reuses its FZ. Each new address's FZ
+        is a fresh child of its parent's FZ (the address minus its last ``/`` segment), with the
+        per-parent child ordinal drawn from ``_fz_child_count`` so siblings never collide
+        (``map/0`` → ``1a1``, ``map/1`` → ``1a2``). A top-level address (no ``/``) is a child of the
+        run root ``1``.
+        """
+        addr = address or ""
+        if addr in self._addr_fz:
+            return self._addr_fz[addr]
+        parent_addr, sep, _leaf = addr.rpartition(_ADDR_SEP)
+        parent_fz = self._allocate_fz(parent_addr) if sep else "1"
+        ordinal = self._fz_child_count.get(parent_fz, 0)
+        self._fz_child_count[parent_fz] = ordinal + 1
+        fz = _fz_child_suffix(parent_fz, ordinal)
+        self._addr_fz[addr] = fz
+        return fz
+
     def _write_note(self, record: Record) -> None:
-        position = len(self._records) + 1 # 1-based write order → the record's FZ position
+        position = len(self._records) + 1  # 1-based write order → the record's FZ position
         related = self._related_for(record)
+        fz_override = (
+            self._allocate_fz(record.address or record.node)
+            if self._address_derived_fz else None
+        )
         text = _record_to_note(
             record,
             slipbox_form=self._slipbox_form,
@@ -1428,6 +1784,7 @@ class FileVaultStateStore:
             trail_id=self._trail_id,
             date=self._date,
             related=related,
+            fz_override=fz_override,
         )
         note_name = self._note_filename(record)
         self._atomic_write(self._dir / note_name, text)
@@ -1477,6 +1834,31 @@ class FileVaultStateStore:
         lines += ["---", "", "# Run State: trail entry point", "",
                   f"The Folgezettel root of this concursus run (trail `{self._trail_id}`). "
                   "Each record below is one node output, addressed as a child of this root.", ""]
+        # Enriched head — rendered ONLY when the data exists, so a bare run is byte-identical:
+        # sibling navigation links (goal / authored DAG / plan) + an agent-assignment table.
+        sibling_links = [
+            (name, label) for name, label in (
+                (_GOAL_NOTE_NAME, "Goal"), (_DAG_NOTE_NAME, "Authored DAG"), (_PLAN_NOTE_NAME, "Plan"),
+            ) if (self._dir / name).exists()
+        ]
+        if sibling_links:
+            lines.append("## Run Artifacts")
+            lines.append("")
+            lines.extend(f"- [{label}]({name})" for name, label in sibling_links)
+            lines.append("")
+        assignments = [
+            (r.node, r.agent_name, r.arn) for r in self._records if getattr(r, "agent_name", None)
+        ]
+        if assignments:
+            lines.append("## Agent Assignment")
+            lines.append("")
+            lines.append("| Node | Agent | ARN |")
+            lines.append("|------|-------|-----|")
+            for node, agent, arn in assignments:
+                lines.append(f"| `{node}` | `{agent}` | `{arn or 'n/a'}` |")
+            lines.append("")
+        lines.append("## Records")
+        lines.append("")
         lines += rows if rows else ["- (no records yet)"]
         lines.append("")
         text = "\n".join(lines)

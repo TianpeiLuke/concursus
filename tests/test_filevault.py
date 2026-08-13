@@ -120,7 +120,7 @@ def test_notes_written_to_disk(tmp_path):
 
 
 def test_default_form_is_slipbox_and_roundtrips(tmp_path):
-    """The DEFAULT posture is the authentic slipbox form: a ``_run.md`` entry point plus
+    """The DEFAULT posture is the authentic Abuse-SlipBox form: a ``_run.md`` entry point plus
     per-record notes carrying SlipBox scaffolding (building_block/folgezettel/Related-Notes), and
     the durable log still round-trips arbitrary outputs exactly and resumes from a fresh store."""
     run = tmp_path / "run"
@@ -618,3 +618,199 @@ def test_revert_note_can_skip_restoring_the_live_note(tmp_path):
     _fv.revert_note(run, "doc.md", 1, restore_live=False)
     assert (run / "doc.md").read_text() == "B"  # live head untouched
     assert _fv.read_note_versions(run, "doc.md")[-1]["content"] == "A"  # but timeline records A
+
+
+# -- R1-1: FileVault-local metadata (agent_name/arn/failure_class/blocked_on) -------------------
+# The extra run-state fields ride the FileVault ``meta:`` blob via ``_filevault_meta`` and round-trip
+# via ``_note_to_record`` — WITHOUT being added to the shared, charset-restricted ``_build_metadata``
+# (so the AgentCore Memory metadata projection is untouched). Each is emitted present-only, so a
+# record without them is byte-identical to the pre-R1-1 note.
+from concursus.state.statestore import _build_metadata as _bm
+
+
+def test_filevault_meta_default_off_is_build_metadata():
+    """A record with no R1-1 fields set → the meta blob equals _build_metadata exactly."""
+    rec = Record(node="triage", output={"root_cause": "x"}, attempt=1, content_hash="h",
+                 schema="s", producer="triage", consumes=["fetch:$.ok"])
+    assert _fv._filevault_meta(rec) == _bm(rec)
+
+
+def test_filevault_meta_extra_keys_present_only_and_not_in_build_metadata():
+    """agent_name/arn appear in the FileVault meta only when set, and never in _build_metadata."""
+    rec = Record(node="deploy", output={"ok": True}, attempt=1, content_hash="h",
+                 agent_name="slipbox_foundry", arn="arn:aws:bedrock-agentcore:...:runtime/x")
+    fm = _fv._filevault_meta(rec)
+    assert fm["agent_name"] == "slipbox_foundry"
+    assert fm["arn"] == "arn:aws:bedrock-agentcore:...:runtime/x"
+    # the shared Memory projection stays clean (charset contract intact)
+    assert "agent_name" not in _bm(rec) and "arn" not in _bm(rec)
+
+
+def test_filevault_note_roundtrips_agent_binding():
+    rec = Record(node="deploy", output={"ok": True}, attempt=1, content_hash="h",
+                 agent_name="slipbox_foundry", arn="arn:aws:...:runtime/x")
+    back = _note_to_record(_record_to_note(rec))
+    assert back.agent_name == "slipbox_foundry"
+    assert back.arn == "arn:aws:...:runtime/x"
+
+
+def test_filevault_note_roundtrips_failure_class_and_blocked_on():
+    """A failed record now round-trips failure_class/blocked_on through the note (latent gap closed)."""
+    rec = Record(node="score", output={}, status="failed",
+                 failure_class="hold", blocked_on="fetch")
+    back = _note_to_record(_record_to_note(rec))
+    assert back.failure_class == "hold"
+    assert back.blocked_on == "fetch"
+
+
+def test_filevault_plain_record_has_none_binding():
+    rec = Record(node="triage", output={"a": 1}, attempt=1, content_hash="h")
+    back = _note_to_record(_record_to_note(rec))
+    assert back.agent_name is None and back.arn is None
+
+
+# -- R2: per-revision plan notes (opt-in) ------------------------------------------------------
+class _FakePlan:
+    revision = 3
+    frontier = ["b"]
+
+    def to_summary_dict(self):
+        return {"order": ["a", "b"],
+                "wiring": {"b": [{"producer": "a", "input_name": "x"}]},
+                "entries": {"a": {"protocol": "MCP", "build_mode": "reuse"},
+                            "b": {"protocol": "A2A", "build_mode": "build"}}}
+
+    def to_dict(self):
+        d = self.to_summary_dict()
+        d["revision"] = self.revision
+        d["frontier"] = self.frontier
+        return d
+
+
+def test_plan_note_default_is_single_plan_md(tmp_path):
+    p = _fv.capture_run_plan_note(_FakePlan(), str(tmp_path), trail_id="run", date="2026-08-11")
+    assert os.path.basename(p) == "_plan.md"
+    assert '"revision"' not in (tmp_path / "_plan.md").read_text()  # compact summary, no revision
+
+
+def test_plan_note_per_revision_and_full(tmp_path):
+    p = _fv.capture_run_plan_note(_FakePlan(), str(tmp_path), trail_id="run", date="2026-08-11",
+                                  revision=3, full=True)
+    assert os.path.basename(p) == "_plan_v3.md"
+    txt = (tmp_path / "_plan_v3.md").read_text()
+    assert '"revision": 3' in txt and '"frontier"' in txt
+
+
+def test_plan_note_refuses_to_parse_as_record(tmp_path):
+    for kw in ({}, {"revision": 3, "full": True}):
+        p = _fv.capture_run_plan_note(_FakePlan(), str(tmp_path), trail_id="run", date="2026-08-11", **kw)
+        with pytest.raises(ValueError):
+            _note_to_record((tmp_path / os.path.basename(p)).read_text())
+
+
+# -- R3-1: address-derived Folgezettel (opt-in) ------------------------------------------------
+def _fzs(run_dir):
+    import re
+    out = []
+    for p in run_dir.glob("*.md"):
+        if p.name in ("_run.md", "_plan.md"):
+            continue
+        m = re.search(r'^folgezettel: "(.*?)"', p.read_text(), re.M)
+        if m:
+            out.append(m.group(1))
+    return sorted(out)
+
+
+def test_fz_default_off_is_write_order(tmp_path):
+    s = FileVaultStateStore(str(tmp_path), trail_id="run")
+    s.put("triage", {"a": 1})
+    s.put("score", {"b": 2})
+    assert _fzs(tmp_path) == ["1a", "1b"]  # legacy write-order, byte-identical
+
+
+def test_fz_address_derived_is_prefix_derivable_and_unique(tmp_path):
+    s = FileVaultStateStore(str(tmp_path), trail_id="run", address_derived_fz=True)
+    s.put("map", {"k": 0}, meta={"address": "map"})
+    s.put("map", {"k": 1}, meta={"address": "map/0"})
+    s.put("map", {"k": 2}, meta={"address": "map/1"})
+    fzs = _fzs(tmp_path)
+    assert len(set(fzs)) == len(fzs)  # unique
+    assert "1a" in fzs and "1a1" in fzs and "1a2" in fzs  # children prefix-derive from parent 1a
+
+
+# -- R1-2 goal note + R1-5 authored-DAG note (non-record projections) --------------------------
+def test_goal_note_is_navigation_and_not_a_record(tmp_path):
+    p = _fv.capture_goal_note("Launch ATO detection for EU5", str(tmp_path), trail_id="run",
+                              date="2026-08-11", metadata={"precision_target": "0.9"})
+    assert os.path.basename(p) == "_goal.md"
+    t = (tmp_path / "_goal.md").read_text()
+    assert "Launch ATO detection" in t and "precision_target" in t and '"navigation"' in t
+    with pytest.raises(ValueError):
+        _note_to_record(t)
+
+
+def test_goal_note_not_loaded_as_record(tmp_path):
+    _fv.capture_goal_note("do X", str(tmp_path), trail_id="run", date="2026-08-11")
+    s = FileVaultStateStore(str(tmp_path), trail_id="run")
+    s.put("x", {"ok": True})
+    recs = s.records()
+    assert len(recs) == 1 and recs[0].node == "x"  # the goal note is skipped, not parsed
+
+
+def test_dag_note_captures_authored_topology(tmp_path):
+    from concursus import AgentDAG
+    dag = AgentDAG()
+    for n in ("discover", "model", "deploy"):
+        dag.add_node(n)
+    dag.add_edge("discover", "model")
+    dag.add_edge("model", "deploy")
+    p = _fv.capture_dag_note(dag, str(tmp_path), trail_id="run", date="2026-08-11")
+    assert os.path.basename(p) == "_dag.md"
+    t = (tmp_path / "_dag.md").read_text()
+    assert "`discover` → `model`" in t and '"model"' in t
+    with pytest.raises(ValueError):
+        _note_to_record(t)
+
+
+# -- R3-3/R3-4: per-episode phase notes (the run trail's phase spine), non-record ---------------
+def test_phase_note_renders_round_and_sets_and_is_non_record(tmp_path):
+    event = {
+        "type": "episode_end", "run_id": "r1", "round": 2,
+        "completed": ["discover", "model"], "frontier": ["deploy"],
+    }
+    p = _fv.render_phase_note(event, str(tmp_path), trail_id="run", date="2026-08-11")
+    assert os.path.basename(p) == "_phase_r2_episode_end.md"
+    t = (tmp_path / "_phase_r2_episode_end.md").read_text()
+    assert "round 2 — episode_end" in t
+    assert "`discover`" in t and "`model`" in t and "`deploy`" in t
+    # non-record: the loaders must refuse to parse a phase note back as a Record
+    with pytest.raises(ValueError):
+        _note_to_record(t)
+
+
+def test_phase_note_empty_frontier_reads_as_converged(tmp_path):
+    event = {"type": "decision", "run_id": "r1", "round": 5, "completed": ["a"], "frontier": []}
+    p = _fv.render_phase_note(event, str(tmp_path), trail_id="run", date="2026-08-11")
+    t = (tmp_path / os.path.basename(p)).read_text()
+    assert "run converged" in t
+    assert os.path.basename(p) == "_phase_r5_decision.md"
+
+
+# -- R3-2: enriched _run.md head (artifacts links + agent-assignment table), present-only --------
+def test_run_head_is_plain_without_extras(tmp_path):
+    s = FileVaultStateStore(str(tmp_path), trail_id="run")
+    s.put("a", {"x": 1})
+    head = (tmp_path / "_run.md").read_text()
+    assert "## Agent Assignment" not in head  # no binding captured
+    assert "## Run Artifacts" not in head      # no _goal/_dag/_plan sibling notes
+    assert "## Records" in head                 # records section always present
+
+
+def test_run_head_shows_artifacts_and_assignment_when_present(tmp_path):
+    _fv.capture_goal_note("do X", str(tmp_path), trail_id="run", date="2026-08-11")
+    s = FileVaultStateStore(str(tmp_path), trail_id="run")
+    s.put("worker", {"ok": True}, meta={"agent_name": "slipbox_foundry", "arn": "arn:aws:x"})
+    s.put("next", {"ok": True})  # second put so the worker row + assignment render
+    head = (tmp_path / "_run.md").read_text()
+    assert "[Goal](_goal.md)" in head
+    assert "## Agent Assignment" in head and "`slipbox_foundry`" in head

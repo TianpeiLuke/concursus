@@ -1,6 +1,6 @@
 """The **capture front** — a source-agnostic envelope + dispatcher onto the shipped note writers.
 
- SPIKE A. Hive's memory store (:mod:`concursus.state.filevault` +
+SPIKE A. Hive's memory store (:mod:`concursus.state.filevault` +
 :mod:`concursus.state.distill`) already writes durable, round-trip-exact slipbox notes per
 run artifact. This module adds the ONE novel abstraction that lets *any* artifact reach those
 writers uniformly: a frozen :class:`CaptureEnvelope` (filled by a per-source ``adapt_<kind>``
@@ -29,6 +29,9 @@ AGENT_LOG = "agent_log"
 RUN_SUMMARY = "run_summary"
 BINDING = "binding"
 PAYLOAD = "payload"
+#: (R4) A consolidation-digestible markdown view of one record — the second, additive projection the
+#: transfer plan's C2 export ships to a consolidation sub-agent. Wired to :func:`_seam_digest_view`.
+DIGEST_VIEW = "digest_view"
 
 
 class CaptureError(ValueError):
@@ -71,7 +74,7 @@ def adapt_plan(plan: Any, run_dir: str, *, trail_id: str = "run", date: str = ""
     A thin wrap — the artifact IS the plan; :func:`capture` routes it to the shipped
     :func:`~concursus.state.filevault.capture_run_plan_note`, which writes ``<run_dir>/_plan.md``
     (a ``run_plan``-stamped slipbox note that ``_note_to_record`` refuses to parse back). Realizes
-     #1 (persist the frozen plan) through the envelope/dispatcher seam.
+    #1 (persist the frozen plan) through the envelope/dispatcher seam.
     """
     return CaptureEnvelope(PLAN, plan, run_dir, trail_id=trail_id, date=date)
 
@@ -86,7 +89,7 @@ def adapt_payload(
     date: str = "",
     related: Optional[List[str]] = None,
 ) -> CaptureEnvelope:
-    """Adapt a node's frozen invoke PAYLOAD into a:data:`PAYLOAD` envelope ( T3).
+    """Adapt a node's frozen invoke PAYLOAD into a :data:`PAYLOAD` envelope (T3).
 
     The artifact is a ``(node, payload, trust_tier)`` tuple; :func:`capture` routes it to the
     :func:`~concursus.state.filevault.capture_payload_note` seam, which REDACTS PII and writes a
@@ -125,12 +128,28 @@ def _seam_payload(env: CaptureEnvelope) -> str:
     )
 
 
+def _seam_digest_view(env: CaptureEnvelope) -> str:
+    """(R4) Render one record as a consolidation-digestible markdown note (a second projection)."""
+    from concursus.state.filevault import render_digest_view_note
+
+    return render_digest_view_note(
+        env.artifact, env.run_dir, trail_id=env.trail_id, date=env.date
+    )
+
+
+def adapt_digest_view(record: Any, run_dir: str, *, trail_id: str = "run", date: str = "") -> CaptureEnvelope:
+    """Adapter: wrap one :class:`Record` for the R4 digest-view seam."""
+    return CaptureEnvelope(source_kind=DIGEST_VIEW, artifact=record, run_dir=run_dir,
+                           trail_id=trail_id, date=date)
+
+
 #: The source_kind -> shipped-seam dispatch table. The "capture graph" of the design is exactly
 #: this dict; adding a source = adding an adapter + one row here, never a new runtime.
 _SEAMS: Dict[str, Callable[[CaptureEnvelope], str]] = {
     PLAN: _seam_plan,
     AGENT_RESPONSE: _seam_agent_response,
     PAYLOAD: _seam_payload,
+    DIGEST_VIEW: _seam_digest_view,
 }
 
 
@@ -163,7 +182,7 @@ def capture_run(
     backlinks: bool = True,
     version_notes: bool = False,
 ) -> Dict[str, Any]:
-    """** T4.** The post-run capture trigger: build + dispatch envelopes for a finished
+    """The post-run capture trigger: build + dispatch envelopes for a finished
     run, then run the T6 reciprocal-backlink post-pass. Returns ``{"paths": [...], "backlinks": n}``
     (plus ``"versioned": n`` when ``version_notes=True``).
 
@@ -217,7 +236,7 @@ def capture_run(
 
 def _version_run_notes(run_dir: str, *, date: str = "") -> int:
     """Snapshot every current top-level note under ``run_dir`` into the append-only version timeline
-    ; return how many notes gained a new version. Skips the ``versions/`` sidecar tree and
+   ; return how many notes gained a new version. Skips the ``versions/`` sidecar tree and
     the derived ``index/`` DB dir. Append-only + content-hash de-duped, so a re-run adds nothing for
     an unchanged note. Pure post-run write (notes-not-records; no live-plan mutation)."""
     import os
@@ -239,13 +258,13 @@ def _version_run_notes(run_dir: str, *, date: str = "") -> int:
 
 # -- T5: the gate + verify pass over a run dir ------------------------------
 def gate_run_dir(run_dir: str) -> Dict[str, Any]:
-    """** T5.** Run a lightweight post-write GATE over a run's capture notes; return a
+    """Run a lightweight post-write GATE over a run's capture notes; return a
     ``{"ok": bool, "checked": n, "issues": [...]}`` verdict.
 
     A *safety net*, not a blocker (the deterministic writers rarely err): it re-reads every note
     under ``run_dir`` and flags (a) a missing YAML frontmatter block and (b) a **dangling
     ``consumes`` backlink** — a note whose Related-Notes line points to a producer note file that is
-    not on disk. This is the [ #2] "actually RUN the format/link check, don't just
+    not on disk. This is the [#2] "actually RUN the format/link check, don't just
     assume compatibility" improvement, scoped to what a deterministic writer can regress. Read-only;
     it never rewrites a note. (Independent-verify of LLM-*enriched* notes — #3 — is a separate,
     enriched-only pass; the deterministic seams here are faithful by construction and skip it.)
@@ -278,7 +297,7 @@ def gate_run_dir(run_dir: str) -> Dict[str, Any]:
 
 # -- I2 (Phase 3, FUTURE hook): the read-back primitive --------------------
 def load_payload_tiers(run_dir: str) -> Dict[str, str]:
-    """Read persisted payload notes back into ``{node: trust_tier}`` ( I2 — FUTURE hook).
+    """Read persisted payload notes back into ``{node: trust_tier}`` (— FUTURE hook).
 
     The minimal read-back primitive the P3/P4 flywheel needs: it re-reads the
     ``<node>__payload.md`` notes a prior run captured and recovers the trust tier each node ran at.
@@ -307,8 +326,23 @@ def load_payload_tiers(run_dir: str) -> Dict[str, str]:
     return out
 
 
+def capture_digest_view(run_dir: str, records, *, trail_id: str = "run", date: str = "") -> List[str]:
+    """(R4) Render a consolidation-digestible digest note per record; return the written paths.
+
+    The batch entry point the transfer plan's C2 export ships to a consolidation sub-agent (as one
+    ``admit_bundle`` objective). Pure post-run projection: each note is a NON-record digest view
+    (stamped so the loaders skip it), so this never mutates the log or affects replay (INV-4). An
+    empty ``records`` writes nothing.
+    """
+    paths: List[str] = []
+    for record in records or []:
+        paths.append(capture(adapt_digest_view(record, run_dir, trail_id=trail_id, date=date)))
+    return paths
+
+
 __all__ = [
     "capture_run",
+    "capture_digest_view",
     "load_payload_tiers",
     "gate_run_dir",
     "CaptureEnvelope",
@@ -316,10 +350,12 @@ __all__ = [
     "capture",
     "adapt_plan",
     "adapt_payload",
+    "adapt_digest_view",
     "PLAN",
     "AGENT_RESPONSE",
     "AGENT_LOG",
     "RUN_SUMMARY",
     "BINDING",
     "PAYLOAD",
+    "DIGEST_VIEW",
 ]

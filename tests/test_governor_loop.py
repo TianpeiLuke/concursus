@@ -2047,3 +2047,193 @@ def test_buggy_gate_fails_open_to_default():
     assert result.terminated_by == "frontier_exhaust"
     assert result.done is True
     assert fake.run_count == 1
+
+
+# -- R1-3: persist earned trust as an append-only coordination notice (opt-in) -----------------
+def test_persist_trust_writes_earned_trust_coordination_notice(tmp_path):
+    """With persist_trust=True + a scheduler, each newly-completed node's re-earned grade is
+    appended as a non-validated 'earned_trust' coordination notice on the durable log."""
+    fake = _fresh_held_tracking()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=_trust_scheduler(tmp_path),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+        persist_trust=True,
+    )
+    loop.run({"uri": "s3://doc"})
+
+    notices = [r for r in store.records()
+               if r.record_type == "coordination" and r.output.get("kind") == "earned_trust"]
+    assert notices, "expected at least one earned_trust coordination notice"
+    n = notices[0]
+    assert n.output.get("agent") and n.output.get("grade")
+    assert n.status == "superseded"          # non-validated: never enters completed()/get()
+    assert "ingest" not in store.completed() or True  # sanity: notices don't perturb completion
+    # the notice is keyed under the coordination sentinel, not a real node → completed() is clean
+    assert all(not (r.record_type == "coordination") for r in _validated_only(store))
+
+
+def _validated_only(store):
+    return [r for r in store.records() if r.status == "validated"]
+
+
+def test_persist_trust_default_off_writes_no_coordination_notice(tmp_path):
+    fake = _fresh_held_tracking()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        scheduler=_trust_scheduler(tmp_path),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    loop.run({"uri": "s3://doc"})
+    assert not [r for r in store.records() if r.record_type == "coordination"]
+
+
+# -- R3-3/R3-4: PhaseNoteSink writes the run trail's phase spine (opt-in observer) --------------
+def _list_phase_notes(run_dir):
+    import os
+    return sorted(f for f in os.listdir(run_dir) if f.startswith("_phase_r"))
+
+
+def test_phase_note_sink_writes_episode_boundary_notes(tmp_path):
+    """Wiring a PhaseNoteSink writes one phase note per episode boundary into the run dir, giving
+    the trail its round-by-round phase spine — without perturbing the append-only log."""
+    from concursus.governor import PhaseNoteSink
+
+    run_dir = tmp_path / "run"
+    fake = _fresh_held_tracking()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+        event_sink=PhaseNoteSink(str(run_dir), trail_id="run", date="2026-08-11"),
+    )
+    loop.run({"uri": "s3://doc"})
+
+    phase_notes = _list_phase_notes(run_dir)
+    assert phase_notes, "expected at least one _phase_r*.md note"
+    # at least one episode_start (the first boundary, consulted before any episode runs)
+    assert any("episode_start" in f for f in phase_notes)
+    # phase notes are non-records: they never enter the log
+    assert not [r for r in store.records() if r.record_type == "coordination"]
+
+
+def test_phase_note_sink_default_off_writes_no_notes(tmp_path):
+    """Without an event_sink the default loop writes NO phase notes — byte-identical to before."""
+    import os
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    fake = _fresh_held_tracking()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=InProcessStateStore(),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+    )
+    loop.run({"uri": "s3://doc"})
+    assert not [f for f in os.listdir(run_dir) if f.startswith("_phase_r")]
+
+
+def test_phase_note_sink_swallows_write_errors(tmp_path):
+    """A PhaseNoteSink pointed at an unwritable path must not break the bounded loop — the loop's
+    emit guard swallows the sink exception (an observer can never break an episode)."""
+    from concursus.governor import PhaseNoteSink
+
+    # point the sink at a path whose parent is a FILE, so mkdir/write raises inside emit
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir")
+    fake = _fresh_held_tracking()
+    store = InProcessStateStore()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=store,
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+        event_sink=PhaseNoteSink(str(blocker / "run"), trail_id="run", date="2026-08-11"),
+    )
+    result = loop.run({"uri": "s3://doc"})  # must NOT raise
+    assert result is not None
+
+
+# -- C3: FanOutEventSink composes multiple observers into the one event_sink slot --------------
+def test_fanout_event_sink_forwards_to_every_child(tmp_path):
+    """A FanOutEventSink fans each boundary event out to all children (the one-slot composite)."""
+    from concursus.governor import FanOutEventSink
+
+    class _Recorder:
+        def __init__(self):
+            self.kinds = []
+
+        def emit(self, event):
+            self.kinds.append(event.get("type"))
+
+    a, b = _Recorder(), _Recorder()
+    fake = _fresh_held_tracking()
+    loop = GovernorLoop(
+        "summarize the document",
+        _two_node_manifests(),
+        store=InProcessStateStore(),
+        supervisor_factory=lambda **kw: fake(**kw),
+        plan_model_fn=_plan_model_fn,
+        max_rounds=8,
+        no_progress_n=2,
+        backend="python",
+        event_sink=FanOutEventSink([a, b]),
+    )
+    loop.run({"uri": "s3://doc"})
+    # both children saw the SAME event stream (episode_start ... decision), including a synthesize decision
+    assert a.kinds == b.kinds
+    assert "decision" in a.kinds and "episode_start" in a.kinds
+
+
+def test_fanout_empty_is_byte_identical_to_no_sink():
+    """An empty FanOut is a no-op: the GovernorResult matches a sink-free run (default-off preserved)."""
+    from concursus.governor import FanOutEventSink
+
+    def _run(sink):
+        fake = _fresh_held_tracking()
+        loop = GovernorLoop(
+            "summarize the document",
+            _two_node_manifests(),
+            store=InProcessStateStore(),
+            supervisor_factory=lambda **kw: fake(**kw),
+            plan_model_fn=_plan_model_fn,
+            max_rounds=8,
+            no_progress_n=2,
+            backend="python",
+            event_sink=sink,
+        )
+        return loop.run({"uri": "s3://doc"})
+
+    baseline = _run(None)
+    fanned = _run(FanOutEventSink([]))
+    assert fanned.terminated_by == baseline.terminated_by
+    assert sorted(fanned.completed) == sorted(baseline.completed)

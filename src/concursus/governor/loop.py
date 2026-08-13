@@ -67,6 +67,7 @@ from concursus.state.statestore import (
     RunEvent,
     RunEventKind,
     StateStore,
+    append_coordination_notice,
     content_hash,
     list_pending_notices,
 )
@@ -184,15 +185,44 @@ class NullEventSink:
         return None
 
 
-class FanOutEventSink:
-    """A composite :class:`EventSink` that fans one event out to several child sinks.
+class PhaseNoteSink:
+    """(R3-3/R3-4) An opt-in :class:`EventSink` that writes one phase note per episode boundary.
 
-    The loop has exactly ONE ``event_sink`` slot, so observers that must coexist are composed here:
-    ``event_sink=FanOutEventSink([a, b])``. Each child's ``emit`` is called in order, INDIVIDUALLY
-    guarded, so one misbehaving child can never starve the others. An empty list is a no-op —
-    behaviorally identical to leaving ``event_sink`` unset, so it stays byte-for-byte default-off.
-    Observer-only: it reads the plain-dict :class:`RunEvent` VALUE and forwards it; it never touches
-    ctx/plan/log (INV-1/3/5).
+    Gives a run's trail its phase spine — ``round 1 → round 2 → …`` — so a session reads as
+    ``goal → plan → execute → collect → decide`` rather than a flat record dump. Each boundary event
+    (``episode_start`` / ``episode_end`` / ``decision``) is rendered as a small NON-record navigation
+    note ``<run_dir>/_phase_r{round}_{type}.md`` carrying the round's completed/frontier sets, so the
+    per-sub-agent record notes (already addressed under the run root) hang beneath a visible phase.
+
+    Strictly an observer: it only reads the plain-dict :class:`RunEvent` VALUE and writes a note —
+    it never touches ctx, the frozen plan, or the append-only log (INV-1/INV-3/INV-5). Wiring it is
+    opt-in (``GovernorLoop(event_sink=PhaseNoteSink(run_dir))``); not wiring it leaves the loop
+    byte-for-byte unchanged. Any error is swallowed by the loop's emit guard, so a bad write can
+    never break an episode.
+    """
+
+    def __init__(self, run_dir: str, *, trail_id: str = "run", date: str = "") -> None:
+        self._run_dir = run_dir
+        self._trail_id = trail_id
+        self._date = date
+
+    def emit(self, event: RunEvent) -> None:
+        from concursus.state.filevault import render_phase_note
+
+        render_phase_note(dict(event), self._run_dir, trail_id=self._trail_id, date=self._date)
+
+
+class FanOutEventSink:
+    """(C3) A composite :class:`EventSink` that fans one event out to several child sinks.
+
+    The loop has exactly ONE ``event_sink`` slot, so observers that must coexist — e.g. a
+    :class:`PhaseNoteSink` (the run's phase spine) AND a transfer trigger (fire the session-end
+    knowledge transfer at ``synthesize``) — are composed here: ``event_sink=FanOutEventSink([phase,
+    trigger])``. Each child's ``emit`` is called in order, INDIVIDUALLY guarded, so one misbehaving
+    child can never starve the others (the loop's own outer guard would otherwise abort the whole
+    fan-out on the first exception). Passing an empty list is a no-op — behaviorally identical to
+    leaving ``event_sink`` unset, so it stays byte-for-byte default-off. Observer-only: it reads the
+    plain-dict :class:`RunEvent` VALUE and forwards it; it never touches ctx/plan/log (INV-1/3/5).
     """
 
     def __init__(self, sinks) -> None:
@@ -338,6 +368,7 @@ class GovernorLoop:
         bind_fn: Optional[Callable[[str], Optional[str]]] = None,
         episode_gate: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
         event_sink: Optional[EventSink] = None,
+        persist_trust: bool = False,
     ) -> None:
         if backend not in ("auto", "python", "langgraph"):
             raise GovernorLoopError(
@@ -349,6 +380,13 @@ class GovernorLoop:
             raise GovernorLoopError("max_rounds must be >= 1 (the loop must be bounded and progress)")
         if no_progress_n < 1:
             raise GovernorLoopError("no_progress_n must be >= 1")
+        # (R1-3) OPT-IN (default OFF): after the collect-node trust re-earn, append a coordination
+        # NOTICE recording each newly-completed node's earned grade, so the earned trust — which is
+        # otherwise in-memory only on the scheduler (scheduler._earned, lost on process exit) —
+        # survives on the append-only log. A coordination notice is non-validated (never enters
+        # completed()/get(), never perturbs the plan; INV-3/5). OFF ⇒ collect is byte-for-byte
+        # unchanged. Only takes effect when a scheduler is also wired.
+        self._persist_trust = bool(persist_trust)
         self._goal = goal
         self._manifests = dict(manifests)
         self._session_id = session_id
@@ -418,19 +456,19 @@ class GovernorLoop:
         if int(checkpoint_every) < 0:
             raise GovernorLoopError("checkpoint_every must be >= 0 (0 disables auto-checkpoint)")
         self._checkpoint_every = int(checkpoint_every)
-        # -- OPT-IN scheduler->compiler frontier channel ( A4) -----
+        # -- OPT-IN scheduler->compiler frontier channel (A4) -----
         # False (default) => today's behavior byte-for-byte: recompile is called WITHOUT compile_next,
         # so ProvisioningPlan.frontier stays empty and to_dict() is unchanged. When True AND a
         # scheduler is set, the ROUTER's cleared frontier (FrontierProposal.compile_next — the nodes
         # trust-cleared to dispatch THIS round) is threaded into the NEXT round's ``recompile`` as its
         # ``compile_next=`` argument, closing the previously-dead scheduler->compiler channel
-        # ( §3, [35e2b3a]). This RECORDS the cleared frontier onto the fresh frozen
+        #. This RECORDS the cleared frontier onto the fresh frozen
         # plan's read-only ``frontier`` field ONLY — assemble/recompile filter it to topology nodes
         # and NEVER let it change order/entries/wiring (the monotonic superset is preserved), so it is
         # a pure provenance annotation, not a plan mutation (INV-2/INV-3/INV-4). Requires a scheduler
         # to produce a frontier; a no-op when ``scheduler is None``.
         self._record_frontier = bool(record_frontier)
-        # -- OPT-IN capability-decompose authoring path ( A1-A3) ---
+        # -- OPT-IN capability-decompose authoring path (A1-A3) ---
         # False (default) => round-1 authoring is byte-for-byte today's single-shot plan_from_goal
         # over the CALLER's manifests. True => the loop authors a multi-node CAPABILITY DAG
         # (plan_from_goal(decompose=True)) and STAFFS it via staff_capability_dag() into an
@@ -1264,7 +1302,17 @@ class GovernorLoop:
                 if not isinstance(outcome, dict):
                     # Non-dict / absent episode output: read the node's log record as the outcome.
                     outcome = self._store.get(node)
-                self._scheduler.update_trust(node_to_agent(node), outcome)
+                agent = node_to_agent(node)
+                grade = self._scheduler.update_trust(agent, outcome)
+                # (R1-3) persist the re-earned grade as an append-only coordination notice, so the
+                # scheduler's otherwise-in-memory earned trust survives on the durable log. Non-
+                # validated (never enters completed()/get(); INV-3/5). OFF ⇒ never touched.
+                if self._persist_trust:
+                    append_coordination_notice(
+                        self._store, node,
+                        {"kind": "earned_trust", "agent": agent, "grade": str(grade),
+                         "round": int(ctx.get("round", 0))},
+                    )
         order = list(ctx["plan"].order)
         ctx["completed"] = sorted(completed)
         ctx["frontier"] = [n for n in order if n not in completed]

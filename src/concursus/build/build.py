@@ -284,7 +284,12 @@ def fingerprint(
     trust re-earning check, and it must never be used to select among versions at dispatch time.
 
     Two manifests with identical hosting inputs produce the same fingerprint; a change to any
-    hosting input (e.g. a new ``container_uri``, protocol, or output schema) changes it.
+    hosting input (e.g. a new ``container_uri``, protocol, entry, network or role) changes it.
+
+    I/O is deliberately NOT part of the identity. A node's ``inputs``/``outputs`` are declared per
+    PLAN NODE, and one provisioned agent serves many plans — so folding them in here would make the
+    same hosted artifact hash differently per plan and force a needless re-provision. Identity is
+    about WHAT IS HOSTED, not about what a particular plan asks it to emit.
     """
     reg = m.registry
     build_mode = str(reg.get("build_mode", "container")).lower()
@@ -299,8 +304,6 @@ def fingerprint(
         "entry": reg.get("entry"),
         "network": _network_configuration(reg),
         "role": role_identity,
-        "input_keys": sorted(m.inputs.keys()),
-        "output_schema": m.output_schema,
     }
     return _canonical_hash(identity)
 
@@ -349,6 +352,37 @@ class RuntimeTemplate(Protocol):
     def create_runtime_request(self, m: "AgentManifest", image_uri: Optional[str]) -> dict: ...
 
 
+#: Generated-source fragment: the payload -> callable adapter, emitted into EVERY wrapper.
+#: It REPLACES a build-time ``_INPUT_KEYS`` list read from ``manifest.contract.inputs``. I/O is a
+#: per-PLAN-NODE property: only the plan author knows what shape a given node must receive, and one
+#: provisioned agent serves many plans, so a wrapper baked at provision time cannot know the keys.
+#: The filtering itself is still worth keeping (an unexpected key would otherwise raise TypeError),
+#: so it is derived from the AGENT CALLABLE's own signature — which the wrapper can always see —
+#: instead of from a manifest declaration it can no longer trust. ``**kwargs`` callables get the
+#: whole payload; a zero-arg-name callable gets it as a single dict.
+_DISPATCH_SRC = (
+    "import inspect\n"
+    "\n"
+    "_SIG = inspect.signature(_agent_callable)\n"
+    "_VAR_KW = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in _SIG.parameters.values())\n"
+    "_NAMED = [\n"
+    "    n\n"
+    "    for n, p in _SIG.parameters.items()\n"
+    "    if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)\n"
+    "]\n"
+    "\n"
+    "\n"
+    "def _dispatch(payload):\n"
+    '    """Call the agent with whatever of ``payload`` its own signature accepts."""\n'
+    "    data = payload if isinstance(payload, dict) else {}\n"
+    "    if _VAR_KW:\n"
+    "        return _agent_callable(**data)\n"
+    "    if _NAMED:\n"
+    "        return _agent_callable(**{k: v for k, v in data.items() if k in _NAMED})\n"
+    "    return _agent_callable(data)\n"
+)
+
+
 class _BaseAgentTemplate:
     """Shared packaging + request logic; subclasses fix the protocol and serving harness."""
 
@@ -385,7 +419,6 @@ class HttpAgentTemplate(_BaseAgentTemplate):
 
     def render_wrapper(self, m: "AgentManifest") -> str:
         module, func = _split_entry(m.registry.get("entry"))
-        keys_repr = ", ".join(repr(k) for k in m.inputs)
         return (
             f'"""Auto-generated AgentCore HTTP entrypoint for agent {m.name!r} '
             f'(Concursus)."""\n'
@@ -396,15 +429,12 @@ class HttpAgentTemplate(_BaseAgentTemplate):
             f"\n"
             f"app = BedrockAgentCoreApp()\n"
             f"\n"
-            f"_INPUT_KEYS = [{keys_repr}]\n"
-            f"\n"
+            f"{_DISPATCH_SRC}"
             f"\n"
             f"@app.entrypoint\n"
             f"def handler(payload, context):\n"
-            f'    """Pull declared contract.inputs from the payload; call the agent; '
-            f'return its dict."""\n'
-            f"    kwargs = {{key: payload.get(key) for key in _INPUT_KEYS}}\n"
-            f"    return _agent_callable(**kwargs)\n"
+            f'    """Pass the payload through to the agent; return its dict."""\n'
+            f"    return _dispatch(payload)\n"
             f"\n"
             f"\n"
             f'if __name__ == "__main__":\n'
@@ -419,7 +449,6 @@ class McpAgentTemplate(_BaseAgentTemplate):
 
     def render_wrapper(self, m: "AgentManifest") -> str:
         module, func = _split_entry(m.registry.get("entry"))
-        keys_repr = ", ".join(repr(k) for k in m.inputs)
         return (
             f'"""Auto-generated AgentCore MCP entrypoint for agent {m.name!r} '
             f'(Concursus)."""\n'
@@ -430,15 +459,12 @@ class McpAgentTemplate(_BaseAgentTemplate):
             f"\n"
             f'mcp = FastMCP("{m.name}", host="0.0.0.0", port={self.port})\n'
             f"\n"
-            f"_INPUT_KEYS = [{keys_repr}]\n"
-            f"\n"
+            f"{_DISPATCH_SRC}"
             f"\n"
             f"@mcp.tool()\n"
             f"def {func}(payload: dict) -> dict:\n"
-            f'    """Pull declared contract.inputs from the payload; call the agent; '
-            f'return its dict."""\n'
-            f"    kwargs = {{key: payload.get(key) for key in _INPUT_KEYS}}\n"
-            f"    return _agent_callable(**kwargs)\n"
+            f'    """Pass the payload through to the agent; return its dict."""\n'
+            f"    return _dispatch(payload)\n"
             f"\n"
             f"\n"
             f'if __name__ == "__main__":\n'
@@ -453,7 +479,6 @@ class A2AAgentTemplate(_BaseAgentTemplate):
 
     def render_wrapper(self, m: "AgentManifest") -> str:
         module, func = _split_entry(m.registry.get("entry"))
-        keys_repr = ", ".join(repr(k) for k in m.inputs)
         return (
             f'"""Auto-generated AgentCore A2A entrypoint for agent {m.name!r} '
             f'(Concursus)."""\n'
@@ -464,15 +489,13 @@ class A2AAgentTemplate(_BaseAgentTemplate):
             f"\n"
             f"app = BedrockAgentCoreApp()\n"
             f"\n"
-            f"_INPUT_KEYS = [{keys_repr}]\n"
-            f"\n"
+            f"{_DISPATCH_SRC}"
             f"\n"
             f"@app.entrypoint\n"
             f"def handler(payload, context):\n"
             f'    """A2A (JSON-RPC 2.0) entrypoint served at / on port {self.port}; '
             f'call the agent; return its dict."""\n'
-            f"    kwargs = {{key: payload.get(key) for key in _INPUT_KEYS}}\n"
-            f"    return _agent_callable(**kwargs)\n"
+            f"    return _dispatch(payload)\n"
             f"\n"
             f"\n"
             f'if __name__ == "__main__":\n'

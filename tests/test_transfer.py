@@ -7,8 +7,9 @@ moment (synthesize / reaper teardown); rollup = the session verdict (``overall_o
 unless the transfer ran and was accepted. All builders are additive/opt-in: a run that does not call
 them is byte-for-byte unchanged.
 
-This is the parity-safe subset for the public mirror — the digest-view bundle and the S3 push
-variant depend on subsystems not present here, so the export is the local-inbox raw-notes path.
+C2 covers three export shapes: the local-inbox raw-notes path (``export_run_log``), the
+consolidation-digestible digest bundle (``export_run_digest``), and the ``ObjectStore`` push variant
+(``export_run_log_to_object_store``).
 """
 
 from __future__ import annotations
@@ -33,7 +34,9 @@ from concursus.state.transfer import (
     TransferTriggerSink,
     build_slipbox_transfer_manifest,
     distill_export,
+    export_run_digest,
     export_run_log,
+    export_run_log_to_object_store,
     mark_transferred,
     recover_trail_id,
     register_slipbox_foundry,
@@ -346,3 +349,55 @@ def test_overall_ok_requires_all_work_when_plan_order_given():
     store = _transfer_session({"state": "complete", "result_path": "/vault/a.md", "job_id": "j"})
     r = session_overall_ok(store, plan_order=[SLIPBOX_TRANSFER_NODE, "unfinished"])
     assert r["overall_ok"] is False and r["work_complete"] is False
+
+
+# -- C2 export variants: digest bundle + S3/ObjectStore push ----------------
+def test_export_run_digest_renders_digestible_non_records(tmp_path):
+    store, _run_dir = _finished_run(tmp_path)
+    admit = _RecordingAdmit()
+    res = export_run_digest(
+        store.records(), str(tmp_path / "dinbox"), admit_fn=admit,
+        trail_id="sess1", date="2026-08-12",
+    )
+    assert res["members"] and all(m.endswith(".digest.md") for m in res["members"])
+    # digest notes are NON-records: the loaders must refuse to parse them back
+    from concursus.state.filevault import _note_to_record
+    for m in res["members"]:
+        with pytest.raises(ValueError):
+            _note_to_record(open(m, encoding="utf-8").read())
+    assert len(admit.calls) == 1
+
+
+def test_export_run_digest_empty_records_writes_nothing(tmp_path):
+    res = export_run_digest([], str(tmp_path / "dinbox"), trail_id="sess1")
+    assert res["members"] == [] and res["admitted"] is None
+
+
+def test_export_run_digest_reexport_is_inode_stable(tmp_path):
+    import os
+    store, _run_dir = _finished_run(tmp_path)
+    d = tmp_path / "dinbox"
+    r1 = export_run_digest(store.records(), str(d), trail_id="sess1", date="2026-08-12")
+    inodes1 = {m.split("/")[-1]: os.stat(m).st_ino for m in r1["members"]}
+    r2 = export_run_digest(store.records(), str(d), trail_id="sess1", date="2026-08-12")
+    inodes2 = {m.split("/")[-1]: os.stat(m).st_ino for m in r2["members"]}
+    assert inodes1 == inodes2  # idempotent re-export
+
+
+def test_export_to_object_store_pushes_byte_identical(tmp_path):
+    import asyncio
+    from concursus.execute.object_store import FileStore
+    _store, run_dir = _finished_run(tmp_path)
+    fs = FileStore(root=str(tmp_path / "s3root"))
+    res = export_run_log_to_object_store(str(run_dir), fs, prefix="s3://bucket/hive/sess1", trail_id="sess1")
+    assert res["members"] and res["prefix"] == "s3://bucket/hive/sess1"
+    for uri in res["members"]:
+        got = asyncio.run(fs.get_object(uri))
+        assert got == (run_dir / uri.split("/")[-1]).read_bytes()
+
+
+def test_export_to_object_store_missing_dir_is_empty(tmp_path):
+    from concursus.execute.object_store import FileStore
+    fs = FileStore(root=str(tmp_path / "s3root"))
+    res = export_run_log_to_object_store(str(tmp_path / "nope"), fs, prefix="s3://b/p")
+    assert res["members"] == []

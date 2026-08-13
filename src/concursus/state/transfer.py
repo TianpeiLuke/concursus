@@ -28,8 +28,11 @@ run that does not build the transfer node is byte-for-byte unchanged. The consol
 job-dict key set the C1 contract mirrors is captured in :data:`CONSOLIDATOR_JOB_DICT_KEYS` so a
 contract-parity test can assert the manifest never invents a field.
 
-Note: this is the parity-safe subset for the public mirror — the digest-view bundle and the S3 push
-variant depend on subsystems not present here, so the export is the local-inbox raw-notes path.
+Exports come in three shapes: :func:`export_run_log` (raw episodic notes to a local inbox),
+:func:`export_run_digest` (the consolidation-digestible digest bundle, via
+:func:`~concursus.state.filevault.render_digest_view_note`), and
+:func:`export_run_log_to_object_store` (the S3/``ObjectStore`` push variant). All are opt-in and
+INV-4-safe (read notes, write an external target; never re-put a Record).
 """
 
 from __future__ import annotations
@@ -300,6 +303,107 @@ def distill_export(store, *, vault_path=None) -> str:
     return distill_store(store, vault_path=vault_path)
 
 
+#: Run-dir sidecar trees the export must NOT copy (derived/rebuilt state, not episodic notes).
+_EXPORT_SKIP_DIRS = ("versions", "index")
+
+
+def _is_sidecar_member(note) -> bool:
+    """True iff ``note`` lives under a derived sidecar tree (:data:`_EXPORT_SKIP_DIRS`) — a
+    belt-and-braces guard so a derived note can never leak into the export even if the glob were
+    ever made recursive."""
+    return any(part in _EXPORT_SKIP_DIRS for part in note.parts)
+
+
+def export_run_digest(
+    records,
+    target_dir,
+    *,
+    admit_fn: Optional[Any] = None,
+    objective: Optional[str] = None,
+    trail_id: str = "run",
+    date: str = "",
+) -> Dict[str, Any]:
+    """Export a run as CONSOLIDATION-DIGESTIBLE notes to ``target_dir`` (C2 digest variant); returns
+    a result dict shaped like :func:`export_run_log`.
+
+    Ships the run's digest bundle (prose, BB-classified, backticked, provenance-cited), NOT the raw
+    JSON-blob record notes — so the plan-phase can section them and a consolidation digester's
+    identifier-grounding finds the identifiers verbatim. Renders one
+    :func:`~concursus.state.filevault.render_digest_view_note` per record, then optionally admits the
+    bundle via the injected ``admit_fn`` exactly as :func:`export_run_log` does.
+
+    Pure post-run projection (INV-4): each note is a NON-record digest view (stamped so the loaders
+    skip it), so this never mutates the log or affects replay. An empty ``records`` writes nothing.
+    Re-export is IDEMPOTENT: the digest renderer writes atomically (new inode every call), so instead
+    of rendering straight into ``target_dir`` we render into a STAGING temp dir, then land each note
+    via :func:`_write_export_note_if_changed` — leaving an unchanged note's inode/mtime intact so the
+    consolidation sub-agent dedups the re-admission.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from concursus.state.filevault import render_digest_view_note
+
+    dst = Path(target_dir)
+    obj = objective or f"{_EXPORT_OBJECTIVE_PREFIX}{trail_id}"
+    members: List[str] = []
+    recs = list(records or [])
+    if recs:
+        dst.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as staging:
+            for record in recs:
+                # render into staging (churns a throwaway inode), then land idempotently in dst
+                staged = render_digest_view_note(record, staging, trail_id=trail_id, date=date)
+                out_path = dst / Path(staged).name
+                _write_export_note_if_changed(out_path, Path(staged).read_text(encoding="utf-8"))
+                members.append(str(out_path))
+
+    admitted = None
+    if admit_fn is not None and members:
+        admitted = admit_fn(members, objective=obj)
+    return {"members": members, "objective": obj, "admitted": admitted}
+
+
+def export_run_log_to_object_store(
+    run_dir,
+    object_store,
+    *,
+    prefix: str,
+    trail_id: str = "run",
+) -> Dict[str, Any]:
+    """Push a finished run's episodic notes to an S3 (or any :class:`ObjectStore`) prefix (C2 push
+    variant).
+
+    The operator's PUSH variant of the inbox export: instead of dropping notes into a local inbox, it
+    writes each note to ``<prefix>/<name>`` via the injected ``object_store`` — an
+    ``execute.object_store.ObjectStore`` (``S3Store`` for real S3, ``FileStore`` for local/tests;
+    either exposes ``async put_object(uri, data, content_type)``). The async put is wrapped with
+    ``asyncio.run``, so this is a plain synchronous call.
+
+    Concursus never hard-depends on boto3 here — the caller injects the store (tests use ``FileStore``,
+    prod wires ``S3Store``). Selects the same top-level, non-sidecar ``*.md`` notes as
+    :func:`export_run_log`. Returns ``{"members": [<uri>], "prefix": <str>}``. NOTE: a consolidation
+    sub-agent that reads a local inbox needs a corresponding S3-PULL lane to ingest from ``prefix`` —
+    that lane is out of scope here (this is the push half). INV-4 safe: reads notes, writes an external
+    object store; no Record, no plan mutation.
+    """
+    import asyncio
+    from pathlib import Path
+
+    src = Path(run_dir)
+    base = prefix.rstrip("/")
+    uris: List[str] = []
+    if src.is_dir():
+        for note in sorted(src.glob("*.md")):
+            if not note.is_file() or _is_sidecar_member(note):
+                continue
+            uri = f"{base}/{note.name}"
+            data = note.read_bytes()
+            asyncio.run(object_store.put_object(uri, data, "text/markdown"))
+            uris.append(uri)
+    return {"members": uris, "prefix": base, "trail_id": trail_id}
+
+
 # -- C3: the session-end transfer triggers ----------------------------------
 def run_needs_transfer(run_dir) -> bool:
     """True iff ``run_dir`` is a real run dir whose transfer has NOT yet been marked done (C3).
@@ -520,6 +624,8 @@ __all__ = [
     "slipbox_transfer_acceptance_fn",
     "register_slipbox_foundry",
     "export_run_log",
+    "export_run_digest",
+    "export_run_log_to_object_store",
     "distill_export",
     "run_needs_transfer",
     "mark_transferred",

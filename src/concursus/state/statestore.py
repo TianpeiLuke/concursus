@@ -225,6 +225,15 @@ class Record:
     #: Mirrors ``blocked_on`` exactly: carried on the in-process record via :func:`_apply_meta`,
     #: NOT projected to charset-restricted AgentCore metadata.
     failure_class: Optional[str] = None
+    #: The bound agent's name for this node — the standing crew member the router matched (opt-in;
+    #: the Supervisor records it when ``capture_agent_binding=True``). Like ``blocked_on`` /
+    #: ``failure_class`` it is carried on the in-process record via :func:`_apply_meta` and NOT
+    #: projected to the charset-restricted AgentCore metadata. ``None`` by default (absent ⇒
+    #: byte-identical).
+    agent_name: Optional[str] = None
+    #: The bound agent's runtime ARN — populated by the Supervisor from its binding / ``_arns``
+    #: (opt-in, ``capture_agent_binding=True``). Same round-trip discipline as ``agent_name``.
+    arn: Optional[str] = None
     #: Checkpoint-compaction epoch (C-4). The monotonic window id current when this event was
     #: written; a ``CHECKPOINT`` event compacts everything written at its own ``epoch`` and rotates
     #: the store to ``epoch + 1``, so a warm resume can bound its tail fetch with an EQUALS_TO
@@ -253,6 +262,8 @@ _META_KEYS: Tuple[str, ...] = (
     "address",
     "blocked_on",
     "failure_class",
+    "agent_name",  # round-trips via _apply_meta + the FileVault meta blob (not the charset-restricted projection)
+    "arn",
 )
 
 # The ``record_type`` marking a content-hash no-op re-put (identical to the latest output).
@@ -1002,4 +1013,11 @@ def _event_to_record(event: dict) -> Record:
         event_id=event.get("eventId"),
         address=meta.get("address"),
         epoch=epoch,
+        # Round-trip the FileVault-only run-state fields when the meta blob carries them (the
+        # charset-restricted AgentCore metadata path never emits these, so ``meta.get`` is None
+        # there ⇒ byte-identical behavior).
+        blocked_on=meta.get("blocked_on"),
+        failure_class=meta.get("failure_class"),
+        agent_name=meta.get("agent_name"),
+        arn=meta.get("arn"),
     )

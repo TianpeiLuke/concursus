@@ -80,8 +80,13 @@ def test_http_wrapper_emits_valid_entrypoint():
     # imports the user callable from registry.entry ("agents.summarize:run")
     assert "from agents.summarize import run as _agent_callable" in wrapper
     assert "run" in wrapper  # the entry function name
-    # declared contract.inputs keys are pulled from the payload
-    assert "'document'" in wrapper and "'lang'" in wrapper
+    # The payload is passed through GENERICALLY: the wrapper no longer bakes a build-time
+    # `_INPUT_KEYS` list from contract.inputs (I/O is per-plan-node, and one provisioned agent
+    # serves many plans). Filtering still happens, but keyed on the callable's own signature.
+    assert "_INPUT_KEYS" not in wrapper
+    assert "'document'" not in wrapper and "'lang'" not in wrapper
+    assert "_dispatch(payload)" in wrapper
+    assert "inspect.signature(_agent_callable)" in wrapper
     assert "app.run()" in wrapper
     compile(wrapper, "<app.py>", "exec")  # emitted source is syntactically valid
 
@@ -286,7 +291,7 @@ def test_build_plan_entry_to_dict_round_trips():
     assert d["fingerprint"] == entry.fingerprint
 
 
-# -- content fingerprint (DEPLOY-IDENTITY / AI-11) --------------------------
+# -- content fingerprint (DEPLOY-IDENTITY) --------------------------
 def test_identical_manifests_produce_equal_fingerprints():
     a = RuntimeBuilderFactory.synthesize(_manifest())
     b = RuntimeBuilderFactory.synthesize(_manifest())
@@ -306,11 +311,35 @@ def test_fingerprint_changes_when_protocol_changes():
     assert fingerprint(_manifest(protocol="HTTP")) != fingerprint(_manifest(protocol="MCP"))
 
 
-def test_fingerprint_changes_when_output_schema_changes():
+def test_fingerprint_is_invariant_to_output_schema():
+    """I/O is NOT part of deploy identity (inverted deliberately).
+
+    ``contract.outputs`` used to be folded into the hash, so editing a schema re-provisioned an
+    otherwise identical artifact. Outputs are declared per PLAN NODE now and one provisioned agent
+    serves many plans, so the same hosted image MUST hash identically regardless of what a given
+    plan asks it to emit. This test previously asserted the opposite; it is inverted, not deleted,
+    so the change of contract stays visible in the history.
+    """
     m1 = _manifest()
     m2 = _manifest()
     m2.contract["outputs"] = {"summary": {"type": "string"}, "score": {"type": "number"}}
-    assert fingerprint(m1) != fingerprint(m2)
+    assert fingerprint(m1) == fingerprint(m2)
+
+
+def test_fingerprint_is_invariant_to_declared_inputs():
+    """The same reasoning for the input side — and the reason the generated wrapper stopped
+    baking an ``_INPUT_KEYS`` list: a build-time input list cannot describe a per-plan contract."""
+    m1 = _manifest()
+    m2 = _manifest()
+    m2.contract["inputs"] = {"document": {"type": "string"}}  # drop 'lang'
+    assert fingerprint(m1) == fingerprint(m2)
+
+
+def test_fingerprint_still_changes_when_hosting_changes():
+    """Guard the other half: dropping I/O must not flatten identity for things that DO matter."""
+    base = fingerprint(_manifest())
+    assert fingerprint(_manifest(protocol="MCP")) != base
+    assert fingerprint(_manifest(container_uri="acct.dkr.ecr.us-east-1.amazonaws.com/other:2")) != base
 
 
 def test_fingerprint_stable_across_registry_key_order():
@@ -350,3 +379,55 @@ def test_fingerprint_folds_synthesized_role_when_no_role_arn():
     assert fp
     # a synthesized-role fingerprint differs from the explicit-role one
     assert fp != fingerprint(_manifest())
+
+
+# -- generated dispatch adapter (executed, not just compiled) ----------------
+# The wrapper templates only ever get `compile()`d by the tests above, which proves syntax and
+# nothing else. `_DISPATCH_SRC` carries real runtime logic now (it replaced the build-time
+# `_INPUT_KEYS` filter), so it is EXECUTED here against the three callable shapes it must serve.
+def _run_dispatch(agent_callable, payload):
+    """exec the generated dispatch fragment against a supplied callable, then dispatch."""
+    from concursus.build.build import _DISPATCH_SRC
+
+    ns = {"_agent_callable": agent_callable}
+    exec(_DISPATCH_SRC, ns)  # noqa: S102 - executing OUR OWN generated fragment, by design
+    return ns["_dispatch"](payload)
+
+
+def test_dispatch_filters_to_a_named_signature():
+    """A plain `def run(document, lang)` gets exactly its own parameters — an extra payload key
+    (which a per-plan contract may well carry) must NOT raise TypeError."""
+    seen = {}
+
+    def run(document, lang):
+        seen.update(document=document, lang=lang)
+        return {"ok": True}
+
+    out = _run_dispatch(run, {"document": "d", "lang": "en", "unexpected": "ignored"})
+    assert out == {"ok": True}
+    assert seen == {"document": "d", "lang": "en"}
+
+
+def test_dispatch_passes_everything_to_a_kwargs_callable():
+    def run(**kwargs):
+        return dict(kwargs)
+
+    assert _run_dispatch(run, {"a": 1, "b": 2}) == {"a": 1, "b": 2}
+
+
+def test_dispatch_hands_a_single_dict_to_a_positional_callable():
+    """A `*args`-only (or bare) callable has no named parameters to fill, so it receives the
+    payload as one dict rather than being called with nothing."""
+
+    def run(*args):
+        return {"got": args[0] if args else None}
+
+    assert _run_dispatch(run, {"a": 1}) == {"got": {"a": 1}}
+
+
+def test_dispatch_tolerates_a_non_dict_payload():
+    def run(document=None):
+        return {"document": document}
+
+    assert _run_dispatch(run, None) == {"document": None}
+    assert _run_dispatch(run, "not-a-dict") == {"document": None}

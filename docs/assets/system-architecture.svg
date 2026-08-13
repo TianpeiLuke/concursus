@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
   <title id="title">Concursus system architecture</title>
-  <desc id="desc">A compact architecture diagram. Core, Assemble, Build, and Execute form the static spine; State is durable storage; Reasoning is pre-compile; Governor controls complete episodes; Transfer exports finished state.</desc>
+  <desc id="desc">A compact architecture diagram. Core, Assemble, Build, and Execute form the static spine; Execute invokes agents over pluggable backends and monitors their health; State is durable storage; Reasoning forms a DAG that feeds Assemble; the Governor forms a fresh frozen plan at the compiler front each episode; Transfer exports finished state.</desc>
   <defs>
     <style>
       .title{font:700 30px Arial,sans-serif;fill:#172033}.subtitle{font:15px Arial,sans-serif;fill:#4b5563}.name{font:700 22px Arial,sans-serif;fill:#172033}.role{font:15px Arial,sans-serif;fill:#263449}.note{font:13px Arial,sans-serif;fill:#4b5563}.band{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}.core{fill:#e7f0ff;stroke:#2563eb;stroke-width:2}.runtime{fill:#e9f9ee;stroke:#16a34a;stroke-width:2}.state{fill:#fff5dc;stroke:#d97706;stroke-width:2}.optional{fill:#f4eaff;stroke:#7c3aed;stroke-width:2}.external{fill:#fce9ee;stroke:#db2777;stroke-width:2}.arrow{fill:none;stroke:#334155;stroke-width:3;marker-end:url(#head)}.statearrow{fill:none;stroke:#b45309;stroke-width:3;marker-end:url(#statehead)}.optarrow{fill:none;stroke:#7c3aed;stroke-width:3;stroke-dasharray:9 7;marker-end:url(#opthead)}
@@ -31,7 +31,7 @@
   <rect x="675" y="455" width="225" height="95" rx="14" class="runtime"/>
   <text x="700" y="491" class="name">Build</text><text x="700" y="520" class="role">Package and provision</text>
   <rect x="965" y="455" width="225" height="95" rx="14" class="runtime"/>
-  <text x="990" y="491" class="name">Execute</text><text x="990" y="520" class="role">Dispatch frozen plan</text>
+  <text x="990" y="488" class="name">Execute</text><text x="990" y="513" class="role">Dispatch frozen plan;</text><text x="990" y="533" class="role">invoke + monitor agents</text>
   <rect x="1255" y="455" width="225" height="95" rx="14" class="external"/>
   <text x="1280" y="491" class="name">AgentCore</text><text x="1280" y="520" class="role">Runtimes and Memory</text>
   <path d="M320 502 H385" class="arrow"/><path d="M610 502 H675" class="arrow"/><path d="M900 502 H965" class="arrow"/><path d="M1190 502 H1255" class="arrow"/>
@@ -46,8 +46,8 @@
   <text x="1090" y="632" class="note">validated records / replay</text>
 
   <path d="M285 295 V455" class="optarrow"/>
-  <path d="M740 295 V455" class="optarrow"/>
-  <path d="M1225 295 V415 H1078 V455" class="optarrow"/>
-  <text x="225" y="375" class="note">drives</text><text x="755" y="375" class="note">DAG</text><text x="1120" y="375" class="note">fresh episode</text>
-  <text x="60" y="850" class="note">Invariant: AgentDAG → Assemble → immutable ProvisioningPlan → Execute. Reasoning is before assembly; Governor and Transfer run between episodes.</text>
+  <path d="M740 295 V425 H497 V455" class="optarrow"/>
+  <path d="M1225 295 V440 H497 V455" class="optarrow"/>
+  <text x="225" y="375" class="note">drives</text><text x="620" y="415" class="note">DAG → assemble</text><text x="900" y="432" class="note">fresh episode → recompile</text>
+  <text x="60" y="850" class="note">Invariant: AgentDAG → Assemble → immutable ProvisioningPlan → Execute. Reasoning forms the DAG before assembly; the Governor re-enters at the compiler front each episode (fresh frozen plan); Transfer runs after a run.</text>
 </svg>

@@ -1,55 +1,53 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1060" viewBox="0 0 1600 1060" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
   <title id="title">Concursus system architecture</title>
-  <desc id="desc">A layered flow diagram showing the static compiler and runtime spine, optional reasoning before compilation, the outer governor loop, durable state, deployment, and knowledge transfer.</desc>
+  <desc id="desc">A compact architecture diagram. Core, Assemble, Build, and Execute form the static spine; State is durable storage; Reasoning is pre-compile; Governor controls complete episodes; Transfer exports finished state.</desc>
   <defs>
     <style>
-      .title{font:700 30px Arial,sans-serif;fill:#172033}.subtitle{font:15px Arial,sans-serif;fill:#4b5563}.label{font:700 18px Arial,sans-serif;fill:#172033}.copy{font:14px Arial,sans-serif;fill:#263449}.small{font:12px Arial,sans-serif;fill:#4b5563}.band{fill:#f6f8fc;stroke:#cbd5e1;stroke-width:2}.core{fill:#e7f0ff;stroke:#2563eb;stroke-width:2}.runtime{fill:#e9f9ee;stroke:#16a34a;stroke-width:2}.state{fill:#fff5dc;stroke:#d97706;stroke-width:2}.optional{fill:#f4eaff;stroke:#7c3aed;stroke-width:2}.external{fill:#fce9ee;stroke:#db2777;stroke-width:2}.arrow{fill:none;stroke:#334155;stroke-width:2.5;marker-end:url(#head)}.optarrow{fill:none;stroke:#7c3aed;stroke-width:2.5;stroke-dasharray:8 6;marker-end:url(#opthead)}.statearrow{fill:none;stroke:#b45309;stroke-width:2.5;marker-end:url(#statehead)}
+      .title{font:700 30px Arial,sans-serif;fill:#172033}.subtitle{font:15px Arial,sans-serif;fill:#4b5563}.name{font:700 22px Arial,sans-serif;fill:#172033}.role{font:15px Arial,sans-serif;fill:#263449}.note{font:13px Arial,sans-serif;fill:#4b5563}.band{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}.core{fill:#e7f0ff;stroke:#2563eb;stroke-width:2}.runtime{fill:#e9f9ee;stroke:#16a34a;stroke-width:2}.state{fill:#fff5dc;stroke:#d97706;stroke-width:2}.optional{fill:#f4eaff;stroke:#7c3aed;stroke-width:2}.external{fill:#fce9ee;stroke:#db2777;stroke-width:2}.arrow{fill:none;stroke:#334155;stroke-width:3;marker-end:url(#head)}.statearrow{fill:none;stroke:#b45309;stroke-width:3;marker-end:url(#statehead)}.optarrow{fill:none;stroke:#7c3aed;stroke-width:3;stroke-dasharray:9 7;marker-end:url(#opthead)}
     </style>
     <marker id="head" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#334155"/></marker>
-    <marker id="opthead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#7c3aed"/></marker>
     <marker id="statehead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#b45309"/></marker>
+    <marker id="opthead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#7c3aed"/></marker>
   </defs>
-  <rect width="1600" height="1060" fill="white"/>
-  <text x="55" y="55" class="title">Concursus: module architecture and control boundaries</text>
-  <text x="55" y="82" class="subtitle">Solid arrows are normal data/control flow. Dashed purple arrows are opt-in composition. The governor never changes a running episode.</text>
+  <rect width="1600" height="900" fill="white"/>
+  <text x="60" y="55" class="title">Concursus architecture</text>
+  <text x="60" y="82" class="subtitle">The static compiler/runtime spine is immutable per episode. Purple paths are opt-in and stay outside a running supervisor.</text>
 
-  <rect x="45" y="120" width="1510" height="290" rx="18" class="band"/>
-  <text x="70" y="152" class="label">Static compiler + runtime spine — always available; one frozen plan, one forward execution pass</text>
-  <rect x="80" y="190" width="230" height="145" rx="12" class="core"/>
-  <text x="105" y="220" class="label">core/</text><text x="105" y="247" class="copy">AgentDAG topology</text><text x="105" y="269" class="copy">AgentManifest contract</text><text x="105" y="291" class="copy">resolve: typed AgentRef wiring</text><text x="105" y="316" class="small">Pure declaration and validation</text>
-  <rect x="385" y="190" width="250" height="145" rx="12" class="core"/>
-  <text x="410" y="220" class="label">assemble/</text><text x="410" y="247" class="copy">validate + type alignment</text><text x="410" y="269" class="copy">resolve edges + synthesize</text><text x="410" y="291" class="copy">frozen ProvisioningPlan</text><text x="410" y="316" class="small">planner: goal → candidate DAG</text>
-  <rect x="710" y="190" width="240" height="145" rx="12" class="runtime"/>
-  <text x="735" y="220" class="label">build/</text><text x="735" y="247" class="copy">runtime templates + images</text><text x="735" y="269" class="copy">trust gate + deploy ledger</text><text x="735" y="291" class="copy">IAM / ECR / provision</text><text x="735" y="316" class="small">AWS/Docker only at execute time</text>
-  <rect x="1025" y="190" width="270" height="145" rx="12" class="runtime"/>
-  <text x="1050" y="220" class="label">execute/</text><text x="1050" y="247" class="copy">Supervisor topo dispatch</text><text x="1050" y="269" class="copy">payload overlay + output QA</text><text x="1050" y="291" class="copy">harness / invoker / monitor</text><text x="1050" y="316" class="small">Optional parallelism and cancellation</text>
-  <rect x="1370" y="190" width="145" height="145" rx="12" class="external"/>
-  <text x="1394" y="220" class="label">AgentCore</text><text x="1394" y="248" class="copy">agent runtimes</text><text x="1394" y="270" class="copy">Memory</text><text x="1394" y="292" class="copy">AWS APIs</text>
-  <path d="M310 263 H385" class="arrow"/><path d="M635 263 H710" class="arrow"/><path d="M635 305 C790 390,955 390,1025 305" class="arrow"/><path d="M1295 263 H1370" class="arrow"/>
-  <text x="659" y="367" class="small">plan.order + wiring</text>
+  <rect x="55" y="125" width="1490" height="230" rx="18" class="band"/>
+  <text x="80" y="158" class="note">OPTIONAL PLAN FORMATION AND OUTER CONTROL</text>
+  <rect x="150" y="190" width="270" height="105" rx="14" class="optional"/>
+  <text x="180" y="228" class="name">CLI</text><text x="180" y="257" class="role">Validate · plan · deploy · run</text>
+  <rect x="590" y="190" width="300" height="105" rx="14" class="optional"/>
+  <text x="620" y="228" class="name">Reasoning</text><text x="620" y="257" class="role">Deliberate and form a DAG</text>
+  <rect x="1060" y="190" width="330" height="105" rx="14" class="optional"/>
+  <text x="1090" y="228" class="name">Governor</text><text x="1090" y="257" class="role">Route complete bounded episodes</text>
 
-  <rect x="80" y="455" width="390" height="210" rx="15" class="state"/>
-  <text x="105" y="487" class="label">state/ — append-only source of truth</text><text x="105" y="517" class="copy">StateStore: in-process, AgentCore Memory, FileVault</text><text x="105" y="542" class="copy">RunGraph + RunIndex: dependency and execution views</text><text x="105" y="567" class="copy">rundb / distill / precedent: disposable derived views</text><text x="105" y="592" class="copy">capture: post-run plan/payload notes</text><text x="105" y="622" class="small">Replay resumes work; projections never direct dispatch.</text>
-  <path d="M1025 330 C915 410,620 420,470 505" class="statearrow"/><path d="M470 545 C680 530,880 480,1025 345" class="statearrow"/>
-  <text x="690" y="460" class="small">validated records / replayed completed outputs</text>
+  <rect x="55" y="390" width="1490" height="210" rx="18" class="band"/>
+  <text x="80" y="423" class="note">STATIC COMPILER + RUNTIME SPINE</text>
+  <rect x="95" y="455" width="225" height="95" rx="14" class="core"/>
+  <text x="120" y="491" class="name">Core</text><text x="120" y="520" class="role">Declare DAG and contracts</text>
+  <rect x="385" y="455" width="225" height="95" rx="14" class="core"/>
+  <text x="410" y="491" class="name">Assemble</text><text x="410" y="520" class="role">Resolve and freeze plan</text>
+  <rect x="675" y="455" width="225" height="95" rx="14" class="runtime"/>
+  <text x="700" y="491" class="name">Build</text><text x="700" y="520" class="role">Package and provision</text>
+  <rect x="965" y="455" width="225" height="95" rx="14" class="runtime"/>
+  <text x="990" y="491" class="name">Execute</text><text x="990" y="520" class="role">Dispatch frozen plan</text>
+  <rect x="1255" y="455" width="225" height="95" rx="14" class="external"/>
+  <text x="1280" y="491" class="name">AgentCore</text><text x="1280" y="520" class="role">Runtimes and Memory</text>
+  <path d="M320 502 H385" class="arrow"/><path d="M610 502 H675" class="arrow"/><path d="M900 502 H965" class="arrow"/><path d="M1190 502 H1255" class="arrow"/>
 
-  <rect x="555" y="455" width="360" height="210" rx="15" class="optional"/>
-  <text x="580" y="487" class="label">reasoning/ — before the freeze (opt-in)</text><text x="580" y="517" class="copy">HypothesisTrail: durable debate branches</text><text x="580" y="542" class="copy">DKSEngine: bounded confidence routing</text><text x="580" y="567" class="copy">InnerGraph: bounded investigator fan-out</text><text x="580" y="592" class="copy">deliberate: seed → form_plan → lower_to_dag</text><text x="580" y="622" class="small">Emits a DAG; it never invokes a committed agent.</text>
-  <path d="M735 455 C660 390,555 380,505 335" class="optarrow"/>
+  <rect x="965" y="680" width="300" height="105" rx="14" class="state"/>
+  <text x="990" y="718" class="name">State</text><text x="990" y="747" class="role">Append, replay, project</text>
+  <rect x="585" y="680" width="300" height="105" rx="14" class="state"/>
+  <text x="610" y="718" class="name">Transfer</text><text x="610" y="747" class="role">Export finished run notes</text>
+  <rect x="205" y="680" width="300" height="105" rx="14" class="external"/>
+  <text x="230" y="718" class="name">Slipbox</text><text x="230" y="747" class="role">Permanent knowledge store</text>
+  <path d="M1077 550 V680" class="statearrow"/><path d="M965 733 H885" class="statearrow"/><path d="M585 733 H505" class="statearrow"/>
+  <text x="1090" y="632" class="note">validated records / replay</text>
 
-  <rect x="1000" y="455" width="515" height="210" rx="15" class="optional"/>
-  <text x="1025" y="487" class="label">governor/ — strictly outside episodes (opt-in)</text><text x="1025" y="517" class="copy">GovernorLoop: plan → route → run episode → collect → replan/synthesize</text><text x="1025" y="542" class="copy">scheduler + registry: trusted standing-agent matching and bindings</text><text x="1025" y="567" class="copy">KTLO: standing event/drift investigations; cockpit + scope: read projections</text><text x="1025" y="592" class="copy">authoring: capability staffing / bounded rebind</text><text x="1025" y="622" class="small">Creates a new plan between episodes; never mutates the plan being run.</text>
-  <path d="M1000 525 C930 455,710 430,545 335" class="optarrow"/><path d="M1170 455 C1170 415,1160 380,1160 335" class="optarrow"/><path d="M1000 610 C850 700,550 720,360 665" class="optarrow"/>
-
-  <rect x="80" y="745" width="380" height="190" rx="15" class="external"/>
-  <text x="105" y="777" class="label">Permanent Slipbox / external consolidator</text><text x="105" y="807" class="copy">Knowledge-transfer destination</text><text x="105" y="832" class="copy">Receives copied episodic run notes</text><text x="105" y="857" class="copy">Can feed distilled precedents back to planning</text><text x="105" y="892" class="small">External runtime is injected, not imported.</text>
-  <rect x="555" y="745" width="360" height="190" rx="15" class="state"/>
-  <text x="580" y="777" class="label">state.transfer (opt-in connector)</text><text x="580" y="807" class="copy">author transfer terminal before assemble</text><text x="580" y="832" class="copy">export finished FileVault run log</text><text x="580" y="857" class="copy">trigger on governor synthesize / sweep</text><text x="580" y="892" class="small">The only egress; no in-Supervisor mutation.</text>
-  <path d="M555 840 H460" class="statearrow"/><path d="M555 785 C450 685,310 690,260 665" class="optarrow"/><path d="M270 745 C350 700,555 690,650 665" class="optarrow"/>
-
-  <rect x="1000" y="745" width="515" height="190" rx="15" class="band"/>
-  <text x="1025" y="777" class="label">Public surface and operational entry points</text><text x="1025" y="807" class="copy">concursus/__init__.py re-exports the supported API</text><text x="1025" y="832" class="copy">cli.py: validate → plan → deploy → run</text><text x="1025" y="857" class="copy">Tests exercise core contracts and optional seams</text><text x="1025" y="892" class="small">CLI drives the same modules; it is not another orchestration path.</text>
-  <path d="M1255 745 V335" class="arrow"/>
-  <text x="1270" y="720" class="small">uses compiler/deploy/run APIs</text>
-  <text x="75" y="1005" class="small">Invariant: AgentDAG → assemble → immutable ProvisioningPlan → Supervisor.run. Reasoning occurs before assemble; governance and transfer triggers occur outside a running Supervisor.</text>
+  <path d="M285 295 V455" class="optarrow"/>
+  <path d="M740 295 V455" class="optarrow"/>
+  <path d="M1225 295 V415 H1078 V455" class="optarrow"/>
+  <text x="225" y="375" class="note">drives</text><text x="755" y="375" class="note">DAG</text><text x="1120" y="375" class="note">fresh episode</text>
+  <text x="60" y="850" class="note">Invariant: AgentDAG → Assemble → immutable ProvisioningPlan → Execute. Reasoning is before assembly; Governor and Transfer run between episodes.</text>
 </svg>

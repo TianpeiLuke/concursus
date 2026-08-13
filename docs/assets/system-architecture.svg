@@ -1,33 +1,37 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1000" viewBox="0 0 1800 1000" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1350" viewBox="0 0 2400 1350" role="img" aria-labelledby="title desc">
   <title id="title">Concursus system architecture</title>
-  <desc id="desc">Code-grounded module and lifecycle map. Core declarations are assembled into an immutable provisioning plan. The plan independently feeds optional deployment and one Supervisor execution episode. Execute appends to and replays State. Optional Reasoning runs before compilation. The optional Governor forms an outer loop around Assemble, the frozen plan, Execute, and State. Transfer is authored before the freeze, then exports finished state to an external Slipbox only at the Governor synthesize boundary.</desc>
+  <desc id="desc">Code-grounded lifecycle and component map. Optional reasoning produces core declarations. Assemble validates the declarations, calls runtime synthesis, and freezes an immutable ProvisioningPlan. The plan independently feeds one Supervisor execution episode and optional AWS provisioning. Execute appends to and replays State. GovernorLoop controls bounded compile-run-collect episodes, while KTLO starts fresh loops. Scheduling, registry, authoring, staffing, cockpit, harness, monitoring, projections, precedent, and transfer modules are grouped with their owning lifecycle components.</desc>
   <defs>
     <style>
+      text{font-family:Inter,"SF Pro Display","Segoe UI",Arial,sans-serif;letter-spacing:0}
       .page{fill:#f7f8fb}
-      .title{font:700 32px Arial,sans-serif;fill:#162033}
-      .subtitle{font:15px Arial,sans-serif;fill:#526075}
-      .section{font:700 12px Arial,sans-serif;fill:#6d28d9}
-      .name{font:700 21px Arial,sans-serif;fill:#162033}
-      .nameSmall{font:700 18px Arial,sans-serif;fill:#162033}
-      .role{font:14px Arial,sans-serif;fill:#35445b}
-      .note{font:12px Arial,sans-serif;fill:#59677b}
-      .edgeLabel{font:12px Arial,sans-serif;fill:#435168}
-      .edgeLabelOpt{font:12px Arial,sans-serif;fill:#6d28d9}
-      .edgeLabelState{font:12px Arial,sans-serif;fill:#a24b0b}
-      .core{fill:#e9f1ff;stroke:#2563eb;stroke-width:2}
-      .compile{fill:#e8f7f4;stroke:#0f766e;stroke-width:2}
-      .runtime{fill:#eaf8ee;stroke:#16803c;stroke-width:2}
-      .state{fill:#fff4da;stroke:#c96a0a;stroke-width:2}
-      .optional{fill:#f4edff;stroke:#7c3aed;stroke-width:2}
-      .external{fill:#fcecf1;stroke:#c02663;stroke-width:2}
-      .neutral{fill:#ffffff;stroke:#64748b;stroke-width:2}
+      .title{font-size:40px;font-weight:750;fill:#162033}
+      .subtitle{font-size:18px;fill:#526075}
+      .section{font-size:14px;font-weight:750;fill:#6d28d9}
+      .name{font-size:24px;font-weight:750;fill:#162033}
+      .nameSmall{font-size:20px;font-weight:750;fill:#162033}
+      .role{font-size:16px;fill:#35445b}
+      .note{font-size:14px;fill:#59677b}
+      .mini{font-size:13px;fill:#64748b}
+      .edgeLabel{font-size:13px;fill:#435168}
+      .edgeLabelOpt{font-size:13px;fill:#6d28d9}
+      .edgeLabelState{font-size:13px;fill:#a24b0b}
+      .core{fill:#e9f1ff;stroke:#2563eb;stroke-width:2.5}
+      .compile{fill:#e8f7f4;stroke:#0f766e;stroke-width:2.5}
+      .runtime{fill:#eaf8ee;stroke:#16803c;stroke-width:2.5}
+      .state{fill:#fff4da;stroke:#c96a0a;stroke-width:2.5}
+      .optional{fill:#f4edff;stroke:#7c3aed;stroke-width:2.5}
+      .external{fill:#fcecf1;stroke:#c02663;stroke-width:2.5}
+      .neutral{fill:#ffffff;stroke:#64748b;stroke-width:2.5}
+      .detail{fill:#ffffff;stroke:#94a3b8;stroke-width:2}
       .buildBand{fill:#f0f8f2;stroke:#86a992;stroke-width:1.5}
-      .governor{fill:#faf7ff;fill-opacity:.82;stroke:#7c3aed;stroke-width:2.5;stroke-dasharray:10 8}
-      .arrow{fill:none;stroke:#40516a;stroke-width:2.5;marker-end:url(#arrow)}
-      .deployArrow{fill:none;stroke:#16803c;stroke-width:2.5;marker-end:url(#deployArrow)}
-      .stateArrow{fill:none;stroke:#b45309;stroke-width:2.5;marker-end:url(#stateArrow)}
-      .optionalArrow{fill:none;stroke:#7c3aed;stroke-width:2.5;stroke-dasharray:8 6;marker-end:url(#optionalArrow)}
-      .legendLine{fill:none;stroke-width:2.5}
+      .governor{fill:#faf7ff;fill-opacity:.84;stroke:#7c3aed;stroke-width:2.5;stroke-dasharray:10 8}
+      .arrow{fill:none;stroke:#40516a;stroke-width:2.8;marker-end:url(#arrow)}
+      .deployArrow{fill:none;stroke:#16803c;stroke-width:2.8;marker-end:url(#deployArrow)}
+      .stateArrow{fill:none;stroke:#b45309;stroke-width:2.8;marker-end:url(#stateArrow)}
+      .optionalArrow{fill:none;stroke:#7c3aed;stroke-width:2.8;stroke-dasharray:8 6;marker-end:url(#optionalArrow)}
+      .projectionArrow{fill:none;stroke:#6e5c9a;stroke-width:2.6;stroke-dasharray:3 8;marker-end:url(#projectionArrow)}
+      .legendLine{fill:none;stroke-width:2.8}
     </style>
     <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
       <path d="M0 0 L10 4 L0 8 Z" fill="#40516a"/>
@@ -41,132 +45,196 @@
     <marker id="optionalArrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
       <path d="M0 0 L10 4 L0 8 Z" fill="#7c3aed"/>
     </marker>
+    <marker id="projectionArrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0 0 L10 4 L0 8 Z" fill="#6e5c9a"/>
+    </marker>
   </defs>
 
-  <rect width="1800" height="1000" class="page"/>
-  <text x="50" y="52" class="title">Concursus architecture</text>
-  <text x="50" y="79" class="subtitle">Compiler-first lifecycle with optional pre-compile reasoning, deployment, outer governance, and knowledge transfer.</text>
+  <rect width="2400" height="1350" class="page"/>
+  <text x="55" y="58" class="title">Concursus architecture</text>
+  <text x="55" y="88" class="subtitle">Compiler-first lifecycle with outer governance, staffing, execution harnesses, durable state, and knowledge transfer.</text>
 
-  <!-- Optional Governor boundary: top lifecycle plus the State leg; Transfer remains outside. -->
-  <path d="M620 270 H1515 V760 H1205 V535 H620 Z" class="governor"/>
+  <!-- Build owns offline synthesis and optional side-effecting deployment. -->
+  <rect x="710" y="105" width="620" height="145" rx="8" class="buildBand"/>
+  <text x="730" y="132" class="section" style="fill:#316143">BUILD MODULE</text>
+  <rect x="735" y="145" width="250" height="82" rx="8" class="runtime"/>
+  <text x="755" y="176" class="nameSmall">Runtime synthesis</text>
+  <text x="755" y="203" class="role">BuildPlanEntry artifacts</text>
+  <rect x="1025" y="145" width="280" height="82" rx="8" class="runtime"/>
+  <text x="1045" y="176" class="nameSmall">Provision</text>
+  <text x="1045" y="203" class="role">Trust gate | IAM | ECR | ledger</text>
+
+  <!-- Public entry and AgentCore deployment target. -->
+  <rect x="355" y="122" width="270" height="105" rx="8" class="neutral"/>
+  <text x="380" y="160" class="nameSmall">CLI / package API</text>
+  <text x="380" y="190" class="role">Validate | plan | deploy | run</text>
+
+  <rect x="1380" y="122" width="265" height="105" rx="8" class="external"/>
+  <text x="1405" y="160" class="name">AgentCore</text>
+  <text x="1405" y="190" class="role">Runtimes + Memory</text>
+
+  <!-- Optional Governor boundary encloses compile-run-collect state, not KTLO, Transfer, or projections. -->
+  <path d="M620 275 H1630 V970 H1230 V745 H620 Z" class="governor"/>
   <text x="645" y="300" class="section">OPTIONAL GOVERNOR - PLAN, ROUTE, RUN ONE EPISODE, COLLECT, DECIDE</text>
 
-  <!-- Build module: synthesis is called by Assemble; provisioning consumes the frozen plan. -->
-  <rect x="700" y="90" width="530" height="145" rx="8" class="buildBand"/>
-  <text x="720" y="116" class="section" style="fill:#316143">BUILD MODULE</text>
-  <rect x="725" y="132" width="220" height="82" rx="8" class="runtime"/>
-  <text x="745" y="163" class="nameSmall">Runtime synthesis</text>
-  <text x="745" y="188" class="role">BuildPlanEntry artifacts</text>
-  <rect x="985" y="132" width="220" height="82" rx="8" class="runtime"/>
-  <text x="1005" y="163" class="nameSmall">Provision</text>
-  <text x="1005" y="188" class="role">IAM | ECR | runtime | ledger</text>
+  <!-- KTLO is a standing outer wrapper that starts fresh bounded Governor loops. -->
+  <rect x="45" y="325" width="265" height="112" rx="8" class="neutral"/>
+  <text x="70" y="363" class="nameSmall">Events + KTLO</text>
+  <text x="70" y="391" class="role">Monitor | triage | admission</text>
+  <text x="70" y="416" class="role">Fresh GovernorLoop per signal</text>
 
-  <!-- Entry point and external AWS target. -->
-  <rect x="350" y="112" width="240" height="102" rx="8" class="neutral"/>
-  <text x="375" y="151" class="name">CLI / package API</text>
-  <text x="375" y="180" class="role">Validate | plan | deploy | run</text>
+  <!-- Explicit governance controls shared by the outer bounded loop. -->
+  <rect x="650" y="325" width="215" height="112" rx="8" class="optional"/>
+  <text x="670" y="361" class="nameSmall">GovernorLoop</text>
+  <text x="670" y="390" class="role">Planner | router | episode</text>
+  <text x="670" y="415" class="role">Collect | bounded decision</text>
 
-  <rect x="1290" y="112" width="220" height="102" rx="8" class="external"/>
-  <text x="1315" y="151" class="name">AgentCore</text>
-  <text x="1315" y="180" class="role">Runtimes + Memory</text>
+  <rect x="895" y="325" width="220" height="112" rx="8" class="optional"/>
+  <text x="915" y="361" class="nameSmall">Scheduler + Registry</text>
+  <text x="915" y="390" class="role">Trust | binding | held set</text>
+  <text x="915" y="415" class="role">Standing agent versions</text>
 
-  <!-- Main compiler and runtime spine. -->
-  <rect x="55" y="335" width="250" height="118" rx="8" class="optional"/>
-  <text x="80" y="374" class="name">Reasoning</text>
-  <text x="80" y="403" class="role">Bounded deliberation</text>
-  <text x="80" y="427" class="role">Converged result -&gt; AgentDAG</text>
+  <rect x="1145" y="325" width="220" height="112" rx="8" class="optional"/>
+  <text x="1165" y="361" class="nameSmall">Authoring + Staffing</text>
+  <text x="1165" y="390" class="role">Decompose | bind | create</text>
+  <text x="1165" y="415" class="role">Manifest + capability DAG</text>
 
-  <rect x="350" y="335" width="240" height="118" rx="8" class="core"/>
-  <text x="375" y="374" class="name">Core</text>
-  <text x="375" y="403" class="role">AgentDAG + manifests</text>
-  <text x="375" y="427" class="role">Topology | contracts | refs</text>
+  <rect x="1395" y="325" width="205" height="112" rx="8" class="optional"/>
+  <text x="1415" y="361" class="nameSmall">Cockpit + UI</text>
+  <text x="1415" y="390" class="role">Read-only projections</text>
+  <text x="1415" y="415" class="role">Status | episode controls</text>
 
-  <rect x="650" y="335" width="240" height="118" rx="8" class="compile"/>
-  <text x="675" y="374" class="name">Assemble</text>
-  <text x="675" y="403" class="role">Validate + resolve wiring</text>
-  <text x="675" y="427" class="role">Synthesize entries + freeze</text>
+  <!-- Main compiler/runtime spine. -->
+  <rect x="45" y="545" width="265" height="130" rx="8" class="optional"/>
+  <text x="70" y="584" class="name">Reasoning</text>
+  <text x="70" y="614" class="role">DKSEngine + InnerGraph</text>
+  <text x="70" y="640" class="role">Converged result -&gt; AgentDAG</text>
+  <text x="70" y="661" class="mini">bounded, optional, pre-compile</text>
 
-  <rect x="950" y="335" width="240" height="118" rx="8" class="compile"/>
-  <text x="975" y="374" class="name">ProvisioningPlan</text>
-  <text x="975" y="403" class="role">Order + entries + wiring</text>
-  <text x="975" y="427" class="role">Immutable for one episode</text>
+  <rect x="355" y="545" width="255" height="130" rx="8" class="core"/>
+  <text x="380" y="584" class="name">Core</text>
+  <text x="380" y="614" class="role">AgentDAG + AgentManifest</text>
+  <text x="380" y="640" class="role">Refs | contracts | capabilities</text>
+  <text x="380" y="661" class="mini">typed declarations + resolve gates</text>
 
-  <rect x="1250" y="335" width="240" height="118" rx="8" class="runtime"/>
-  <text x="1275" y="374" class="name">Execute</text>
-  <text x="1275" y="403" class="role">Supervisor: one topo pass</text>
-  <text x="1275" y="427" class="role">Harness | invoker | monitor</text>
+  <rect x="650" y="545" width="250" height="130" rx="8" class="compile"/>
+  <text x="675" y="584" class="name">Assemble</text>
+  <text x="675" y="614" class="role">Validate + resolve wiring</text>
+  <text x="675" y="640" class="role">Synthesize entries + freeze</text>
+  <text x="675" y="661" class="mini">bounded monotonic recompile</text>
 
-  <rect x="1540" y="335" width="220" height="118" rx="8" class="external"/>
-  <text x="1565" y="374" class="name">Other backends</text>
-  <text x="1565" y="403" class="role">Callable | HTTP</text>
-  <text x="1565" y="427" class="role">Strands | declared API</text>
+  <rect x="950" y="545" width="260" height="130" rx="8" class="compile"/>
+  <text x="975" y="584" class="nameSmall">ProvisioningPlan</text>
+  <text x="975" y="614" class="role">Order | entries | wiring</text>
+  <text x="975" y="640" class="role">Frontier | precedents | revision</text>
+  <text x="975" y="661" class="mini">immutable for one episode</text>
 
-  <!-- Durable state and external knowledge transfer. -->
-  <rect x="1230" y="605" width="280" height="115" rx="8" class="state"/>
-  <text x="1255" y="643" class="name">State</text>
-  <text x="1255" y="672" class="role">Append-only log + replay</text>
-  <text x="1255" y="696" class="role">Memory/FileVault | projections</text>
+  <rect x="1280" y="545" width="300" height="130" rx="8" class="runtime"/>
+  <text x="1305" y="584" class="name">Execute</text>
+  <text x="1305" y="614" class="role">Supervisor + NodeExecutors</text>
+  <text x="1305" y="640" class="role">Harness | invoker | monitor</text>
+  <text x="1305" y="661" class="mini">one topological pass | optional waves</text>
 
-  <rect x="865" y="605" width="270" height="115" rx="8" class="optional"/>
-  <text x="890" y="643" class="name">Transfer</text>
-  <text x="890" y="672" class="role">Terminal-node authoring</text>
-  <text x="890" y="696" class="role">Finished-run export trigger</text>
+  <rect x="1690" y="545" width="310" height="130" rx="8" class="external"/>
+  <text x="1715" y="584" class="nameSmall">Runtime backends</text>
+  <text x="1715" y="614" class="role">AgentCore | callable | HTTP</text>
+  <text x="1715" y="640" class="role">Strands | declared API stub</text>
+  <text x="1715" y="661" class="mini">selected through AgentInvoker</text>
 
-  <rect x="530" y="605" width="270" height="115" rx="8" class="external"/>
-  <text x="555" y="643" class="name">External Slipbox</text>
-  <text x="555" y="672" class="role">Permanent knowledge store</text>
-  <text x="555" y="696" class="role">Injected consolidation workflow</text>
+  <!-- Canonical state and post-run knowledge systems. -->
+  <rect x="1280" y="805" width="300" height="130" rx="8" class="state"/>
+  <text x="1305" y="844" class="name">State</text>
+  <text x="1305" y="874" class="role">Append-only StateStore log</text>
+  <text x="1305" y="900" class="role">InProcess | Memory | FileVault</text>
+  <text x="1305" y="921" class="mini">records | replay | checkpoint</text>
 
-  <!-- Primary compiler/data paths. -->
-  <path d="M305 394 H350" class="optionalArrow"/>
-  <text x="307" y="382" class="edgeLabelOpt">pre-compile</text>
-  <path d="M590 394 H650" class="arrow"/>
-  <path d="M890 394 H950" class="arrow"/>
-  <path d="M1190 394 H1250" class="arrow"/>
-  <path d="M1490 394 H1540" class="arrow"/>
+  <rect x="890" y="805" width="280" height="130" rx="8" class="optional"/>
+  <text x="915" y="844" class="name">Transfer</text>
+  <text x="915" y="874" class="role">Terminal-node authoring</text>
+  <text x="915" y="900" class="role">Synthesize trigger + sweep</text>
+  <text x="915" y="921" class="mini">opt-in | default-off | fail-closed</text>
 
-  <!-- Entry point and Build relationships. -->
-  <path d="M470 214 V335" class="arrow"/>
-  <text x="480" y="278" class="edgeLabel">drives</text>
-  <path d="M770 335 V214" class="deployArrow"/>
-  <text x="782" y="257" class="edgeLabel">uses synthesis</text>
-  <path d="M1080 335 V214" class="deployArrow"/>
-  <text x="1092" y="257" class="edgeLabel">optional deploy</text>
-  <path d="M1205 173 H1290" class="deployArrow"/>
-  <text x="1213" y="160" class="edgeLabel">create</text>
-  <path d="M1380 335 V214" class="arrow"/>
-  <text x="1392" y="278" class="edgeLabel">invoke</text>
+  <rect x="520" y="805" width="280" height="130" rx="8" class="external"/>
+  <text x="545" y="844" class="nameSmall">External Slipbox</text>
+  <text x="545" y="874" class="role">Permanent knowledge store</text>
+  <text x="545" y="900" class="role">Injected consolidation workflow</text>
 
-  <!-- Execute and State are bidirectional: append during a run, replay on resume. -->
-  <path d="M1335 453 V605" class="stateArrow"/>
-  <text x="1288" y="535" class="edgeLabelState">append</text>
-  <path d="M1420 605 V453" class="stateArrow"/>
-  <text x="1431" y="535" class="edgeLabelState">replay / resume</text>
+  <rect x="1690" y="805" width="310" height="130" rx="8" class="detail"/>
+  <text x="1715" y="844" class="nameSmall">Derived projections</text>
+  <text x="1715" y="874" class="role">RunGraph | RunIndex | run DB</text>
+  <text x="1715" y="900" class="role">Capture | phase notes | UI views</text>
+  <text x="1715" y="921" class="mini">deletable and rebuildable</text>
+
+  <rect x="1690" y="985" width="310" height="120" rx="8" class="detail"/>
+  <text x="1715" y="1024" class="nameSmall">Precedent memory</text>
+  <text x="1715" y="1054" class="role">distill_run + retriever</text>
+  <text x="1715" y="1080" class="role">Feeds only a later compile</text>
+
+  <!-- Primary compile and invocation paths. -->
+  <path d="M310 610 H355" class="optionalArrow"/>
+  <text x="313" y="596" class="edgeLabelOpt">pre-compile</text>
+  <path d="M610 610 H650" class="arrow"/>
+  <path d="M900 610 H950" class="arrow"/>
+  <path d="M1210 610 H1280" class="arrow"/>
+  <path d="M1580 610 H1690" class="arrow"/>
+  <text x="1600" y="596" class="edgeLabel">invoke</text>
+
+  <!-- Entry, KTLO, governance, and Build relationships. -->
+  <path d="M490 227 V545" class="arrow"/>
+  <text x="502" y="478" class="edgeLabel">drives</text>
+  <path d="M310 381 H650" class="optionalArrow"/>
+  <text x="427" y="367" class="edgeLabelOpt">fresh bounded loop</text>
+  <path d="M865 381 H895" class="optionalArrow"/>
+  <text x="868" y="367" class="edgeLabelOpt">route</text>
+
+  <path d="M790 545 V470 H880 V227" class="deployArrow"/>
+  <text x="805" y="493" class="edgeLabel">uses synthesis</text>
+  <path d="M1080 545 V470 H1128 V227 H1165" class="deployArrow"/>
+  <text x="1088" y="493" class="edgeLabel">optional deploy</text>
+  <path d="M1305 186 H1380" class="deployArrow"/>
+  <text x="1317" y="172" class="edgeLabel">create / reuse</text>
+  <path d="M1580 580 H1645 V255 H1515 V227" class="arrow"/>
+  <text x="1588" y="278" class="edgeLabel">invoke</text>
+
+  <!-- Execute and State: append during a run, replay on resume. -->
+  <path d="M1350 675 V805" class="stateArrow"/>
+  <text x="1304" y="747" class="edgeLabelState">append</text>
+  <path d="M1510 805 V675" class="stateArrow"/>
+  <text x="1521" y="747" class="edgeLabelState">replay / resume</text>
 
   <!-- Governor feedback exists only between complete episodes. -->
-  <path d="M1230 680 H1218 V495 H1160 V453" class="optionalArrow"/>
-  <text x="1000" y="508" class="edgeLabelOpt">collect -&gt; next compile (between episodes)</text>
+  <path d="M1280 870 H1235 V730 H1080 V675" class="optionalArrow"/>
+  <text x="1000" y="718" class="edgeLabelOpt">collect -&gt; next compile (between episodes)</text>
 
-  <!-- Transfer's three independent relationships. -->
-  <path d="M900 605 V560 H820 V453" class="optionalArrow"/>
-  <text x="680" y="550" class="edgeLabelOpt">author terminal node before freeze</text>
-  <path d="M1050 535 V605" class="optionalArrow"/>
-  <text x="1062" y="576" class="edgeLabelOpt">synthesize trigger</text>
-  <path d="M1230 662 H1135" class="stateArrow"/>
-  <text x="1148" y="650" class="edgeLabelState">finished notes</text>
-  <path d="M865 662 H800" class="stateArrow"/>
-  <text x="805" y="650" class="edgeLabelState">export</text>
+  <!-- Transfer is authored before freeze and exports only finished notes. -->
+  <path d="M950 805 V740 H880 V675" class="optionalArrow"/>
+  <text x="650" y="776" class="edgeLabelOpt">pre-freeze terminal node</text>
+  <path d="M1280 870 H1170" class="stateArrow"/>
+  <text x="1190" y="856" class="edgeLabelState">finished notes</text>
+  <path d="M890 870 H800" class="stateArrow"/>
+  <text x="814" y="856" class="edgeLabelState">export</text>
 
-  <!-- Legend and invariant. -->
-  <rect x="50" y="825" width="1710" height="118" rx="8" fill="#ffffff" stroke="#d5dbe5"/>
-  <text x="75" y="855" class="nameSmall">Reading the map</text>
-  <path d="M75 882 H135" class="legendLine" style="stroke:#40516a"/>
-  <text x="145" y="887" class="note">normal compile / data flow</text>
-  <path d="M385 882 H445" class="legendLine" style="stroke:#16803c"/>
-  <text x="455" y="887" class="note">build / deploy relationship</text>
-  <path d="M720 882 H780" class="legendLine" style="stroke:#b45309"/>
-  <text x="790" y="887" class="note">state / knowledge flow</text>
-  <path d="M1020 882 H1080" class="legendLine" style="stroke:#7c3aed;stroke-dasharray:8 6"/>
-  <text x="1090" y="887" class="note">opt-in or outer-boundary flow</text>
-  <text x="75" y="922" class="note">Invariant: AgentDAG + manifests -&gt; Assemble -&gt; immutable ProvisioningPlan -&gt; Supervisor.run. Build deployment is optional; Governor and Transfer never mutate a running episode.</text>
+  <!-- State read models and precedent feedback remain outside a live episode. -->
+  <path d="M1580 870 H1690" class="projectionArrow"/>
+  <text x="1592" y="856" class="edgeLabelOpt">project</text>
+  <path d="M1845 935 V985" class="projectionArrow"/>
+  <text x="1860" y="966" class="edgeLabelOpt">distill</text>
+  <path d="M1690 1045 H840 V675" class="projectionArrow"/>
+  <text x="1115" y="1031" class="edgeLabelOpt">retrieve precedent for a later compile</text>
+
+  <!-- Legend and invariants. -->
+  <rect x="45" y="1170" width="2310" height="125" rx="8" fill="#ffffff" stroke="#d5dbe5"/>
+  <text x="70" y="1200" class="nameSmall">Reading the map</text>
+  <path d="M70 1227 H130" class="legendLine" style="stroke:#40516a"/>
+  <text x="140" y="1232" class="note">compile / control flow</text>
+  <path d="M390 1227 H450" class="legendLine" style="stroke:#16803c"/>
+  <text x="460" y="1232" class="note">build / deploy relationship</text>
+  <path d="M765 1227 H825" class="legendLine" style="stroke:#b45309"/>
+  <text x="835" y="1232" class="note">state / knowledge flow</text>
+  <path d="M1100 1227 H1160" class="legendLine" style="stroke:#7c3aed;stroke-dasharray:8 6"/>
+  <text x="1170" y="1232" class="note">optional / outer-boundary flow</text>
+  <path d="M1510 1227 H1570" class="legendLine" style="stroke:#6e5c9a;stroke-dasharray:3 8"/>
+  <text x="1580" y="1232" class="note">read model / later-run feedback</text>
+  <text x="70" y="1270" class="note">Invariant: AgentDAG + manifests -&gt; Assemble -&gt; immutable ProvisioningPlan -&gt; Supervisor.run. Build deployment is optional; KTLO, Governor, Transfer, and precedent never mutate a running episode.</text>
+  <text x="2330" y="1270" class="mini" text-anchor="end">Source: src/concursus</text>
 </svg>

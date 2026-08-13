@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-12
+
+### Added — operator console + status vocabulary (the UI layer)
+- `concursus.ui` — a new operator-UI package. Presentation only, with a one-way dependency
+  (it consumes the record dict `tests/dag_render.py` produces and never imports the record layer),
+  and deliberately **not** re-exported from `concursus.__all__` — the console is an operator surface,
+  not part of the compiler's public API, and `tests/test_api_surface.py` guards that boundary.
+  - `ui.status` — the node-execution status vocabulary (`STATUS_*` constants + `status_style()`),
+    lifted out of `tests/dag_render.py` (which now re-exports every name, so its ~94 references keep
+    working). One table drives the mermaid `classDef`, the HTML badge, the text report, the DAG node,
+    and the Kanban column, so no two renderers can disagree about what a colour means.
+  - `ui.console` — `render_console` / `board_columns`: a DAG + node card + live Kanban board rendered
+    from a single record dict, stdlib-only hand-rolled SVG (no CDN, no npm). Phases U0/U1/U1c/U1d — the
+    DAG serves both live and finished runs (click a node to raise its full card in a right-hand panel),
+    the Kanban is **live-only** (`live=True`), and the per-status glyph table (`MARKS`) is the only
+    presentation this module owns.
+
+### Added — FileVault run notes (Slipbox / Folgezettel projection)
+- `state.filevault` now projects a run into durable Slipbox-style notes under Folgezettel addressing
+  (`_allocate_fz`): a goal note (`_goal.md`, kind `hive_run_goal`), a DAG note (`_dag.md`,
+  `hive_run_dag`), one note per phase (`hive_phase_note`), and a digest-view note (`hive_digest_view`)
+  — via `render_phase_note` / `capture_dag_note` / `capture_goal_note` / `render_digest_view_note`, so
+  the per-sub-agent record notes hang beneath a visible goal/DAG/phase spine.
+- `export_run_digest` / `export_run_log_to_object_store` — export a finished run's notes into the
+  transfer inbox / an `ObjectStore` (idempotent; `versions`/`index` skipped).
+- `state.capture` — the `digest_view` capture seam (`DIGEST_VIEW`, `adapt_digest_view`,
+  `capture_digest_view`) that adapts a record into a captured digest view.
+
+### Added — governor phase spine
+- `governor.PhaseNoteSink` (R3-3/R3-4) — an opt-in `EventSink` that writes one phase note per episode
+  boundary (`_phase_r{round}_{type}.md`, carrying the round's completed/frontier sets), giving a run's
+  trail its phase spine (round 1 → round 2 → …). Strictly an observer — wire it via
+  `GovernorLoop(event_sink=PhaseNoteSink(run_dir))`; not wiring it leaves the loop byte-for-byte
+  unchanged, and any write error is swallowed by the loop's emit guard.
+
+### Changed — assemble authoring dials, build payload adapter, statestore binding
+- `assemble` gains opt-in authoring gates and dials, all default-off (behaviour unchanged unless
+  enabled): a monotonic re-compile ceiling + counter (the plan-generation feedback edge), a
+  compile-time read-only cross-run **precedent** retriever (advisory context for the plan author that
+  never changes the compiled topology), a per-node frozen PAYLOAD contract (F1) with a payload-tier
+  authoring dial (F1/F4), a deep-alignment gate (B2), a single-writer gate (B1), an adaptive-strictness
+  dial (B4), and a compact, navigable plan projection for a durable plan note.
+- `build` — each wrapper's payload→callable adapter is now derived from the **agent callable's own
+  signature** instead of a provision-time `_INPUT_KEYS` list read from `manifest.contract.inputs`: I/O
+  is a per-plan-node property and one provisioned agent serves many plans, so a wrapper baked at
+  provision time cannot know the keys. `**kwargs` callables get the whole payload; unexpected-key
+  filtering is kept but derived from the signature the wrapper can always see.
+- `state.statestore` — the in-process record gains opt-in `agent_name` / agent-runtime-ARN fields,
+  recorded by the `Supervisor` when `capture_agent_binding=True` and round-tripped through the
+  FileVault-only run-state fields; never projected to the charset-restricted AgentCore metadata path
+  (absent there ⇒ byte-identical).
+
 ### Added — the execute runtime stack (invoke real leaf agents)
 - `concursus.execute` gains the harness/invoker/monitor runtime that turns the abstract `Supervisor`
   into a system that actually **invokes real leaf agents** — previously `execute/` was only

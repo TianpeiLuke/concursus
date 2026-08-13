@@ -65,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `supervisor.py` (a dispatcher over an injected `invoke_fn`). All opt-in via the existing
   `NodeExecutor` seam: a run that does not wire a harness factory is byte-for-byte unchanged.
   - `AgentInvoker` — dispatches to a leaf agent by `manifest.runtime.backend`: `callable` (in-process),
-    `agentcore` (Bedrock InvokeAgentRuntime), `http` (aiohttp/urllib + SSE), `strands` (the Strands
+    `agentcore` (Bedrock InvokeAgent), `http` (aiohttp/urllib + SSE), `strands` (the Strands
     SDK); `api` is a declared stub. `invoke_with_tap` returns the response + a live `LogEvent` stream.
   - `ExecutionMonitor` — a rule-based per-node health monitor (idle-timeout / error-threshold /
     tool-loop / token-budget) over that log stream, emitting a `HealthSignal` and, on a terminating

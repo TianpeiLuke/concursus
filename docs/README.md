@@ -27,6 +27,7 @@ Then reach for a **Guide** when you have a task in hand, or the **API reference*
 | [Overview](overview.md) | What Concursus is, the problem it solves, and its mental model. |
 | [Getting Started](getting-started.md) | Install, declare your first team, compile it, and run it — Python API and CLI. |
 | [Core Concepts](concepts.md) | The vocabulary and invariants: DAG, manifest, plan, state, trust, governor, reasoning. |
+| [System Architecture](architecture.md) | Code-reviewed module map, dependency direction, lifecycle flow, and SVG/PNG architecture diagram. |
 
 ## Guides
 

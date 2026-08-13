@@ -11,6 +11,12 @@ It is the **coordinator AgentCore deliberately doesn't ship**: AgentCore gives y
 
 > **Status: alpha.** This release ships the **declarative core** (`AgentDAG` + `AgentManifest`) **and the offline compiler**: the dependency resolver, the runtime builder, the `OrchestrationAssembler` (DAG + manifests → a `ProvisioningPlan`), and the topological `Supervisor` — plus the `plan` / `deploy` / `run` CLI verbs. The compiler is pure-Python; boto3 stays behind the `[agentcore]` extra and is imported lazily only when `deploy --execute` / `run --execute` actually calls AWS.
 
+## System architecture
+
+![Concursus system architecture](docs/assets/system-architecture.svg)
+
+The architecture has one immutable inner path — `AgentDAG + manifests → assemble → ProvisioningPlan → Supervisor.run` — with durable state alongside it. The optional reasoning tier forms a DAG *before* compilation; the optional governor creates fresh plans only *between* complete execution episodes. See the [comprehensive module map and relationship analysis](docs/architecture.md), or open the [PNG diagram](docs/assets/system-architecture.png) where SVG rendering is unavailable.
+
 ---
 
 ## Installation

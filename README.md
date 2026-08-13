@@ -13,9 +13,9 @@ It is the **coordinator AgentCore deliberately doesn't ship**: AgentCore gives y
 
 ## System architecture
 
-![Concursus system architecture](docs/assets/system-architecture.svg)
+![Concursus system architecture](docs/assets/system-architecture.png)
 
-The architecture has one immutable inner path — `AgentDAG + manifests → assemble → ProvisioningPlan → Supervisor.run` — with durable state alongside it. The optional reasoning tier forms a DAG *before* compilation; the optional governor creates fresh plans only *between* complete execution episodes. See the [comprehensive module map and relationship analysis](docs/architecture.md), or open the [PNG diagram](docs/assets/system-architecture.png) where SVG rendering is unavailable.
+The architecture has one immutable inner path — `AgentDAG + manifests → assemble → ProvisioningPlan → Supervisor.run` — with durable state alongside it. The optional reasoning tier forms a DAG *before* compilation; the optional governor creates fresh plans only *between* complete execution episodes. See the [comprehensive module map and relationship analysis](docs/architecture.md), or the [scalable SVG diagram](docs/assets/system-architecture.svg) for a vector version.
 
 ---
 
